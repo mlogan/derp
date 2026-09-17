@@ -69,6 +69,21 @@ Yes, and never with branch hooks only.
   load after the switch, so the other thread's writes are seen. Only a
   hooked store exposes the lost update. This is inherent to replaying the
   displaced instruction and worth remembering when reading hit rates.
+- Fraction of seeds that catch the bug, measured:
+
+  | rate | seeds hooking the store | seeds catching the bug |
+  |---|---|---|
+  | 1/16 | 3 / 60 | 3 / 60 |
+  | 1/4 | 9 / 40 | 9 / 40 |
+  | 1 | 40 / 40 | 40 / 40 |
+
+  The catch rate equals the rate at which the single racy store is
+  selected, i.e. the hook rate. Once the store is hooked every seed
+  catches it, because the loop hits that site hundreds of times per run.
+  Site selection is drawn at rewrite time, so a seed either can or cannot
+  catch a given bug regardless of the schedule. Biasing selection toward
+  stores, or hooking the instruction after a load instead of the load,
+  would raise the rate for read-modify-write races.
 - `mutex.c` always prints 400000; `channel.rs` always prints the correct
   tallies; both have a stable schedule hash per seed and different hashes
   across seeds (`tests/threads_tests.rs`).

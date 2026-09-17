@@ -61,6 +61,8 @@ pub struct Stats {
     pub data_in_code_words: usize,
     pub skipped_blr_x30: usize,
     pub stub_bytes: usize,
+    /// Addresses of the hooked memory instructions
+    pub mem_site_addrs: Vec<u64>,
 }
 
 impl std::fmt::Display for Stats {
@@ -86,7 +88,12 @@ impl std::fmt::Display for Stats {
             "skipped: exclusive_words={} data_in_code_words={} blr_x30={}",
             self.exclusive_words, self.data_in_code_words, self.skipped_blr_x30
         )?;
-        write!(f, "stub_bytes={}", self.stub_bytes)
+        writeln!(f, "stub_bytes={}", self.stub_bytes)?;
+        write!(f, "mem_site_addrs=")?;
+        for (i, a) in self.mem_site_addrs.iter().enumerate() {
+            write!(f, "{}{a:#x}", if i == 0 { "" } else { "," })?;
+        }
+        Ok(())
     }
 }
 
@@ -392,6 +399,7 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
                     let roll = rng.below(u64::from(rate_den));
                     if roll < u64::from(rate_num) {
                         stats.mem_sites += 1;
+                        stats.mem_site_addrs.push(pc);
                         b.stub(pc, Guard::None, false, Tail::Replay(words[i]))?;
                     }
                 }

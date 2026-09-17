@@ -1,48 +1,8 @@
 mod common;
 
-use std::path::{Path, PathBuf};
-
+use common::{rewrite_to, run};
 use rewrite::launch::{self, Launch};
-use rewrite::macho::{self, MachO};
-use rewrite::rewrite::{self as rw, Options};
-
-fn rewrite_to(exe: &Path, out: &Path, opts: &Options) -> rw::Stats {
-    let m = MachO::parse(std::fs::read(exe).unwrap()).unwrap();
-    let r = rw::rewrite(&m, opts).unwrap();
-    std::fs::write(out, &r.image).unwrap();
-    std::fs::set_permissions(out, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    macho::adhoc_sign(out).unwrap();
-    r.stats
-}
-
-/// Run `exe` with stdout captured to a file; returns (outcome, stdout).
-fn run(
-    exe: &Path,
-    args: &[&str],
-    dylib: Option<PathBuf>,
-    env: Vec<(String, String)>,
-) -> (launch::Outcome, String) {
-    let out_path = exe.with_extension(format!("out{}", std::process::id()));
-    let script = exe.with_extension("sh");
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\nexec \"$@\" > {}\n", out_path.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let mut all = vec![exe.as_os_str().to_owned()];
-    all.extend(args.iter().map(std::convert::Into::into));
-    let cfg = Launch {
-        exe: script,
-        args: all,
-        dylib,
-        env,
-        disable_aslr: true,
-    };
-    let outcome = launch::launch(&cfg).expect("launch");
-    let text = std::fs::read_to_string(&out_path).unwrap_or_default();
-    (outcome, text)
-}
+use rewrite::rewrite::Options;
 
 #[test]
 fn loops_branch_only_matches_native() {
@@ -65,9 +25,9 @@ fn loops_branch_only_matches_native() {
     assert_eq!(supervised.exit_code(), Some(0));
     assert_eq!(text, expected);
     let hooks = supervised.report.get_u64("hooks").unwrap();
-    let switches = supervised.report.get_u64("switches").unwrap();
+    let expiries = supervised.report.get_u64("expiries").unwrap();
     assert!(hooks > 1_000_000, "hooks={hooks}");
-    assert!(switches > 100, "switches={switches}");
+    assert!(expiries > 100, "expiries={expiries}");
 }
 
 #[test]

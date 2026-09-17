@@ -5,6 +5,7 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod interpose;
 mod report;
 #[path = "../../src/rng.rs"]
 mod rng;
@@ -17,11 +18,10 @@ static INIT: extern "C" fn() = init;
 
 extern "C" fn init() {
     let config = sched::Config::from_env();
-    let Some(page) = stubdata::find() else {
-        report::log("no __STUBD page in the main image; running unhooked");
-        report::install_exit_hook();
-        return;
-    };
+    let page = stubdata::find();
+    if page.is_none() {
+        report::log("no __STUBD page in the main image; scheduling only at blocking calls");
+    }
     sched::init(page, &config);
     report::install_exit_hook();
 }

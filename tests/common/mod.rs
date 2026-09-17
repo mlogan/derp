@@ -74,3 +74,67 @@ pub fn build_c_source(name: &str, source: &str, out_dir: &Path) -> PathBuf {
     assert!(status.success(), "compiling {name} failed");
     out
 }
+
+/// Compile a Rust test program with rustc directly (std, optimized).
+pub fn build_rust(name: &str, out_dir: &Path) -> PathBuf {
+    let src = programs_dir().join(format!("{name}.rs"));
+    let out = out_dir.join(name);
+    let status = Command::new("rustc")
+        .args(["-O", "-C", "link-args=-Wl,-headerpad,0x1000", "-o"])
+        .arg(&out)
+        .arg(&src)
+        .status()
+        .expect("rustc");
+    assert!(status.success(), "compiling {name} failed");
+    out
+}
+
+/// Rewrite `exe` into `out` and sign it.
+pub fn rewrite_to(
+    exe: &Path,
+    out: &Path,
+    opts: &rewrite::rewrite::Options,
+) -> rewrite::rewrite::Stats {
+    let m = rewrite::macho::MachO::parse(std::fs::read(exe).unwrap()).unwrap();
+    let r = rewrite::rewrite::rewrite(&m, opts).unwrap();
+    std::fs::write(out, &r.image).unwrap();
+    std::fs::set_permissions(out, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    rewrite::macho::adhoc_sign(out).unwrap();
+    r.stats
+}
+
+/// Run `exe` under the launcher with stdout captured to a file.
+/// Returns the outcome and the captured stdout.
+pub fn run(
+    exe: &Path,
+    args: &[&str],
+    dylib: Option<PathBuf>,
+    env: Vec<(String, String)>,
+) -> (rewrite::launch::Outcome, String) {
+    let tag = format!("{}-{:?}", std::process::id(), std::thread::current().id());
+    let tag = tag.replace(|c: char| !c.is_ascii_alphanumeric(), "");
+    let out_path = exe.with_extension(format!("out{tag}"));
+    let script = exe.with_extension(format!("sh{tag}"));
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nexec \"$@\" > {}\n", out_path.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let mut all = vec![exe.as_os_str().to_owned()];
+    all.extend(args.iter().map(std::convert::Into::into));
+    let cfg = rewrite::launch::Launch {
+        exe: script,
+        args: all,
+        dylib,
+        env,
+        disable_aslr: true,
+    };
+    let outcome = rewrite::launch::launch(&cfg).expect("launch");
+    let text = std::fs::read_to_string(&out_path).unwrap_or_default();
+    (outcome, text)
+}
+
+pub fn seed_env(seed: u64) -> Vec<(String, String)> {
+    vec![("REWRITE_SEED".into(), seed.to_string())]
+}

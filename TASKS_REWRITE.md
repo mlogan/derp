@@ -25,10 +25,46 @@ unit.
 - Hello world round-trips and runs standalone and supervised
   (`tests/macho_tests.rs`).
 
-## Day 2 — Branch rewriting, stubs, overhead ⏳
+## Day 2 — Branch rewriting, stubs, overhead ✅
 
-## Day 3 — Threads, baton scheduler, blocking primitives
+- `decode.rs`: branch, memory, exclusive, stack-address classes with
+  assembler-verified unit tests.
+- `rewrite.rs`: one stub per hooked site; conditional sites keep an
+  inverted guard inside the stub (reach never matters); `bl`/`blr` sites
+  keep `bl` so x30 is set by hardware; memory sites replay the word.
+- Supervisor trampoline saves x2-x17, nzcv, fpsr, q0-q31 around the Rust
+  scheduler.
+- Overhead on `loops 3`, branch-only, no supervisor: **1.64x** (target
+  1.3x). Deferred: keep `b.cond` at the site when the stub is in reach,
+  use x16/x17 at call sites instead of the stack.
 
-## Day 4 — Seeded quanta, trace, memory hooks
+## Day 3 — Threads, baton scheduler, blocking primitives ✅
+
+- `sched.rs`: one mach semaphore per thread, baton handed at quantum expiry
+  and blocking calls; RNG picks the next runnable thread and the quantum.
+- `interpose.rs`: `pthread_create/join`, mutex (trylock loop), cond
+  (FIFO waiter queues, timed waits released when idle), `__ulock_wait*`,
+  `os_sync_wait_on_address*`, `dispatch_semaphore_wait` (Rust's
+  `Thread::park`), `sched_yield`, sleeps.
+- Thread exit: a pthread key destructor (created after dyld's TLV key, so
+  it runs after Rust TLS destructors) hands the baton on. libpthread nulls
+  the key value before the destructor, so the id is passed explicitly.
+- Gotchas found: image 0 is the inserted dylib, not the executable (use
+  `_NSGetMachExecuteHeader`); the real `pthread_join` waits on a ulock
+  only the kernel wakes (pass-through mode); `os_unfair_lock` waiters
+  yield-and-retry because the unlock only wakes if the kernel saw a waiter.
+- `mutex.c`, `race.c` (both variants), `channel.rs` pass
+  (`tests/threads_tests.rs`).
+
+## Day 4 — Seeded quanta, trace, memory hooks ✅
+
+- Sparse memory hooks with the stack and exclusive-span rules were built on
+  day 2; schedule hash (FNV over from/to/issued) in the report.
+- `race.c` with `--mem-hook-rate 1/16`: seed 30 (of this build) hooks the
+  store and prints total=313294 with the same hash on every run; branch
+  hooks only always print 400000. Test searches seeds 1..40 rather than
+  hard-coding one.
+- Known limitation: a lost update needs the *store* hooked; a hooked load
+  replays after the switch, so it cannot split the read-modify-write.
 
 ## Day 5 — Determinism hardening, measurements, write-up

@@ -420,6 +420,12 @@ Before committing, verify:
 compiler), 6 (register allocation), 7 (benchmark corpus and performance).
 See `TASKS_PHASE{N}.md`.
 
+**Rewrite experiment** (branch `mlogan-rewrite`): the repository and
+`supervisor/` run native arm64 Mach-O binaries under a
+deterministic baton scheduler. Plan in `IMPLEMENTATION_PLAN_REWRITE.md`,
+progress in `TASKS_REWRITE.md`, results in `docs/REWRITE_RESULTS.md`.
+Guests must link with `-Wl,-headerpad,0x1000`.
+
 **Next Phase**: Not yet planned
 
 ---

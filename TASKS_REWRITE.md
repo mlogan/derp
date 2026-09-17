@@ -67,4 +67,28 @@ unit.
 - Known limitation: a lost update needs the *store* hooked; a hooked load
   replays after the switch, so it cannot split the read-modify-write.
 
-## Day 5 — Determinism hardening, measurements, write-up
+## Day 5 — Determinism hardening, measurements, write-up ✅
+
+- `supervisor/src/alloc.rs`: size-class allocator in a 4 GB region at
+  0x3_0000_0000 behind the interposed malloc family; foreign pointers go
+  to the real functions.
+- `supervisor/src/determinism.rs`: seeded `arc4random*`, `getentropy`,
+  `CCRandomGenerateBytes`; virtual clock behind `clock_gettime`,
+  `gettimeofday`, `time`, `mach_absolute_time` (+1 µs per read, +1 ms per
+  switch). mmap placement was tried and dropped (libmalloc xzone traps).
+- `supervisor/src/spin.rs`: spinlock for state touched before libmalloc is
+  initialized (`std::sync::Mutex` reads a thread-local, which dyld
+  allocates with `malloc`).
+- Schedule hash now covers the switch site (stub address or blocked-on
+  address); `rewrite repeat --runs N` checks exit status, stdout and hash.
+- 100-run identical checks: race.c (seed 30, total 313294), channel.rs,
+  mutex.c (50), loops.c dense (20). All pass.
+- Overhead on `loops 3`: branch-only 1.57x (1.62x supervised), 1/16 2.0x,
+  rate 1 5.1x. Targets (1.3x, 3x) missed; see the write-up.
+- Write-up: `docs/REWRITE_RESULTS.md`.
+
+## Remaining (days 6-7 slack, not started)
+
+- Stub cost: keep `b.cond` at the site when in reach; x16/x17 at call sites.
+- Virtual-clock-driven timed waits.
+- Blocking pass-through calls (`read` on a pipe) still hold the baton.

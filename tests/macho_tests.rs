@@ -9,21 +9,14 @@ fn run_capture(
     exe: &std::path::Path,
     dylib: Option<std::path::PathBuf>,
 ) -> (launch::Outcome, String) {
-    // Route the guest's stdout through a file so the test can read it.
     let out_path = exe.with_extension("out");
-    let script = common::scratch_dir("macho").join("run.sh");
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\nexec \"$@\" > {}\n", out_path.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let cfg = Launch {
-        exe: script,
-        args: vec![exe.as_os_str().to_owned()],
+        exe: exe.to_path_buf(),
+        args: Vec::new(),
         dylib,
         env: Vec::new(),
         disable_aslr: true,
+        stdout: Some(out_path.clone()),
     };
     let outcome = launch::launch(&cfg).expect("launch");
     let text = std::fs::read_to_string(&out_path).unwrap_or_default();

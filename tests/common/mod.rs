@@ -114,21 +114,13 @@ pub fn run(
     let tag = format!("{}-{:?}", std::process::id(), std::thread::current().id());
     let tag = tag.replace(|c: char| !c.is_ascii_alphanumeric(), "");
     let out_path = exe.with_extension(format!("out{tag}"));
-    let script = exe.with_extension(format!("sh{tag}"));
-    std::fs::write(
-        &script,
-        format!("#!/bin/sh\nexec \"$@\" > {}\n", out_path.display()),
-    )
-    .unwrap();
-    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
-    let mut all = vec![exe.as_os_str().to_owned()];
-    all.extend(args.iter().map(std::convert::Into::into));
     let cfg = rewrite::launch::Launch {
-        exe: script,
-        args: all,
+        exe: exe.to_path_buf(),
+        args: args.iter().map(std::convert::Into::into).collect(),
         dylib,
         env,
         disable_aslr: true,
+        stdout: Some(out_path.clone()),
     };
     let outcome = rewrite::launch::launch(&cfg).expect("launch");
     let text = std::fs::read_to_string(&out_path).unwrap_or_default();

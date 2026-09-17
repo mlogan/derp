@@ -20,6 +20,8 @@ pub struct Launch {
     /// Extra `KEY=VALUE` pairs for the child's environment
     pub env: Vec<(String, String)>,
     pub disable_aslr: bool,
+    /// Redirect the guest's stdout to this file (created or truncated)
+    pub stdout: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -119,14 +121,27 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
             0
         };
         libc::posix_spawnattr_setflags(&raw mut attr, flags);
+        let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
+        libc::posix_spawn_file_actions_init(&raw mut actions);
+        let stdout_c = cfg.stdout.as_deref().map(cstring);
+        if let Some(p) = &stdout_c {
+            libc::posix_spawn_file_actions_addopen(
+                &raw mut actions,
+                1,
+                p.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                0o644,
+            );
+        }
         let rc = libc::posix_spawn(
             &raw mut pid,
             exe.as_ptr(),
-            std::ptr::null(),
+            &raw const actions,
             &raw const attr,
             argv_ptrs.as_ptr(),
             env_ptrs.as_ptr(),
         );
+        libc::posix_spawn_file_actions_destroy(&raw mut actions);
         libc::posix_spawnattr_destroy(&raw mut attr);
         libc::close(write_fd);
         rc

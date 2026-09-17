@@ -252,14 +252,16 @@ impl Sched {
 /// Give up the baton with `state` recorded for the calling thread, and
 /// block until it comes back. Must be called with the baton held and
 /// without the scheduler lock.
-pub fn yield_baton(state: State) {
+/// `site` names the switch point for the schedule trace: the stub address
+/// on quantum expiry, the blocked-on address for blocking calls.
+pub fn yield_baton(state: State, site: u64) {
     let Some(me) = my_id() else { return };
-    yield_baton_as(me, state);
+    yield_baton_as(me, state, site);
 }
 
 /// `yield_baton` for a caller that already knows its id (the teardown hook
 /// runs after libpthread has cleared the key value).
-pub fn yield_baton_as(me: usize, state: State) {
+pub fn yield_baton_as(me: usize, state: State, site: u64) {
     let mut guard = SCHED.lock().unwrap();
     let Some(s) = guard.as_mut() else { return };
     debug_assert_eq!(s.current, me);
@@ -278,7 +280,11 @@ pub fn yield_baton_as(me: usize, state: State) {
         return;
     }
     s.switches += 1;
-    s.trace_hash = fnv(fnv(fnv(s.trace_hash, me as u64), next as u64), s.issued);
+    crate::determinism::on_switch();
+    s.trace_hash = fnv(
+        fnv(fnv(fnv(s.trace_hash, me as u64), next as u64), s.issued),
+        site,
+    );
     s.threads[next].state = State::Running;
     s.current = next;
     let next_sem = s.threads[next].sem;
@@ -299,12 +305,12 @@ pub fn wait_for_baton(id: usize) {
 /// Called from the stub's expired path through the register-saving
 /// trampoline, with the guest's registers already preserved.
 #[no_mangle]
-pub extern "C" fn rewrite_yield_impl() {
+pub extern "C" fn rewrite_yield_impl(stub_pc: u64) {
     if let Some(s) = SCHED.lock().unwrap().as_mut() {
         s.expiries += 1;
     }
     if my_id().is_some() {
-        yield_baton(State::Runnable);
+        yield_baton(State::Runnable, stub_pc);
     } else if let Some(s) = SCHED.lock().unwrap().as_mut() {
         s.reset_counter();
     }
@@ -369,6 +375,7 @@ std::arch::global_asm!(
     "stp q26, q27, [sp, #-32]!",
     "stp q28, q29, [sp, #-32]!",
     "stp q30, q31, [sp, #-32]!",
+    "mov x0, x30",
     "bl _rewrite_yield_impl",
     "ldp q30, q31, [sp], #32",
     "ldp q28, q29, [sp], #32",

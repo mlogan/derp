@@ -9,6 +9,15 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::alloc::{
+    my_aligned_alloc, my_calloc, my_free, my_malloc, my_malloc_good_size, my_malloc_size,
+    my_posix_memalign, my_realloc, my_valloc,
+};
+use crate::determinism::{
+    my_arc4random, my_arc4random_buf, my_arc4random_uniform, my_cc_random_generate_bytes,
+    my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_gettimeofday,
+    my_mach_absolute_time, my_mach_continuous_time, my_time,
+};
 use crate::sched::{self, my_id, State, SCHED};
 
 #[repr(C)]
@@ -50,6 +59,11 @@ extern "C" {
     fn pthread_yield_np();
     fn dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isize;
     fn dispatch_semaphore_signal(sema: *mut c_void) -> isize;
+    fn CCRandomGenerateBytes(buf: *mut c_void, n: usize) -> c_int;
+    fn valloc(size: usize) -> *mut c_void;
+    fn clock_gettime_nsec_np(clk: libc::clockid_t) -> u64;
+    fn mach_absolute_time() -> u64;
+    fn mach_continuous_time() -> u64;
 }
 
 const DISPATCH_TIME_NOW: u64 = 0;
@@ -112,7 +126,7 @@ pub extern "C" fn thread_teardown(value: *mut c_void) {
             s.wake_all(join_key(id));
         }
     }
-    sched::yield_baton_as(id, State::Exited);
+    sched::yield_baton_as(id, State::Exited, 0);
 }
 
 extern "C" fn my_pthread_create(
@@ -150,7 +164,7 @@ extern "C" fn my_pthread_join(t: libc::pthread_t, ret: *mut *mut c_void) -> c_in
                 break;
             }
             drop(guard);
-            sched::yield_baton(State::Blocked(join_key(id)));
+            sched::yield_baton(State::Blocked(join_key(id)), join_key(id) as u64);
         }
     }
     // The real join waits on a ulock the kernel wakes at thread
@@ -168,7 +182,7 @@ extern "C" fn my_pthread_mutex_lock(m: *mut libc::pthread_mutex_t) -> c_int {
             return rc;
         }
         count(C_MUTEX);
-        sched::yield_baton(State::Blocked(m as usize));
+        sched::yield_baton(State::Blocked(m as usize), m as usize as u64);
     }
 }
 
@@ -217,7 +231,7 @@ fn cond_block(c: usize, me: usize) -> bool {
                 return false;
             }
         }
-        sched::yield_baton(State::Blocked(c));
+        sched::yield_baton(State::Blocked(c), c as u64);
     }
 }
 
@@ -311,7 +325,7 @@ fn futex_block(addr: *mut c_void, timed: bool) -> bool {
         s.threads[me].timed = timed;
         s.threads[me].timed_out = false;
     }
-    sched::yield_baton(State::Blocked(addr as usize));
+    sched::yield_baton(State::Blocked(addr as usize), addr as usize as u64);
     let mut guard = SCHED.lock().unwrap();
     let t = &mut guard.as_mut().unwrap().threads[me];
     t.timed = false;
@@ -344,7 +358,7 @@ extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: 
         return 0;
     }
     if ulock_is_unfair(op) {
-        sched::yield_baton(State::Runnable);
+        sched::yield_baton(State::Runnable, 0);
         return 0;
     }
     if futex_block(addr, timeout_us != 0) {
@@ -369,7 +383,7 @@ extern "C" fn my_ulock_wait2(
         return 0;
     }
     if ulock_is_unfair(op) {
-        sched::yield_baton(State::Runnable);
+        sched::yield_baton(State::Runnable, 0);
         return 0;
     }
     if futex_block(addr, timeout_ns != 0) {
@@ -483,7 +497,7 @@ extern "C" fn my_sched_yield() -> c_int {
         return unsafe { libc::sched_yield() };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable);
+    sched::yield_baton(State::Runnable, 0);
     0
 }
 
@@ -492,7 +506,7 @@ extern "C" fn my_pthread_yield_np() {
         return unsafe { pthread_yield_np() };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable);
+    sched::yield_baton(State::Runnable, 0);
 }
 
 extern "C" fn my_nanosleep(req: *const libc::timespec, rem: *mut libc::timespec) -> c_int {
@@ -500,7 +514,7 @@ extern "C" fn my_nanosleep(req: *const libc::timespec, rem: *mut libc::timespec)
         return unsafe { libc::nanosleep(req, rem) };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable);
+    sched::yield_baton(State::Runnable, 0);
     0
 }
 
@@ -509,7 +523,7 @@ extern "C" fn my_usleep(us: u32) -> c_int {
         return unsafe { libc::usleep(us) };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable);
+    sched::yield_baton(State::Runnable, 0);
     0
 }
 
@@ -518,7 +532,7 @@ extern "C" fn my_sleep(s: u32) -> u32 {
         return unsafe { libc::sleep(s) };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable);
+    sched::yield_baton(State::Runnable, 0);
     0
 }
 
@@ -545,4 +559,24 @@ interposers! {
     my_nanosleep => libc::nanosleep,
     my_usleep => libc::usleep,
     my_sleep => libc::sleep,
+    my_malloc => libc::malloc,
+    my_calloc => libc::calloc,
+    my_free => libc::free,
+    my_realloc => libc::realloc,
+    my_posix_memalign => libc::posix_memalign,
+    my_aligned_alloc => libc::aligned_alloc,
+    my_valloc => valloc,
+    my_malloc_size => libc::malloc_size,
+    my_malloc_good_size => libc::malloc_good_size,
+    my_arc4random => libc::arc4random,
+    my_arc4random_uniform => libc::arc4random_uniform,
+    my_arc4random_buf => libc::arc4random_buf,
+    my_getentropy => libc::getentropy,
+    my_cc_random_generate_bytes => CCRandomGenerateBytes,
+    my_clock_gettime => libc::clock_gettime,
+    my_clock_gettime_nsec_np => clock_gettime_nsec_np,
+    my_gettimeofday => libc::gettimeofday,
+    my_time => libc::time,
+    my_mach_absolute_time => mach_absolute_time,
+    my_mach_continuous_time => mach_continuous_time,
 }

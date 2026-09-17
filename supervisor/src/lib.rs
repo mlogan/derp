@@ -5,11 +5,14 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+mod alloc;
+mod determinism;
 mod interpose;
 mod report;
 #[path = "../../src/rng.rs"]
 mod rng;
 mod sched;
+mod spin;
 mod stubdata;
 
 #[used]
@@ -22,6 +25,7 @@ extern "C" fn init() {
     if page.is_none() {
         report::log("no __STUBD page in the main image; scheduling only at blocking calls");
     }
+    determinism::init(config.seed);
     sched::init(page, &config);
     report::install_exit_hook();
 }

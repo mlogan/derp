@@ -14,7 +14,9 @@ usage:
   rewrite rewrite [opts] <in> <out>    rewrite and sign
   rewrite run [opts] <prog> [args…]    rewrite (cached), then launch under the supervisor
   rewrite bench [opts] <prog> [args…]  time native vs rewritten (no supervisor)
+  rewrite repeat [opts] <prog> [args…] run N times; exit status, stdout and schedule hash must agree
 options:
+  --runs N                             repetitions for repeat (default 100)
   --seed S                             run seed (default 0)
   --mem-hook-rate R                    0, 1 or a fraction like 1/16 (default 0)
   --quantum LO..HI                     hook events per quantum (default 1000..10000)
@@ -34,6 +36,7 @@ struct Cli {
     supervisor: bool,
     disable_aslr: bool,
     native: bool,
+    runs: u32,
     rest: Vec<OsString>,
 }
 
@@ -44,6 +47,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         supervisor: true,
         disable_aslr: true,
         native: false,
+        runs: 100,
         rest: Vec::new(),
     };
     while let Some(a) = args.first().and_then(|a| a.to_str()).map(str::to_owned) {
@@ -66,6 +70,9 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             "--no-supervisor" => cli.supervisor = false,
             "--aslr" => cli.disable_aslr = false,
             "--native" => cli.native = true,
+            "--runs" => {
+                cli.runs = take_value(&mut args)?.parse().map_err(|_| "bad --runs")?;
+            }
             _ if a.starts_with("--") => return Err(format!("unknown option {a}")),
             _ => break,
         }
@@ -129,6 +136,7 @@ fn run_guest(
     cli: &Cli,
     args: Vec<OsString>,
     quiet: bool,
+    stdout: Option<PathBuf>,
 ) -> Fallible<launch::Outcome> {
     let dylib = if cli.supervisor && !cli.native {
         Some(
@@ -147,6 +155,7 @@ fn run_guest(
             ("REWRITE_QUANTUM".into(), cli.quantum.clone()),
         ],
         disable_aslr: cli.disable_aslr,
+        stdout,
     };
     let outcome = launch::launch(&cfg)?;
     if !quiet {
@@ -177,7 +186,7 @@ fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
         let mut best = f64::INFINITY;
         for _ in 0..3 {
             let t = Instant::now();
-            let o = run_guest(exe.to_path_buf(), plain, rest[1..].to_vec(), true)?;
+            let o = run_guest(exe.to_path_buf(), plain, rest[1..].to_vec(), true, None)?;
             if o.exit_code() != Some(0) {
                 return Err(format!("{} failed", exe.display()).into());
             }
@@ -194,6 +203,55 @@ fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
         rewritten_t / native
     );
     Ok(())
+}
+
+/// Run the guest `cli.runs` times; every run must agree with the first on
+/// exit status, stdout and schedule hash.
+fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
+    let prog = PathBuf::from(&rest[0]);
+    let exe = cached_rewrite(&prog, &cli.opts)?;
+    let out = std::env::temp_dir().join(format!("rewrite-repeat-{}", std::process::id()));
+    let mut first: Option<(Option<i32>, String, String)> = None;
+    let mut result = Ok(());
+    for i in 0..cli.runs {
+        let o = run_guest(
+            exe.clone(),
+            cli,
+            rest[1..].to_vec(),
+            true,
+            Some(out.clone()),
+        )?;
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        let hash = o.report.get("schedule_hash").unwrap_or("").to_string();
+        let this = (o.exit_code(), text, hash);
+        match &first {
+            None => {
+                println!(
+                    "run 0: exit={:?} hash={} stdout={:?}",
+                    this.0,
+                    this.2,
+                    this.1.trim_end()
+                );
+                first = Some(this);
+            }
+            Some(f) if *f != this => {
+                result = Err(format!(
+                    "run {i} differs: exit={:?} hash={} stdout={:?}",
+                    this.0,
+                    this.2,
+                    this.1.trim_end()
+                )
+                .into());
+                break;
+            }
+            Some(_) => {}
+        }
+    }
+    let _ = std::fs::remove_file(&out);
+    if result.is_ok() {
+        println!("{} runs identical", cli.runs);
+    }
+    result
 }
 
 fn main() -> ExitCode {
@@ -230,10 +288,11 @@ fn main() -> ExitCode {
             } else {
                 cached_rewrite(&prog, &cli.opts)
             };
-            exe.and_then(|exe| run_guest(exe, &cli, rest[1..].to_vec(), false))
+            exe.and_then(|exe| run_guest(exe, &cli, rest[1..].to_vec(), false, None))
                 .map(|o| exit_from(&o))
         }
         Some("bench") if !rest.is_empty() => bench(cli, &rest).map(|()| ExitCode::SUCCESS),
+        Some("repeat") if !rest.is_empty() => repeat(&cli, &rest).map(|()| ExitCode::SUCCESS),
         _ => return fail(USAGE),
     };
     result.unwrap_or_else(fail)

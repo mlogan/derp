@@ -71,6 +71,7 @@ fn stubs_are_slide_proof() {
         dylib: Some(common::supervisor_dylib()),
         env: vec![],
         disable_aslr: false,
+        stdout: None,
     };
     // Output goes to the test's stdout here; only the status is checked.
     let o = launch::launch(&cfg).unwrap();

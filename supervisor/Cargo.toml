@@ -1,0 +1,15 @@
+[package]
+name = "rewrite-supervisor"
+version = "0.1.0"
+edition = "2021"
+description = "Supervisor dylib injected into rewritten guests: baton scheduler and libSystem interposers"
+
+[lib]
+name = "rewrite_supervisor"
+crate-type = ["cdylib"]
+
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

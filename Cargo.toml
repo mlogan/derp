@@ -1,0 +1,11 @@
+[package]
+name = "rewrite"
+version = "0.1.0"
+edition = "2021"
+description = "Rewrites aarch64 Mach-O executables to hook branches and memory accesses, and launches them under a deterministic scheduler"
+
+[dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

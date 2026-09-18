@@ -129,17 +129,76 @@ Overhead on `loops 3` today (release build):
 | supervised, rate 1/16 | 0.55 s | 2.2x |
 | supervised, rate 1 | 1.46 s | 5.8x |
 
-## Day 3 — Virtual pids and process lifecycle (next)
+## Day 3 — Virtual pids and process lifecycle ✅
 
-- [ ] Launcher socket: `Register`, `Spawn` (rewrite on demand), `Report`
-- [ ] `posix_spawn`/`posix_spawnp`, `fork`, `execve` interposition
-- [ ] `waitpid`/`wait4` as scheduler waits; vpid translation in `getpid`,
-      `getppid`, `kill`
-- [ ] Spawned children are reaped by their parent, not the launcher, so
-      the launcher's "hand the baton on after the reap" path needs another
-      signal for them (kqueue `NOTE_EXIT` works on any pid)
-- [ ] `pipeline.c` spawns its stages
+- **One launcher socket for the whole run** (not one per guest as the plan
+  said), inherited by every guest at fd 240. Only the baton holder talks,
+  so frames from different processes never interleave, and spawned
+  children need no new connection. Frames: `Spawn` (path → rewritten
+  path), `Spawned` (child index, real pid → ack once the launcher watches
+  it), `Report` (replaces the per-guest report pipe).
+- The launcher loop is a kqueue over the socket and `NOTE_EXIT |
+  NOTE_EXITSTATUS` for every process of the run. It cannot reap guests'
+  children, so their status comes from the event. Socket frames are
+  drained before an exit is handled, so a dying guest's report is not lost.
+- **The parent registers a spawned child itself** in the shared state (it
+  holds the baton), so process and thread ids follow spawn order. The
+  child starts parked and runnable; no launcher round trip for `Register`.
+- `posix_spawn`, `posix_spawnp` (own `PATH` search), `fork`, `execve`.
+  Children get our environment variables re-injected whatever `envp` the
+  guest passed, and ASLR off. `execve` keeps the process record and the
+  baton; the new image adopts the one live thread record. A `fork` child
+  parks like a spawned one (the plan had the parent park; either is
+  deterministic and this shares the spawn path).
+- `waitpid`, `wait4`, `wait`: block on the process's wait key until the
+  launcher has seen a child die, then a real `wait4` on the zombie.
+  `WNOHANG` works. Process groups are not modelled (pid 0 or negative
+  means any child).
+- Virtual pids are `1000 + index`; the launcher is pid 1 to guests.
+  `kill` with SIGTERM/SIGKILL retires the target's threads under the lock
+  before sending, so the baton cannot go to a dead thread; other signals
+  to other guests are logged and dropped.
+- On-demand rewriting lives in `src/cache.rs` (moved from the
+  CLI). An already rewritten file passes through, which is what a guest
+  re-spawning itself via `_NSGetExecutablePath` names. Cache writes go
+  through a rename.
+- A manifest run's exit status reflects the manifest's own processes only.
+- Test: `spawn_tree.c` (two `posix_spawn`, one `fork`+`execve`, one plain
+  `fork`, reaped by pid and with `wait`). Pids 1000-1004, line order
+  differs across seeds, 100 identical runs at seed 3.
 
-## Days 4-12 — not started
+## Day 4 — Readiness waits for pipes ✅
+
+- `supervisor/src/io.rs`: `read`, `readv`, `write`, `writev`,
+  `close` and their `$NOCANCEL` forms (stdio calls those, not the public
+  names). Pipes and kernel sockets in blocking mode only; regular files,
+  ttys and descriptors the guest made non-blocking pass through.
+- Reads `poll` with a zero timeout first. Writes set `O_NONBLOCK` around
+  each attempt and loop until the whole buffer is out, parking when the
+  pipe is full. The flag flip is invisible to other guests because nobody
+  else runs in between.
+- All I/O waiters share one key and are woken (across processes) after any
+  successful read or write on a pipe or socket, any close, and any process
+  death. Reads wake too: draining a full pipe unblocks its writer.
+- **External descriptors**: pipes and sockets on the launcher's own fds
+  0-2 have their peer outside the run. The launcher exports their
+  `dev:ino` and guests block on them for real; otherwise
+  `echo x | rewrite run prog` would be reported as a deadlock.
+- `io_waits` per process in the report.
+- Test: `pipeline.c`, 200,000 lines through two pipes, every stage parks;
+  correct on every seed, 100 identical runs at seed 2.
+- Deferred to day 5 where it becomes testable: the (process, fd) → virtual
+  socket map across `dup`/`fork`/`execve`. Kernel pipes need no
+  bookkeeping of ours.
+
+## Day 5 — Hosts and virtual stream sockets (next)
+
+- [ ] Host table in the shared state from the manifest
+- [ ] Socket table, bind table keyed on host, rings, backlog
+- [ ] `socket`/`bind`/`listen`/`connect`/`accept`/`send`/`recv`/`close`
+      with placeholder fds and refcounts across `dup`/`fork`/`execve`
+- [ ] `tcp_echo.c` over TCP and `--unix`, server and client on two hosts
+
+## Days 6-12 — not started
 
 See the plan's implementation order.

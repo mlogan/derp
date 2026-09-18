@@ -18,6 +18,11 @@ use crate::determinism::{
     my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_gettimeofday,
     my_mach_absolute_time, my_mach_continuous_time, my_time,
 };
+use crate::io::{
+    close_nocancel, my_close, my_close_nocancel, my_read, my_read_nocancel, my_readv,
+    my_readv_nocancel, my_write, my_write_nocancel, my_writev, my_writev_nocancel, read_nocancel,
+    readv_nocancel, write_nocancel, writev_nocancel,
+};
 use crate::process::{
     my_execve, my_fork, my_getpid, my_getppid, my_kill, my_posix_spawn, my_posix_spawnp, my_wait,
     my_wait4, my_waitpid,
@@ -533,6 +538,16 @@ interposers! {
     my_getpid => libc::getpid,
     my_getppid => libc::getppid,
     my_kill => libc::kill,
+    my_read => libc::read,
+    my_read_nocancel => read_nocancel,
+    my_readv => libc::readv,
+    my_readv_nocancel => readv_nocancel,
+    my_write => libc::write,
+    my_write_nocancel => write_nocancel,
+    my_writev => libc::writev,
+    my_writev_nocancel => writev_nocancel,
+    my_close => libc::close,
+    my_close_nocancel => close_nocancel,
     my_malloc => libc::malloc,
     my_calloc => libc::calloc,
     my_free => libc::free,

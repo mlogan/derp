@@ -192,3 +192,34 @@ fn spawned_forked_and_execed_children_join_the_schedule() {
         "every seed interleaved the output the same way"
     );
 }
+
+#[test]
+fn pipeline_is_correct_with_a_stable_schedule() {
+    let dir = common::scratch_dir("multiproc_pipeline");
+    let exe = common::build_c("pipeline", &dir, &[]);
+    let native = Command::new(&exe).output().unwrap();
+    let expected = String::from_utf8(native.stdout).unwrap();
+    assert!(expected.starts_with("count=66666 checksum="), "{expected}");
+    let manifest = dir.join("pipeline.manifest");
+    std::fs::write(&manifest, "host a\n    pipeline\n").unwrap();
+    let scratch = dir.join("scratch");
+
+    let mut hashes = Vec::new();
+    for seed in 1..=3u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 1);
+        assert_eq!(r.stdout[0], expected, "seed {seed}");
+        assert_eq!(r.u64("run.processes"), 4);
+        // Every stage had to wait for a pipe, in both directions
+        assert!(r.u64("p1.io_waits") > 0, "{:?}", r.fields);
+        assert!(r.u64("p2.io_waits") > 0 && r.u64("p3.io_waits") > 0);
+        let again = run_manifest(&manifest, &scratch, seed, 1);
+        assert_eq!(again.stdout[0], expected);
+        assert_eq!(
+            r.fields["run.schedule_hash"], again.fields["run.schedule_hash"],
+            "seed {seed} not repeatable"
+        );
+        hashes.push(r.fields["run.schedule_hash"].clone());
+    }
+    hashes.dedup();
+    assert!(hashes.len() > 1, "every seed produced the same schedule");
+}

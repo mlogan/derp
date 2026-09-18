@@ -155,6 +155,7 @@ fn spawn(
     let ours = [
         "DYLD_INSERT_LIBRARIES",
         PASSIVE_VAR,
+        shared::EXTERNAL_VAR,
         shared::SHARED_VAR,
         shared::PROC_VAR,
     ];
@@ -499,6 +500,24 @@ fn kill_all(procs: &mut [Tracked]) {
     }
 }
 
+/// `dev:ino` of the pipes and sockets among our own standard descriptors.
+/// Their other end is outside the run, so guests must block on them for
+/// real instead of waiting for another guest to make them ready.
+fn external_objects() -> String {
+    let mut out = Vec::new();
+    for fd in 0..3 {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
+            continue;
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind == libc::S_IFIFO || kind == libc::S_IFSOCK {
+            out.push(format!("{}:{}", st.st_dev, st.st_ino));
+        }
+    }
+    out.join(",")
+}
+
 /// A guest asks where the rewritten form of a program it wants to run is.
 fn rewritten_path(run: &Run, payload: &[u8]) -> Result<Vec<u8>, i32> {
     let path = Path::new(std::ffi::OsStr::from_bytes(payload));
@@ -539,6 +558,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
         if run.passive {
             env.push((PASSIVE_VAR.into(), "1".into()));
         }
+        env.push((shared::EXTERNAL_VAR.into(), external_objects()));
         if let Some(coord) = coord {
             let pid = coord.register(guest.host);
             debug_assert_eq!(pid as usize, procs.len());

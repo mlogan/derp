@@ -279,6 +279,7 @@ pub fn init(info: Option<Info>, cfg: &Config) {
         Ok(path) => {
             crate::coord::connect();
             crate::process::init();
+            crate::io::init();
             join_run(&path)
         }
         Err(_) => start_private_run(cfg),
@@ -309,6 +310,7 @@ pub fn become_forked_child(child: u32) {
     };
     PID.store(child, Ordering::Relaxed);
     HOOKS.store(0, Ordering::Relaxed);
+    crate::io::IO_WAITS.store(0, Ordering::Relaxed);
     for c in &crate::interpose::COUNTS {
         c.store(0, Ordering::Relaxed);
     }
@@ -408,6 +410,11 @@ pub fn report(out: &mut String) {
     let _ = writeln!(out, "expiries={expiries}");
     let _ = writeln!(out, "switches={switches}");
     let _ = writeln!(out, "schedule_hash={hash:016x}");
+    let _ = writeln!(
+        out,
+        "io_waits={}",
+        crate::io::IO_WAITS.load(Ordering::Relaxed)
+    );
     for (name, c) in crate::interpose::COUNT_NAMES
         .iter()
         .zip(crate::interpose::COUNTS.iter())

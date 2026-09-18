@@ -23,14 +23,16 @@ struct Inherit {
     dylib: String,
     shared: String,
     seed: String,
+    external: String,
 }
 
 static INHERIT: SpinLock<Option<Inherit>> = SpinLock::new(None);
 
-const OUR_VARS: [&str; 4] = [
+const OUR_VARS: [&str; 5] = [
     "DYLD_INSERT_LIBRARIES",
     shared::SHARED_VAR,
     shared::PROC_VAR,
+    shared::EXTERNAL_VAR,
     "REWRITE_SEED",
 ];
 
@@ -40,6 +42,7 @@ pub fn init() {
         dylib: get("DYLD_INSERT_LIBRARIES"),
         shared: get(shared::SHARED_VAR),
         seed: get("REWRITE_SEED"),
+        external: get(shared::EXTERNAL_VAR),
     });
 }
 
@@ -82,6 +85,7 @@ fn child_env(envp: *const *mut c_char, proc_index: u32) -> Vec<CString> {
             ("DYLD_INSERT_LIBRARIES", i.dylib.as_str()),
             (shared::SHARED_VAR, i.shared.as_str()),
             ("REWRITE_SEED", i.seed.as_str()),
+            (shared::EXTERNAL_VAR, i.external.as_str()),
         ] {
             out.push(CString::new(format!("{k}={v}")).unwrap());
         }

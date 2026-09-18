@@ -43,6 +43,12 @@ pub const PROC_VAR: &str = "REWRITE_PROC";
 pub const SITE_PROCESS_DIED: u64 = u64::MAX;
 /// Key a process's threads block on in `waitpid`; never a real address
 pub const WAIT_KEY: u64 = 0x7FFF_FFFF_0000;
+/// Key of threads parked until a descriptor becomes ready. Readiness
+/// crosses processes, so these are woken without regard to `pid`.
+pub const IO_KEY: u64 = 0x7FFF_FFFF_0001;
+/// Pipes and sockets the launcher itself was given (as `dev:ino` pairs):
+/// their other end is outside the run, so guests block on them for real.
+pub const EXTERNAL_VAR: &str = "REWRITE_EXTERNAL";
 /// `ProcRec::parent` of the processes the launcher started
 pub const NO_PROC: u32 = u32::MAX;
 /// First virtual pid; process `i` of the run is `VPID_BASE + i`. The
@@ -337,6 +343,17 @@ impl State {
         }
     }
 
+    /// Let every thread parked for I/O readiness re-check. Kernel object
+    /// state only changes when a guest acts, so doing this after each such
+    /// act is exact.
+    pub fn wake_io(&mut self) {
+        for t in self.live() {
+            if t.state == T_BLOCKED && t.key == IO_KEY {
+                t.state = T_RUNNABLE;
+            }
+        }
+    }
+
     pub fn wake_thread(&mut self, id: usize) {
         if self.threads[id].state == T_BLOCKED {
             self.threads[id].state = T_RUNNABLE;
@@ -443,6 +460,8 @@ impl State {
     pub fn process_died(&mut self, pid: u32, status: i32) -> Handoff {
         self.procs[pid as usize].state = P_EXITED;
         self.procs[pid as usize].exit_status = status;
+        // Its descriptors are closed: peers may see EOF or EPIPE now
+        self.wake_io();
         let parent = self.procs[pid as usize].parent;
         if parent != NO_PROC {
             self.wake_all(parent, WAIT_KEY);

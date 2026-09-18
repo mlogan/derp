@@ -9,6 +9,7 @@ mod alloc;
 mod coord;
 mod determinism;
 mod interpose;
+mod io;
 mod process;
 mod report;
 #[path = "../../src/rng.rs"]

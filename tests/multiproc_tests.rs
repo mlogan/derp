@@ -384,3 +384,25 @@ fn two_hosts_share_a_port_and_loopback_stays_home() {
         );
     }
 }
+
+#[test]
+fn timed_waits_follow_the_virtual_clock() {
+    let dir = common::scratch_dir("multiproc_timers");
+    common::build_c("timers", &dir, &[]);
+    let manifest = dir.join("timers.manifest");
+    std::fs::write(&manifest, "host a\n    timers\n").unwrap();
+    let scratch = dir.join("scratch");
+    let started = std::time::Instant::now();
+    for seed in 1..=4u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 1);
+        let out = &r.stdout[0];
+        assert!(
+            out.starts_with("sleepers woke in order 10 20 30\n"),
+            "seed {seed}: {out}"
+        );
+        assert!(!out.contains("NO"), "seed {seed}: {out}");
+        assert_eq!(out.lines().count(), 19, "seed {seed}: {out}");
+    }
+    // Virtual time: the waits add up to seconds of timeouts that nobody sat through
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}

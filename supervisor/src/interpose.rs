@@ -31,6 +31,7 @@ use crate::net::{
     my_listen, my_recv, my_recvfrom, my_recvmsg, my_send, my_sendmsg, my_sendto, my_setsockopt,
     my_shutdown, my_socket, rewrite_fcntl_shim, rewrite_ioctl_shim,
 };
+use crate::poll::{my_poll, my_select};
 use crate::process::{
     my_execve, my_fork, my_getpid, my_getppid, my_kill, my_posix_spawn, my_posix_spawnp, my_wait,
     my_wait4, my_waitpid,
@@ -139,7 +140,7 @@ pub extern "C" fn thread_teardown(value: *mut c_void) {
     let id = value as usize - 1;
     count(C_EXIT);
     sched::wake_all(join_key(id));
-    sched::yield_baton_as(id, State::Exited, 0);
+    sched::yield_baton_as(id, State::Exited, 0, None);
 }
 
 extern "C" fn my_pthread_create(
@@ -204,32 +205,25 @@ extern "C" fn my_pthread_mutex_unlock(m: *mut libc::pthread_mutex_t) -> c_int {
     rc
 }
 
-fn cond_enqueue(c: usize, me: usize, timed: bool) {
-    sched::with(|s, _| s.cond_enqueue(me, c as u64, timed));
+fn cond_enqueue(c: usize, me: usize) {
+    sched::with(|s, _| s.cond_enqueue(me, c as u64));
 }
 
-/// Returns true when signaled, false on timeout
-fn cond_block(c: usize, me: usize) -> bool {
+/// Returns true when signaled, false when `deadline` passed first
+fn cond_block(c: usize, me: usize, deadline: Option<u64>) -> bool {
     loop {
-        let done = sched::with(|s, _| {
-            let t = &mut s.threads[me];
-            if t.signaled {
-                t.signaled = false;
-                t.timed = false;
-                return Some(true);
-            }
-            if t.timed_out {
-                t.timed = false;
-                t.timed_out = false;
-                t.cond_key = 0;
-                return Some(false);
-            }
-            None
-        });
-        if let Some(Some(signaled)) = done {
-            return signaled;
+        let signaled = sched::with(|s, _| std::mem::take(&mut s.threads[me].signaled));
+        if signaled == Some(true) {
+            return true;
         }
-        sched::yield_baton(State::Blocked(c), c as u64);
+        if sched::block_until(c as u64, deadline) {
+            // A signal that raced the deadline still counts
+            return sched::with(|s, _| {
+                let t = &mut s.threads[me];
+                t.cond_key = 0;
+                std::mem::take(&mut t.signaled)
+            }) == Some(true);
+        }
     }
 }
 
@@ -241,9 +235,9 @@ extern "C" fn my_pthread_cond_wait(
         return unsafe { libc::pthread_cond_wait(c, m) };
     };
     count(C_COND);
-    cond_enqueue(c as usize, me, false);
+    cond_enqueue(c as usize, me);
     my_pthread_mutex_unlock(m);
-    cond_block(c as usize, me);
+    cond_block(c as usize, me, None);
     my_pthread_mutex_lock(m)
 }
 
@@ -256,9 +250,12 @@ extern "C" fn my_pthread_cond_timedwait(
         return unsafe { libc::pthread_cond_timedwait(c, m, ts) };
     };
     count(C_COND);
-    cond_enqueue(c as usize, me, true);
+    // The deadline is absolute on the (virtual) realtime clock
+    let abs = unsafe { (*ts).tv_sec as u64 * 1_000_000_000 + (*ts).tv_nsec as u64 };
+    let deadline = abs.saturating_sub(crate::determinism::REALTIME_BASE_NS);
+    cond_enqueue(c as usize, me);
     my_pthread_mutex_unlock(m);
-    let signaled = cond_block(c as usize, me);
+    let signaled = cond_block(c as usize, me, Some(deadline));
     let rc = my_pthread_mutex_lock(m);
     if rc != 0 {
         return rc;
@@ -301,20 +298,17 @@ fn value_matches(addr: *mut c_void, value: u64, wide: bool) -> bool {
     }
 }
 
-/// Block on `addr` once. Returns false if the wait timed out.
-fn futex_block(addr: *mut c_void, timed: bool) -> bool {
-    let me = my_id().unwrap();
-    sched::with(|s, _| {
-        s.threads[me].timed = timed;
-        s.threads[me].timed_out = false;
-    });
-    sched::yield_baton(State::Blocked(addr as usize), addr as usize as u64);
-    sched::with(|s, _| {
-        let t = &mut s.threads[me];
-        t.timed = false;
-        !std::mem::take(&mut t.timed_out)
-    })
-    .unwrap_or(true)
+/// Block on `addr` once, for at most `timeout_ns` of virtual time (0:
+/// forever). Returns false if the wait timed out.
+fn futex_block(addr: *mut c_void, timeout_ns: u64) -> bool {
+    let deadline = (timeout_ns != 0).then(|| sched::now() + timeout_ns);
+    !sched::block_until(addr as usize as u64, deadline)
+}
+
+/// Sleep for `ns` of virtual time: a wait nothing but the deadline ends.
+fn sleep_ns(ns: u64) {
+    let deadline = sched::now() + ns;
+    while !sched::block_until(shared::SLEEP_KEY, Some(deadline)) {}
 }
 
 fn ulock_is_wide(op: u32) -> bool {
@@ -346,7 +340,7 @@ extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: 
         sched::yield_baton(State::Runnable, 0);
         return 0;
     }
-    if futex_block(addr, timeout_us != 0) {
+    if futex_block(addr, u64::from(timeout_us) * 1000) {
         0
     } else {
         timed_out_errno()
@@ -371,7 +365,7 @@ extern "C" fn my_ulock_wait2(
         sched::yield_baton(State::Runnable, 0);
         return 0;
     }
-    if futex_block(addr, timeout_ns != 0) {
+    if futex_block(addr, timeout_ns) {
         0
     } else {
         timed_out_errno()
@@ -399,7 +393,7 @@ extern "C" fn my_os_sync_wait_on_address(
     if !value_matches(addr, value, size == 8) {
         return 0;
     }
-    futex_block(addr, false);
+    futex_block(addr, 0);
     0
 }
 
@@ -420,7 +414,7 @@ extern "C" fn my_os_sync_wait_on_address_with_timeout(
     if !value_matches(addr, value, size == 8) {
         return 0;
     }
-    if futex_block(addr, true) {
+    if futex_block(addr, timeout_ns.max(1)) {
         0
     } else {
         timed_out_errno()
@@ -443,6 +437,32 @@ extern "C" fn my_os_sync_wake_by_address_all(addr: *mut c_void, size: usize, fla
     0
 }
 
+/// How long a `dispatch_time_t` deadline is from now, in nanoseconds (0:
+/// forever). libdispatch computed it from the real clock a moment ago, so
+/// the distance is taken on the real clock and rounded to a millisecond,
+/// which absorbs the microseconds since; callers ask for whole
+/// milliseconds far more often than not.
+fn dispatch_timeout_ns(timeout: u64) -> u64 {
+    const MS: i64 = 1_000_000;
+    if timeout == DISPATCH_TIME_FOREVER {
+        return 0;
+    }
+    let real_now = if (timeout as i64) < 0 {
+        // Wall time, encoded as minus nanoseconds since the epoch
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut ts) };
+        let now = ts.tv_sec * 1_000_000_000 + ts.tv_nsec;
+        (timeout as i64).wrapping_neg() - now
+    } else {
+        // Mach absolute ticks; 125/3 ns each on Apple Silicon
+        (timeout as i64) * 125 / 3 - (unsafe { mach_absolute_time() } as i64) * 125 / 3
+    };
+    (((real_now + MS / 2) / MS).max(1) * MS) as u64
+}
+
 /// Rust's `Thread::park` sits on one of these. A zero timeout is a
 /// try-wait, which lets the count live in libdispatch while the blocking
 /// moves into the scheduler.
@@ -455,7 +475,7 @@ extern "C" fn my_dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isi
             return 0;
         }
         count(C_DISPATCH);
-        if !futex_block(sema, timeout != DISPATCH_TIME_FOREVER) {
+        if !futex_block(sema, dispatch_timeout_ns(timeout)) {
             return 1;
         }
     }
@@ -491,7 +511,14 @@ extern "C" fn my_nanosleep(req: *const libc::timespec, rem: *mut libc::timespec)
         return unsafe { libc::nanosleep(req, rem) };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable, 0);
+    let ns = unsafe { (*req).tv_sec as u64 * 1_000_000_000 + (*req).tv_nsec as u64 };
+    sleep_ns(ns);
+    if !rem.is_null() {
+        unsafe {
+            (*rem).tv_sec = 0;
+            (*rem).tv_nsec = 0;
+        }
+    }
     0
 }
 
@@ -500,7 +527,7 @@ extern "C" fn my_usleep(us: u32) -> c_int {
         return unsafe { libc::usleep(us) };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable, 0);
+    sleep_ns(u64::from(us) * 1000);
     0
 }
 
@@ -509,7 +536,7 @@ extern "C" fn my_sleep(s: u32) -> u32 {
         return unsafe { libc::sleep(s) };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable, 0);
+    sleep_ns(u64::from(s) * 1_000_000_000);
     0
 }
 
@@ -577,6 +604,8 @@ interposers! {
     my_freeaddrinfo => libc::freeaddrinfo,
     my_getifaddrs => libc::getifaddrs,
     my_freeifaddrs => libc::freeifaddrs,
+    my_poll => libc::poll,
+    my_select => libc::select,
     my_sendmsg => libc::sendmsg,
     my_recvmsg => libc::recvmsg,
     rewrite_fcntl_shim => libc::fcntl,

@@ -64,6 +64,18 @@ fn managed(fd: c_int) -> bool {
     flags >= 0 && flags & libc::O_NONBLOCK == 0
 }
 
+/// A pipe or kernel socket whose other end is a guest's, whatever its
+/// blocking mode: what `poll` may wait on in the scheduler.
+pub fn is_guest_object(fd: c_int) -> bool {
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
+        return false;
+    }
+    let kind = st.st_mode & libc::S_IFMT;
+    (kind == libc::S_IFIFO || kind == libc::S_IFSOCK)
+        && !EXTERNAL.lock().contains(&(i64::from(st.st_dev), st.st_ino))
+}
+
 /// Any pipe or socket, for deciding whether an act can unblock a peer
 fn shared_object(fd: c_int) -> bool {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };

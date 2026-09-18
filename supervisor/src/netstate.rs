@@ -130,6 +130,10 @@ pub struct Sock {
     /// A datagram socket with a default destination, which also filters
     /// what it receives
     pub has_peer: bool,
+    /// `SO_RCVTIMEO` and `SO_SNDTIMEO` in nanoseconds of virtual time (0:
+    /// wait forever)
+    pub rcv_timeout_ns: u64,
+    pub snd_timeout_ns: u64,
     pub host: u32,
     /// Open descriptors, over all processes
     pub refs: u32,
@@ -249,6 +253,8 @@ impl Net {
         s.pending = false;
         s.nosigpipe = false;
         s.has_peer = false;
+        s.rcv_timeout_ns = 0;
+        s.snd_timeout_ns = 0;
         s.dropped = 0;
         s.host = host;
         s.refs = 0;

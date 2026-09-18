@@ -77,6 +77,11 @@ pub fn proc_of(vpid: i32) -> Option<u32> {
     (vpid >= VPID_BASE && vpid < VPID_BASE + MAX_PROCS as i32).then(|| (vpid - VPID_BASE) as u32)
 }
 
+pub const PER_READ_NS: u64 = 1_000;
+pub const PER_YIELD_NS: u64 = 1_000_000;
+/// Key of sleeping threads: nothing wakes it but the deadline
+pub const SLEEP_KEY: u64 = 0x7FFF_FFFF_0002;
+
 pub const T_FREE: u32 = 0;
 pub const T_RUNNABLE: u32 = 1;
 pub const T_RUNNING: u32 = 2;
@@ -105,10 +110,10 @@ pub struct ThreadRec {
     pub cond_key: u64,
     pub cond_seq: u64,
     pub signaled: bool,
-    /// Waiting with a timeout: may be released with ETIMEDOUT when nothing
-    /// else can run
-    pub timed: bool,
+    /// Set when the wait ended because `deadline` passed
     pub timed_out: bool,
+    /// Virtual time at which a blocked thread gives up waiting (0: never)
+    pub deadline: u64,
     /// Bumped by whoever hands this thread the baton
     pub park: AtomicU32,
 }
@@ -140,6 +145,10 @@ pub struct State {
     /// Quantum for whichever thread runs next, installed by the receiver
     /// so that hooks can be attributed to processes
     pub pending_quantum: i64,
+    /// The run's one virtual clock, in nanoseconds since the run began.
+    /// It moves only when a guest reads it or gives up the baton, and jumps
+    /// to the next deadline when nothing can run.
+    pub clock_ns: u64,
     pub current: u32,
     pub nthreads: u32,
     pub nprocs: u32,
@@ -364,13 +373,11 @@ impl State {
         }
     }
 
-    pub fn cond_enqueue(&mut self, id: usize, cond: u64, timed: bool) {
+    pub fn cond_enqueue(&mut self, id: usize, cond: u64) {
         let seq = self.next_cond_seq;
         self.next_cond_seq += 1;
         let t = &mut self.threads[id];
         t.signaled = false;
-        t.timed = timed;
-        t.timed_out = false;
         t.cond_key = cond;
         t.cond_seq = seq;
     }
@@ -407,18 +414,44 @@ impl State {
         self.pending_quantum
     }
 
+    /// A read of the clock: every read moves it a little, so busy-waits on
+    /// the clock make progress.
+    pub fn clock_read(&mut self) -> u64 {
+        self.clock_ns += PER_READ_NS;
+        self.clock_ns
+    }
+
+    /// Release every blocked thread whose deadline has passed.
+    fn expire_deadlines(&mut self) {
+        let now = self.clock_ns;
+        for t in self.live() {
+            if t.state == T_BLOCKED && t.deadline != 0 && t.deadline <= now {
+                t.deadline = 0;
+                t.timed_out = true;
+                t.state = T_RUNNABLE;
+            }
+        }
+    }
+
+    fn earliest_deadline(&mut self) -> Option<u64> {
+        self.live()
+            .iter()
+            .filter(|t| t.state == T_BLOCKED && t.deadline != 0)
+            .map(|t| t.deadline)
+            .min()
+    }
+
     /// Choose the next baton holder. Returns None when nothing can run.
+    /// Deadlines that have passed are handled before the choice; when
+    /// nothing is runnable the clock jumps to the earliest deadline.
     fn pick(&mut self) -> Option<usize> {
-        let runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
-        if runnable == 0 {
-            // Idle: let a timed waiter time out, lowest id first
-            let timed = self
-                .live()
-                .iter()
-                .position(|t| t.timed && t.state == T_BLOCKED)?;
-            self.threads[timed].timed_out = true;
-            self.threads[timed].state = T_RUNNABLE;
-            return Some(timed);
+        self.expire_deadlines();
+        let mut runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
+        while runnable == 0 {
+            let next = self.earliest_deadline()?;
+            self.clock_ns = self.clock_ns.max(next);
+            self.expire_deadlines();
+            runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         }
         let n = self.rng.below(runnable as u64) as usize;
         self.live()
@@ -439,6 +472,11 @@ impl State {
             self.threads[id].key = key;
             id
         });
+        // Every yield, not only a switch: a lone compute thread must still
+        // let a sleeper's deadline pass.
+        if me.is_some() {
+            self.clock_ns += PER_YIELD_NS;
+        }
         let Some(next) = self.pick() else {
             return Handoff::Idle;
         };
@@ -479,6 +517,7 @@ impl State {
                 }
                 t.state = T_EXITED;
                 t.cond_key = 0;
+                t.deadline = 0;
             }
         }
         match held {

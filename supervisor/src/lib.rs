@@ -12,6 +12,7 @@ mod interpose;
 mod io;
 mod names;
 mod net;
+mod poll;
 mod process;
 mod report;
 #[path = "../../src/rng.rs"]

@@ -11,7 +11,7 @@
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::sched::{self, my_id, State};
+use crate::sched::{self, my_id};
 use crate::shared::netstate::{
     Addr, NetError, FAMILY_INET, FAMILY_UNIX, KIND_DGRAM, KIND_STREAM, MAX_DGRAM, RING,
     UNIX_PATH_MAX,
@@ -59,19 +59,32 @@ fn nonblocking(fd: c_int) -> bool {
     flags >= 0 && flags & libc::O_NONBLOCK != 0
 }
 
-fn park_for_io() {
-    crate::io::IO_WAITS.fetch_add(1, Ordering::Relaxed);
-    sched::yield_baton(State::Blocked(shared::IO_KEY as usize), shared::IO_KEY);
+/// Which of a socket's timeouts bounds a wait
+#[derive(Clone, Copy)]
+enum Wait {
+    /// Fail with `EAGAIN` instead of waiting
+    Never,
+    Receive(u32),
+    Send(u32),
 }
 
 /// Run `op` on the locked state until it is ready, parking in between
-/// unless the descriptor is non-blocking. Success wakes the I/O waiters:
-/// whatever happened may have made a peer ready.
+/// unless the descriptor is non-blocking. The socket's receive or send
+/// timeout is a virtual-time deadline for the whole call. Success wakes
+/// the I/O waiters: whatever happened may have made a peer ready.
 fn blocking<T>(
     fd: c_int,
-    dontwait: bool,
+    wait: Wait,
     mut op: impl FnMut(&mut shared::State, u32) -> Result<T, NetError>,
 ) -> Result<T, c_int> {
+    let timeout = sched::with(|s, _| match wait {
+        Wait::Receive(sock) => s.net.socks[sock as usize].rcv_timeout_ns,
+        Wait::Send(sock) => s.net.socks[sock as usize].snd_timeout_ns,
+        Wait::Never => 0,
+    })
+    .unwrap_or(0);
+    let deadline = (timeout != 0).then(|| sched::now() + timeout);
+    let dontwait = matches!(wait, Wait::Never);
     loop {
         let r = sched::with(|s, pid| {
             let r = op(s, pid);
@@ -85,7 +98,12 @@ fn blocking<T>(
             Ok(v) => return Ok(v),
             Err(NetError::Errno(e)) => return Err(e),
             Err(NetError::WouldBlock) if dontwait || nonblocking(fd) => return Err(libc::EAGAIN),
-            Err(NetError::WouldBlock) => park_for_io(),
+            Err(NetError::WouldBlock) => {
+                crate::io::IO_WAITS.fetch_add(1, Ordering::Relaxed);
+                if sched::block_until(shared::IO_KEY, deadline) {
+                    return Err(libc::EAGAIN);
+                }
+            }
         }
     }
 }
@@ -204,14 +222,16 @@ pub unsafe extern "C" fn my_bind(fd: c_int, addr: *const Sockaddr, len: Socklen)
     let Some(a) = parse_addr(addr, len) else {
         return set_errno(libc::EAFNOSUPPORT);
     };
-    status(blocking(fd, true, |s, _| s.net.bind(sock, a)))
+    status(blocking(fd, Wait::Never, |s, _| s.net.bind(sock, a)))
 }
 
 pub unsafe extern "C" fn my_listen(fd: c_int, backlog: c_int) -> c_int {
     let Some(sock) = lookup(fd) else {
         return libc::listen(fd, backlog);
     };
-    status(blocking(fd, true, |s, _| s.net.listen(sock, backlog)))
+    status(blocking(fd, Wait::Never, |s, _| {
+        s.net.listen(sock, backlog)
+    }))
 }
 
 static PASSTHROUGH_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -270,7 +290,7 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
     };
     let dgram = kind_of(sock) == KIND_DGRAM;
     let mut outside = false;
-    let r = blocking(fd, true, |s, pid| {
+    let r = blocking(fd, Wait::Never, |s, pid| {
         let here = s.procs[pid as usize].host;
         let host = if dest.family == FAMILY_INET {
             match s.net.host_for_ip(here, dest.ip) {
@@ -317,7 +337,7 @@ pub unsafe extern "C" fn my_accept(fd: c_int, addr: *mut Sockaddr, len: *mut Soc
         Ok(p) => p,
         Err(e) => return set_errno(e),
     };
-    let accepted = blocking(fd, false, |s, pid| {
+    let accepted = blocking(fd, Wait::Receive(listener), |s, pid| {
         let far = s.net.accept(listener)?;
         s.net.set_ident(far, ident);
         s.net.add_ref(pid, far);
@@ -383,9 +403,13 @@ pub fn send_to(
     to: Option<Addr>,
 ) -> isize {
     let bytes = unsafe { std::slice::from_raw_parts(buf, len) };
-    let dontwait = flags & libc::MSG_DONTWAIT != 0;
+    let wait = if flags & libc::MSG_DONTWAIT != 0 {
+        Wait::Never
+    } else {
+        Wait::Send(sock)
+    };
     if kind_of(sock) == KIND_DGRAM {
-        let sent = blocking(fd, dontwait, |s, pid| {
+        let sent = blocking(fd, wait, |s, pid| {
             let dest = dgram_dest(s, pid, to)?;
             s.net.send_dgram(sock, dest, bytes)
         });
@@ -396,7 +420,7 @@ pub fn send_to(
     }
     let mut done = 0usize;
     loop {
-        match blocking(fd, dontwait, |s, _| s.net.send(sock, &bytes[done..])) {
+        match blocking(fd, wait, |s, _| s.net.send(sock, &bytes[done..])) {
             Ok(n) => done += n,
             Err(_) if done > 0 => break,
             Err(libc::EPIPE) => return broken_pipe(sock, flags),
@@ -423,10 +447,14 @@ pub fn recv_from(
     from: &mut Option<Addr>,
 ) -> isize {
     let out = unsafe { std::slice::from_raw_parts_mut(buf, len) };
-    let dontwait = flags & libc::MSG_DONTWAIT != 0;
+    let wait = if flags & libc::MSG_DONTWAIT != 0 {
+        Wait::Never
+    } else {
+        Wait::Receive(sock)
+    };
     let peek = flags & libc::MSG_PEEK != 0;
     if kind_of(sock) == KIND_DGRAM {
-        return match blocking(fd, dontwait, |s, _| s.net.recv_dgram(sock, out, peek)) {
+        return match blocking(fd, wait, |s, _| s.net.recv_dgram(sock, out, peek)) {
             Ok((n, source)) => {
                 *from = Some(source);
                 n as isize
@@ -437,9 +465,7 @@ pub fn recv_from(
     let waitall = flags & libc::MSG_WAITALL != 0 && !peek;
     let mut done = 0usize;
     loop {
-        match blocking(fd, dontwait, |s, _| {
-            s.net.recv(sock, &mut out[done..], peek)
-        }) {
+        match blocking(fd, wait, |s, _| s.net.recv(sock, &mut out[done..], peek)) {
             Ok(0) => break,
             Ok(n) => done += n,
             Err(_) if done > 0 => break,
@@ -563,7 +589,9 @@ pub unsafe extern "C" fn my_shutdown(fd: c_int, how: c_int) -> c_int {
         return libc::shutdown(fd, how);
     };
     let (read, write) = (how != libc::SHUT_WR, how != libc::SHUT_RD);
-    status(blocking(fd, true, |s, _| s.net.shutdown(sock, read, write)))
+    status(blocking(fd, Wait::Never, |s, _| {
+        s.net.shutdown(sock, read, write)
+    }))
 }
 
 // ---- names and options ----------------------------------------------------
@@ -662,6 +690,21 @@ pub unsafe extern "C" fn my_setsockopt(
             && len as usize >= std::mem::size_of::<c_int>()
             && value.cast::<c_int>().read_unaligned() != 0;
         sched::with(|s, _| s.net.socks[sock as usize].nosigpipe = on);
+    } else if level == libc::SOL_SOCKET && (name == libc::SO_RCVTIMEO || name == libc::SO_SNDTIMEO)
+    {
+        if value.is_null() || (len as usize) < std::mem::size_of::<libc::timeval>() {
+            return set_errno(libc::EINVAL);
+        }
+        let tv = value.cast::<libc::timeval>().read_unaligned();
+        let ns = tv.tv_sec as u64 * 1_000_000_000 + tv.tv_usec as u64 * 1000;
+        sched::with(|s, _| {
+            let k = &mut s.net.socks[sock as usize];
+            if name == libc::SO_RCVTIMEO {
+                k.rcv_timeout_ns = ns;
+            } else {
+                k.snd_timeout_ns = ns;
+            }
+        });
     } else if !harmless(level, name) {
         log_unknown_option("setsockopt", level, name);
     }

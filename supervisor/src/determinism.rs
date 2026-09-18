@@ -69,22 +69,19 @@ pub extern "C" fn my_cc_random_generate_bytes(buf: *mut c_void, n: usize) -> c_i
 
 // ---- virtual clock --------------------------------------------------------
 
-/// Nanoseconds of virtual time since process start. Every read advances it
-/// a little so busy-waits on the clock make progress; every thread switch
-/// advances it more.
-static TICKS: AtomicU64 = AtomicU64::new(0);
-const PER_READ_NS: u64 = 1_000;
-const PER_SWITCH_NS: u64 = 1_000_000;
+/// The clock is the run's, in the shared scheduler state, so every process
+/// sees one timeline. This local one only serves a process that is not in
+/// a run (passive mode).
+static LOCAL_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Fixed wall-clock epoch offset so `CLOCK_REALTIME` is repeatable too
-const REALTIME_BASE_NS: u64 = 1_800_000_000 * 1_000_000_000;
-const MONOTONIC_BASE_NS: u64 = 1_000_000_000;
-
-pub fn on_switch() {
-    TICKS.fetch_add(PER_SWITCH_NS, Ordering::Relaxed);
-}
+pub const REALTIME_BASE_NS: u64 = 1_800_000_000 * 1_000_000_000;
+pub const MONOTONIC_BASE_NS: u64 = 1_000_000_000;
 
 fn now_ns() -> u64 {
-    TICKS.fetch_add(PER_READ_NS, Ordering::Relaxed) + PER_READ_NS
+    crate::sched::clock_read().unwrap_or_else(|| {
+        LOCAL_TICKS.fetch_add(crate::shared::PER_READ_NS, Ordering::Relaxed)
+            + crate::shared::PER_READ_NS
+    })
 }
 
 fn monotonic_ns() -> u64 {

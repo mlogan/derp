@@ -339,12 +339,30 @@ pub fn add_thread() -> usize {
 /// on quantum expiry, the blocked-on address for blocking calls.
 pub fn yield_baton(state: State, site: u64) {
     let Some(me) = my_id() else { return };
-    yield_baton_as(me, state, site);
+    yield_baton_as(me, state, site, None);
+}
+
+/// Block on `key` until woken or until the virtual clock reaches
+/// `deadline`. Returns true when the deadline ended the wait.
+pub fn block_until(key: u64, deadline: Option<u64>) -> bool {
+    let Some(me) = my_id() else { return false };
+    yield_baton_as(me, State::Blocked(key as usize), key, deadline);
+    with(|s, _| std::mem::take(&mut s.threads[me].timed_out)) == Some(true)
+}
+
+/// The virtual clock without advancing it, for computing deadlines
+pub fn now() -> u64 {
+    with(|s, _| s.clock_ns).unwrap_or(0)
+}
+
+/// A read of the virtual clock by the guest, or None outside a run.
+pub fn clock_read() -> Option<u64> {
+    with(|s, _| s.clock_read())
 }
 
 /// `yield_baton` for a caller that already knows its id (the teardown hook
 /// runs after libpthread has cleared the key value).
-pub fn yield_baton_as(me: usize, state: State, site: u64) {
+pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>) {
     let Some(sh) = shared() else { return };
     settle_hooks();
     let (st, key) = match state {
@@ -354,6 +372,9 @@ pub fn yield_baton_as(me: usize, state: State, site: u64) {
     };
     let mut s = sh.lock();
     debug_assert_eq!(s.current as usize, me);
+    s.threads[me].timed_out = false;
+    // A deadline of 0 would mean none; one in the past expires at once
+    s.threads[me].deadline = deadline.map_or(0, |d| d.max(1));
     match s.hand_off(Some((me, st, key)), site) {
         Handoff::Idle => {
             let stuck = state != State::Exited || s.any_alive();
@@ -369,7 +390,6 @@ pub fn yield_baton_as(me: usize, state: State, site: u64) {
         }
         Handoff::Switch { to, seen } => {
             drop(s);
-            crate::determinism::on_switch();
             sh.unpark(to);
             if state != State::Exited {
                 sh.park(me, seen);

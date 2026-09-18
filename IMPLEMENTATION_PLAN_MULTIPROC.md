@@ -57,13 +57,27 @@ The experiment answers three questions with numbers:
   experiment delivers instantly and in order. The simulator replaces that
   policy with latency, loss, partitions and reordering driven by the seeded
   RNG and the virtual clock, without touching the socket API layer.
+- **Every process lives on a virtual host, and the socket table is keyed on
+  it.** A host has a name and an address in a virtual subnet (`10.0.0.0/24`,
+  assigned in declaration order). Each initial process is placed on a host
+  from the command line (`--host NAME`, default one host per initial
+  process: `h0`, `h1`, …); spawned children inherit their parent's host.
+  Port tables and UNIX-domain names are per host, so two hosts can bind the
+  same port. `127.0.0.1` means the caller's own host and never crosses
+  hosts; `INADDR_ANY` binds the host's address and its loopback.
+  `gethostname` returns the virtual name, and `getaddrinfo` resolves
+  virtual host names from the host table (other names pass through).
+  `deliver` receives the source and destination hosts, which is what the
+  simulator's latency and partition matrices will be keyed on.
 - **A virtual socket still has a real fd.** `socket()` returns a real
   placeholder descriptor so fd numbers, `dup`, `close`, `fork` inheritance
   and `select` bitmaps stay coherent; the shared state maps (process, fd) to
   the virtual socket and refcounts it.
-- **Sockets to addresses no guest has bound** are real: a loopback address
-  with no listener gets ECONNREFUSED; any other address passes through to
-  the kernel, is logged once, and is treated as input.
+- **Addresses outside the virtual network are real.** Inside it, a connect
+  to a known host with no listener on that port gets ECONNREFUSED, and an
+  address in the subnet that no host owns gets EHOSTUNREACH. Any address
+  outside the subnet passes through to the kernel, is logged once, and is
+  treated as input.
 - **I/O syscalls count as hook events.** Each interposed I/O call decrements
   the shared quantum counter like a stub does, so a quantum can expire at an
   I/O boundary. A read-modify-write on a file (read, compute, write) then
@@ -113,8 +127,12 @@ thread from any process, bump its `park_word`, wake it with
 - Reaps children with `waitpid`, keeps the (vpid, real pid) map, and prints
   one aggregated report: per-process hooks, switches, and the single
   run-wide schedule hash.
-- `rewrite run --seed S [--mem-hook-rate R] prog1 args… [-- prog2 args…]`
-  launches several initial processes; `rewrite repeat` compares the
+- `rewrite run --seed S [--mem-hook-rate R] [--host a] prog1 args…
+  [-- [--host b] prog2 args…]` launches several initial processes, each on
+  the named virtual host (or on its own host by default). The host table
+  (names and addresses) is written into the shared state before any guest
+  starts and exported as `REWRITE_HOSTS` so test programs can find peers
+  without arguments; `rewrite repeat` compares the
   aggregated report and every process's stdout (each redirected to a file
   in the scratch directory).
 
@@ -158,15 +176,18 @@ counter and yields if it expires.
 
 ### 6. Virtual network (`supervisor/src/net.rs`)
 
-State in the shared file: a socket table (`{ kind, state, local, peer,
-rx: ring, backlog, options, refs }`), a port table per address family, and
-an in-flight queue of `{ deliver_at, dst_socket, bytes | fin | datagram }`.
+State in the shared file: a host table (`{ name, addr }`), a socket table
+(`{ host, kind, state, local, peer, rx: ring, backlog, options, refs }`), a
+bind table keyed on (host, family, protocol, port or UNIX name), and an
+in-flight queue of `{ deliver_at, src_host, dst_host, dst_socket,
+bytes | fin | datagram }`. Each process record carries its host.
 
 | Call | Handling |
 |---|---|
 | `socket` | allocate a virtual socket and a real placeholder fd |
-| `bind`, `listen` | port table entry (ephemeral ports handed out in order); UNIX-domain paths are names in the table, no filesystem node |
-| `connect` | find the listener in the port table: queue a connection on its backlog, wake accept waiters, park until accepted (or return EINPROGRESS when non-blocking). No listener: ECONNREFUSED for loopback, otherwise fall back to a real socket |
+| `bind`, `listen` | bind table entry on the caller's host (ephemeral ports handed out in order per host); binding another host's address is EADDRNOTAVAIL; UNIX-domain paths are names in the host's table, no filesystem node |
+| `connect` | resolve the destination address to a host (loopback → the caller's own), find the listener in that host's bind table: queue a connection on its backlog, wake accept waiters, park until accepted (or return EINPROGRESS when non-blocking). Known host, no listener: ECONNREFUSED; unowned subnet address: EHOSTUNREACH; outside the subnet: a real socket |
+| `gethostname`, `getaddrinfo`, `getifaddrs` | the virtual host's name; virtual names from the host table; the host's address and loopback |
 | `accept` | pop the backlog or park for readable |
 | `send`, `sendto`, `sendmsg`, `write`, `writev` | hand the bytes to `deliver(src, dst, payload)`; stream sockets block (or EAGAIN) when the peer's ring is full, which gives real backpressure |
 | `recv`, `recvfrom`, `recvmsg`, `read`, `readv` | copy from the ring, or park for readable; zero-length read after the peer's FIN |
@@ -174,8 +195,10 @@ an in-flight queue of `{ deliver_at, dst_socket, bytes | fin | datagram }`.
 | `getsockname`, `getpeername`, `getsockopt`, `setsockopt`, `ioctl(FIONREAD)`, `fcntl(O_NONBLOCK)` | answered from socket state; `SO_RCVTIMEO`/`SO_SNDTIMEO` become virtual-time deadlines; options with no meaning here (`TCP_NODELAY`, `SO_REUSEADDR`, keepalive) are accepted and recorded |
 
 `deliver` is the single entry point for traffic. In this experiment it
-appends to the destination immediately. Its signature already carries
-source, destination and the virtual clock, and the scheduler already drains
+appends to the destination immediately (or after the fixed `--net-latency`
+when the two hosts differ; traffic within a host is never delayed). Its
+signature already carries the source and destination hosts and sockets and
+the virtual clock, and the scheduler already drains
 the in-flight queue when it advances the clock, so a simulator only has to
 choose `deliver_at` (latency), whether to enqueue at all (loss, partition)
 and queue order for datagrams (reordering). A fixed `--net-latency` option
@@ -223,6 +246,9 @@ empty `LC_DATA_IN_CODE` when space is still short. Keep the
    arrived, in order of arrival.
 7. `poll_server.c`: a single-threaded server multiplexing several clients
    with `poll`, and the same with `kevent`, using read timeouts.
+8. `two_hosts.c`: the same server binary started on two hosts on the same
+   port, a client on a third host that talks to both by name, and a check
+   that connecting to `127.0.0.1` from the client's host is refused.
 
 ## Implementation Order
 
@@ -232,8 +258,8 @@ empty `LC_DATA_IN_CODE` when space is still short. Keep the
 | 2 | Counter relocation into shared state; header-room changes in the rewriter; default-linked hello world rewrites without `-headerpad` |
 | 3 | Virtual pids, `posix_spawn`/`fork`/`execve`/`waitpid` interposition, report aggregation; `pipeline.c` spawns its stages (pipes still pass through) |
 | 4 | Readiness waits for pipes; fd table bookkeeping across `dup`/`fork`/`execve`; `pipeline.c` correct with a stable hash |
-| 5 | Virtual stream sockets: socket table, port table, `connect`/`accept`/`send`/`recv`/`close`, backpressure; `tcp_echo.c` over TCP and `--unix` |
-| 6 | Socket options, non-blocking mode, `shutdown`, datagram sockets; `udp_ping.c`; `deliver` with the in-flight queue |
+| 5 | Host table and `--host` placement; virtual stream sockets: socket table, bind table keyed on host, `connect`/`accept`/`send`/`recv`/`close`, backpressure; `tcp_echo.c` over TCP and `--unix` with server and client on different hosts |
+| 6 | Socket options, non-blocking mode, `shutdown`, datagram sockets; `gethostname`/`getaddrinfo`/`getifaddrs`; `udp_ping.c` and `two_hosts.c`; `deliver` with the in-flight queue |
 | 7 | Shared virtual clock, deadline-ordered timed waits; `poll`/`select` over mixed real and virtual fds; sleeps become timed waits |
 | 8 | `kevent` emulation for virtual fds; `poll_server.c` in both forms; fixed `--net-latency` through the in-flight queue |
 | 9 | `counter_file.c` and `shared_map.c`: races reproduce from a seed; I/O calls as hook events; 100-run checks |
@@ -249,6 +275,9 @@ empty `LC_DATA_IN_CODE` when space is still short. Keep the
 - No traffic between guests reaches the kernel: the report shows every
   connection and byte count through the virtual network, and no guest holds
   a bound or connected kernel socket during the tests.
+- `two_hosts.c`: two hosts bind the same port without conflict, the client
+  reaches each by virtual name and address, loopback never crosses hosts,
+  and a spawned child is on its parent's host.
 - With `--net-latency` set to a fixed value, outputs stay correct, the
   schedule changes, and the 100-run check still passes: the simulator seam
   works end to end.
@@ -268,9 +297,10 @@ empty `LC_DATA_IN_CODE` when space is still short. Keep the
 - System utilities and platform binaries.
 - Signals other than SIGTERM/SIGKILL to parked processes.
 - The network simulator itself: latency distributions, loss, partitions,
-  bandwidth limits, datagram reordering, per-process virtual hosts and
-  addresses. This experiment builds the seam (`deliver`, the in-flight
-  queue, the clock hookup) and proves it with a fixed latency only.
+  bandwidth limits, datagram reordering, routing between subnets. This
+  experiment builds the seam (virtual hosts, `deliver`, the in-flight
+  queue, the clock hookup) and proves it with a fixed inter-host latency
+  only.
 - Sockets to hosts outside the run (they pass through as input); DNS.
 - Descriptor passing (`SCM_RIGHTS`), raw sockets, `AF_INET6`, multicast,
   out-of-band data, `sendfile`.

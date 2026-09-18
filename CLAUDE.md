@@ -425,11 +425,15 @@ See `TASKS_PHASE{N}.md`.
 deterministic baton scheduler. Plan in `IMPLEMENTATION_PLAN_REWRITE.md`,
 progress in `TASKS_REWRITE.md`, results in `docs/REWRITE_RESULTS.md`.
 
-**Multi-process runs** (branch `mlogan-multiproc`): one scheduler in shared
-memory for several guests, `rewrite run --manifest FILE`. Plan in
-`IMPLEMENTATION_PLAN_MULTIPROC.md`, progress and deviations in
-`TASKS_MULTIPROC.md`. Rewritten binaries need the supervisor dylib (their
-stubs address a fixed region it maps); default-linked guests work.
+**Multi-process runs** (branch `mlogan-multiproc`, plan complete): one
+scheduler in shared memory for several guests on virtual hosts, with
+virtual pids, pipe and lock readiness waits, a virtual network (stream and
+datagram sockets, `poll`/`select`/`kevent`), one virtual clock, and a fixed
+`--net-latency` as the seam for a network simulator.
+`rewrite run --manifest FILE`. Plan in `IMPLEMENTATION_PLAN_MULTIPROC.md`,
+progress and deviations in `TASKS_MULTIPROC.md`, results in
+`docs/MULTIPROC_RESULTS.md`, usage in `README.md`. Rewritten
+binaries need the supervisor dylib; default-linked guests work.
 
 **Next Phase**: Not yet planned
 

@@ -12,10 +12,27 @@ rewrite repeat --seed S --runs N …             # status, stdout and schedule h
 rewrite bench  prog args…                      # native vs rewritten, no scheduling
 ```
 
+Options worth knowing:
+
+- `--mem-hook-rate 1/16` hooks a sparse, seeded set of memory accesses;
+  races on plain memory need it, races through files and sockets do not.
+- `--quantum LO..HI` is hook events per scheduling quantum. The default
+  `1000..10000` finds races in short programs and costs about 57% on two
+  compute-bound processes; `10000..100000` costs about 10% and misses races
+  in short programs.
+- `--manifest FILE` lists virtual hosts and the processes on each; hosts
+  get `10.0.0.1` upward and are reachable by name. `--net-latency 5ms`
+  delays traffic between different hosts in virtual time.
+- `--capture` writes each guest's stdout to `stdout.<index>` in the
+  `--scratch` directory. The report goes to stderr: `run.*` totals, then
+  `p<index>.*` per process.
+- `REWRITE_PARK_SPINS=N` makes a parking thread spin first. It only helps
+  when the baton bounces back within microseconds; off by default.
+
 Plans and progress: `IMPLEMENTATION_PLAN_REWRITE.md`,
 `IMPLEMENTATION_PLAN_MULTIPROC.md`, `TASKS_REWRITE.md`,
-`TASKS_MULTIPROC.md`. Results of the single-process experiment:
-`docs/REWRITE_RESULTS.md`.
+`TASKS_MULTIPROC.md`. Results: `docs/REWRITE_RESULTS.md` (single process)
+and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
 
 ## What a guest must be
 

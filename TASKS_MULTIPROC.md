@@ -229,32 +229,119 @@ Overhead on `loops 3` today (release build):
   host, so that form cannot cross hosts as the plan's day table implied).
   Four connections, 820,120 bytes, 0 pass-through, 100 identical runs.
 
-## Remaining
+## Day 6 — Datagrams, options, names ✅
 
-### Day 6 — options, datagrams, names, in-flight queue
-- [ ] `setsockopt`/`getsockopt` answered from socket state (`SO_ERROR`,
-      `SO_RCVTIMEO`/`SO_SNDTIMEO` need the virtual clock, day 7),
-      `ioctl(FIONREAD)` (variadic: same shim as `fcntl`), non-blocking
-      `connect` with `EINPROGRESS`
-- [ ] Datagram sockets (`socket()` still passes `SOCK_DGRAM` to the kernel)
-- [ ] `gethostname`, `getaddrinfo`, `getifaddrs`
-- [ ] `deliver` through an in-flight queue with `deliver_at`
-- [ ] `udp_ping.c`, `two_hosts.c`
-- [ ] SIGPIPE on a write to a closed peer (today only `EPIPE`)
+- Datagram sockets in `netstate.rs`: bound on first send, connected ones
+  get a default destination and a source filter, boundaries and sources
+  kept in the ring, truncation on short reads. A UDP datagram nobody is
+  bound for, or that finds a full ring, is lost and counted
+  (`run.net_dropped`); a UNIX-domain one reports it instead.
+- Stream bytes, datagrams and FIN all go through `deliver()`.
+- `sendmsg`/`recvmsg` without ancillary data; `getsockopt` answers
+  `SO_TYPE`, `SO_ERROR`, `SO_ACCEPTCONN`, buffer sizes; harmless options are
+  accepted, unknown ones logged by number; `SO_NOSIGPIPE`/`MSG_NOSIGNAL`
+  decide whether a write to a closed peer raises SIGPIPE.
+- `ioctl(FIONREAD)` through a second variadic shim (`FIONBIO` works on the
+  placeholder as it is).
+- `names.rs`: `gethostname`, `getaddrinfo` for virtual host names (the rest
+  goes to the system resolver), `getifaddrs` (`lo0` and `en0`), each with
+  its free function so our lists never reach libSystem's allocator.
+- A UNIX-domain connect to a path that is a socket in the real filesystem
+  leaves the virtual network: libSystem's resolver reaches mDNSResponder
+  that way on the guest's thread. Checked by hand: `h0`, `localhost` and a
+  non-existent name all resolve as they should inside a run.
+- Non-blocking `connect` completes at once, so there is no `EINPROGRESS`.
+- Tests: `udp_ping.c` (pings sent before the server is bound are lost and
+  resent), `two_hosts.c` (same port on two hosts, by name and address,
+  loopback refused, unowned address unreachable, child on parent's host).
 
-### Day 7 — shared virtual clock and timers
-- [ ] Clock into the shared state (still per-process atomics in
-      `determinism.rs`); deadline-ordered timed waits replace "release
-      when idle"; sleeps become timed waits
-- [ ] `poll`/`select` over mixed real and virtual descriptors (today they
-      pass through and see the placeholder, which is never ready)
+## Day 7 — Shared virtual clock, timed waits, poll/select ✅
 
-### Days 8-12
-- [ ] `kevent` emulation; `poll_server.c`; `--net-latency`
-- [ ] `counter_file.c`, `shared_map.c`; I/O calls as hook events; `flock`
-- [ ] `net.rs`; switch cost in-process vs cross-process; throughput
-      against kernel loopback; quantum defaults
-- [ ] `docs/MULTIPROC_RESULTS.md`
+- `clock_ns` in the shared state. It advances 1 us per read and 1 ms per
+  **yield** (not per switch: a lone compute thread must still let a
+  sleeper's deadline pass), and jumps to the earliest deadline when nothing
+  is runnable.
+- Threads carry a `deadline` instead of the old "release when idle" flag:
+  `pthread_cond_timedwait`, ulock and `os_sync` waits with a timeout,
+  `dispatch_semaphore_wait`. Sleeps are timed waits on a key nothing wakes.
+- `dispatch_time_t` deadlines come from libdispatch's read of the real
+  clock, so the distance is taken on the real clock and rounded to 1 ms.
+- `poll.rs`: `poll` and `select` over virtual sockets and kernel
+  descriptors; sets with nothing between guests are waited on for real.
+- `SO_RCVTIMEO`/`SO_SNDTIMEO` bound socket waits in virtual time.
+- Test: `timers.c`, 19 checks that hold on every seed; seconds of timeouts
+  run in 0.4 s of real time.
+
+## In-flight payloads and `--net-latency` ✅ (plan: days 6 and 8)
+
+- Done after the clock, which it needs. `deliver()` either lets a payload
+  arrive or launches it with a `deliver_at`; whenever the clock moves, what
+  is due lands and I/O waiters are woken; an idle run jumps to the next
+  arrival as it does to the next timer.
+- Records wait in a per-socket FIFO rather than one global queue: with one
+  latency per link they are always in due order. Stream bytes in flight
+  hold part of the receiver's window; FIN travels behind the data; traffic
+  within a host is never delayed.
+- Found while testing: `writable()` ignored room in the flight ring while
+  `launch()` did not, which would have spun a `poll` for writability.
+
+## Day 8 — kevent ✅
+
+- `kq.rs`: `EVFILT_READ`/`EVFILT_WRITE` registrations on virtual sockets
+  are kept per kqueue in the guest, everything else stays on the real
+  kqueue, polled with a zero timeout alongside. Level-triggered, `EV_CLEAR`
+  and `EV_ONESHOT`; `EV_DISPATCH`/`EV_RECEIPT` are logged.
+- Edge-triggered registrations compare per-socket `rd_events`/`wr_events`
+  counters, since an edge can come and go between two looks.
+- Test: `poll_server.c` in both forms, four clients, one dropped by a
+  100 ms idle timeout on every seed; also with `--net-latency 5ms`.
+
+## Day 9 — Cross-process races ✅
+
+- Interposed I/O calls (33 of them) are hook events via
+  `sched::hook_event`. `files.rs`: `flock` and `fcntl(F_SETLK[W])` retry in
+  the scheduler; `pread`, `pwrite`, `lseek`, `fsync`, `open` count too; the
+  first path outside a manifest run's scratch directory is logged.
+- `counter_file.c`: exact with `--flock`; 4 of seeds 1..20 lose updates
+  without, branch hooks only; seed 10 prints 500 of 2000 on 100 runs.
+- `shared_map.c`: exact with branch hooks; seed 30 at 1/16 prints 301,719
+  of 400,000 on 100 runs.
+- `rewrite run --capture`. **Test-helper bug fixed:** it ran the launcher
+  twice and passed extra options to one run only, so the latency test had
+  been comparing outputs of runs without latency.
+
+## Day 10 — Rust, measurements ✅
+
+- `net.rs` (Rust `std::net` + `std::process::Command`) ran correctly the
+  first time; 100 identical runs with memory hooks at 1/16.
+- Switch cost: 2.77 us in-process on `origin/main`, 2.88 us in-process now,
+  5.41 us cross-process. Quantum defaults kept (larger quanta lose the
+  `counter_file.c` race). Spin-before-park measured and left off.
+  Throughput 3.3 GB/s against 11.5 GB/s kernel loopback at 64 KB writes.
+- All numbers and the reasoning: `docs/MULTIPROC_RESULTS.md`.
+
+## Days 11-12 — Write-up ✅
+
+- `docs/MULTIPROC_RESULTS.md`, `README.md`.
+
+## Test summary
+
+- `cargo test -p rewrite`: 25 unit tests (12 of them the network state
+  machine), 4 Mach-O, 16 multi-process, 3 rewrite, 4 thread tests. All
+  pass; the suite was run repeatedly after every day without a flake.
+- `cargo clippy -p rewrite -p rewrite-supervisor --all-targets`: clean.
+- Every acceptance criterion of the plan is met; see the results document
+  for the 100-run table.
+
+## Not done / follow-ups
+
+- The supervisor allocator's region still uses an `mmap` hint (see day 1
+  gotchas); give it the `mach_vm_allocate` treatment.
+- Unmodelled socket and kqueue features are listed under "Known
+  limitations" in the results document.
+- Stub cost work from the first experiment is still deferred.
+- The network simulator itself (latency distributions, loss, partitions,
+  reordering) is the next project; its seam is `Net::deliver`.
 
 ### Decisions confirmed by Mark (2026-09-18)
 - Rewritten binaries require the supervisor dylib; passive mode replaces

@@ -184,6 +184,7 @@ fn placeholder(ty: c_int) -> Result<(c_int, u64), c_int> {
 }
 
 pub unsafe extern "C" fn my_socket(domain: c_int, ty: c_int, protocol: c_int) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let family = match domain {
         libc::AF_INET => FAMILY_INET,
         libc::AF_UNIX => FAMILY_UNIX,
@@ -216,6 +217,7 @@ pub unsafe extern "C" fn my_socket(domain: c_int, ty: c_int, protocol: c_int) ->
 }
 
 pub unsafe extern "C" fn my_bind(fd: c_int, addr: *const Sockaddr, len: Socklen) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::bind(fd, addr, len);
     };
@@ -226,6 +228,7 @@ pub unsafe extern "C" fn my_bind(fd: c_int, addr: *const Sockaddr, len: Socklen)
 }
 
 pub unsafe extern "C" fn my_listen(fd: c_int, backlog: c_int) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::listen(fd, backlog);
     };
@@ -282,6 +285,7 @@ unsafe fn is_system_socket(addr: &Addr) -> bool {
 }
 
 pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Socklen) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::connect(fd, addr, len);
     };
@@ -328,6 +332,7 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
 }
 
 pub unsafe extern "C" fn my_accept(fd: c_int, addr: *mut Sockaddr, len: *mut Socklen) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let Some(listener) = lookup(fd) else {
         return libc::accept(fd, addr, len);
     };
@@ -483,6 +488,7 @@ pub fn recv_fd(fd: c_int, sock: u32, buf: *mut u8, len: usize, flags: c_int) -> 
 }
 
 pub unsafe extern "C" fn my_send(fd: c_int, buf: *const c_void, n: usize, flags: c_int) -> isize {
+    sched::hook_event(sched::SITE_NET);
     match lookup(fd) {
         Some(sock) => send_fd(fd, sock, buf.cast(), n, flags),
         None => libc::send(fd, buf, n, flags),
@@ -490,6 +496,7 @@ pub unsafe extern "C" fn my_send(fd: c_int, buf: *const c_void, n: usize, flags:
 }
 
 pub unsafe extern "C" fn my_recv(fd: c_int, buf: *mut c_void, n: usize, flags: c_int) -> isize {
+    sched::hook_event(sched::SITE_NET);
     match lookup(fd) {
         Some(sock) => recv_fd(fd, sock, buf.cast(), n, flags),
         None => libc::recv(fd, buf, n, flags),
@@ -504,6 +511,7 @@ pub unsafe extern "C" fn my_sendto(
     addr: *const Sockaddr,
     len: Socklen,
 ) -> isize {
+    sched::hook_event(sched::SITE_NET);
     match lookup(fd) {
         // A stream ignores the destination
         Some(sock) => send_to(fd, sock, buf.cast(), n, flags, parse_addr(addr, len)),
@@ -519,6 +527,7 @@ pub unsafe extern "C" fn my_recvfrom(
     addr: *mut Sockaddr,
     len: *mut Socklen,
 ) -> isize {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::recvfrom(fd, buf, n, flags, addr, len);
     };
@@ -535,6 +544,7 @@ pub unsafe extern "C" fn my_recvfrom(
 /// `sendmsg` without ancillary data: the vectors are gathered, since a
 /// datagram must go out whole.
 pub unsafe extern "C" fn my_sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) -> isize {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::sendmsg(fd, msg, flags);
     };
@@ -555,6 +565,7 @@ pub unsafe extern "C" fn my_sendmsg(fd: c_int, msg: *const libc::msghdr, flags: 
 }
 
 pub unsafe extern "C" fn my_recvmsg(fd: c_int, msg: *mut libc::msghdr, flags: c_int) -> isize {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::recvmsg(fd, msg, flags);
     };
@@ -585,6 +596,7 @@ pub unsafe extern "C" fn my_recvmsg(fd: c_int, msg: *mut libc::msghdr, flags: c_
 }
 
 pub unsafe extern "C" fn my_shutdown(fd: c_int, how: c_int) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::shutdown(fd, how);
     };
@@ -601,6 +613,7 @@ pub unsafe extern "C" fn my_getsockname(
     addr: *mut Sockaddr,
     len: *mut Socklen,
 ) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::getsockname(fd, addr, len);
     };
@@ -621,6 +634,7 @@ pub unsafe extern "C" fn my_getpeername(
     addr: *mut Sockaddr,
     len: *mut Socklen,
 ) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::getpeername(fd, addr, len);
     };
@@ -682,6 +696,7 @@ pub unsafe extern "C" fn my_setsockopt(
     value: *const c_void,
     len: Socklen,
 ) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::setsockopt(fd, level, name, value, len);
     };
@@ -718,6 +733,7 @@ pub unsafe extern "C" fn my_getsockopt(
     value: *mut c_void,
     len: *mut Socklen,
 ) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
         return libc::getsockopt(fd, level, name, value, len);
     };
@@ -768,6 +784,7 @@ fn duplicated(sock: u32) {
 }
 
 pub unsafe extern "C" fn my_dup(fd: c_int) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let sock = lookup(fd);
     let new = libc::dup(fd);
     if let (Some(sock), true) = (sock, new >= 0) {
@@ -777,6 +794,7 @@ pub unsafe extern "C" fn my_dup(fd: c_int) -> c_int {
 }
 
 pub unsafe extern "C" fn my_dup2(fd: c_int, target: c_int) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let sock = lookup(fd);
     let replaced = if fd == target { None } else { lookup(target) };
     let new = libc::dup2(fd, target);
@@ -797,11 +815,15 @@ pub unsafe extern "C" fn my_dup2(fd: c_int, target: c_int) -> c_int {
 /// the caller's frame that nobody looks at.
 #[no_mangle]
 pub unsafe extern "C" fn rewrite_fcntl_impl(fd: c_int, cmd: c_int, arg: usize) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     let sock = if cmd == libc::F_DUPFD || cmd == libc::F_DUPFD_CLOEXEC {
         lookup(fd)
     } else {
         None
     };
+    if (cmd == libc::F_SETLKW || cmd == libc::F_SETLK) && my_id().is_some() {
+        return crate::files::record_lock(fd, cmd == libc::F_SETLKW, arg as *mut libc::flock);
+    }
     let rc = libc::fcntl(fd, cmd, arg);
     if let (Some(sock), true) = (sock, rc >= 0) {
         duplicated(sock);
@@ -819,6 +841,7 @@ pub unsafe extern "C" fn rewrite_ioctl_impl(
     request: libc::c_ulong,
     arg: usize,
 ) -> c_int {
+    sched::hook_event(sched::SITE_NET);
     if request == FIONREAD {
         if let Some(sock) = lookup(fd) {
             let pending = sched::with(|s, _| s.net.pending_bytes(sock)).unwrap_or(0);

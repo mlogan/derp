@@ -84,6 +84,7 @@ unsafe fn between_guests(fds: &[libc::pollfd]) -> bool {
 }
 
 pub unsafe extern "C" fn my_poll(fds: *mut libc::pollfd, n: libc::nfds_t, timeout: c_int) -> c_int {
+    sched::hook_event(sched::SITE_WAIT);
     let set = if fds.is_null() {
         &mut [][..]
     } else {
@@ -117,6 +118,7 @@ pub unsafe extern "C" fn my_select(
     errorfds: *mut libc::fd_set,
     timeout: *mut libc::timeval,
 ) -> c_int {
+    sched::hook_event(sched::SITE_WAIT);
     let n = (nfds.max(0) as usize).min(FD_SETSIZE);
     let mut fds: Vec<libc::pollfd> = Vec::new();
     for fd in 0..n {

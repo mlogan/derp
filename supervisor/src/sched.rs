@@ -285,6 +285,7 @@ pub fn init(info: Option<Info>, cfg: &Config) {
             crate::coord::connect();
             crate::process::init();
             crate::io::init();
+            crate::files::init();
             join_run(&path)
         }
         Err(_) => start_private_run(cfg),
@@ -405,6 +406,31 @@ pub fn wait_for_baton(id: usize) {
     let Some(sh) = shared() else { return };
     sh.park(id, 0);
     install_quantum(sh.lock().pending_quantum);
+}
+
+/// Switch sites of interposed calls in the schedule trace: far above any
+/// stub address, tagged with the kind of call.
+pub const SITE_IO: u64 = 0xF100_0000_0000_0000;
+pub const SITE_NET: u64 = 0xF200_0000_0000_0000;
+pub const SITE_WAIT: u64 = 0xF300_0000_0000_0000;
+pub const SITE_FILE: u64 = 0xF400_0000_0000_0000;
+
+/// An interposed I/O call counts as one hook event, like a stub: the
+/// quantum can expire at an I/O boundary. That puts switch points inside
+/// a read-modify-write on a file even when only branches are hooked.
+pub fn hook_event(site: u64) {
+    if my_id().is_none() {
+        return;
+    }
+    let Some(sh) = shared() else { return };
+    let expired = unsafe {
+        let counter = sh.counter();
+        *counter -= 1;
+        *counter == 0
+    };
+    if expired {
+        rewrite_yield_impl(site);
+    }
 }
 
 /// Called from the stub's expired path through the register-saving

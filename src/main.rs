@@ -29,6 +29,8 @@ options:
   --manifest FILE                      processes to start, by virtual host
   --scratch DIR                        working directory and TMPDIR of a manifest run
                                        (default: a directory under the system temp dir)
+  --capture                            manifest run: each guest's stdout goes to stdout.<index>
+                                       in the scratch directory instead of ours
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
 manifest:
@@ -48,6 +50,7 @@ struct Cli {
     supervisor: bool,
     manifest: Option<PathBuf>,
     scratch: Option<PathBuf>,
+    capture: bool,
     net_latency_ns: u64,
     disable_aslr: bool,
     native: bool,
@@ -75,6 +78,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         supervisor: true,
         manifest: None,
         scratch: None,
+        capture: false,
         net_latency_ns: 0,
         disable_aslr: true,
         native: false,
@@ -107,6 +111,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             }
             "--manifest" => cli.manifest = Some(take_value(&mut args)?.into()),
             "--scratch" => cli.scratch = Some(take_value(&mut args)?.into()),
+            "--capture" => cli.capture = true,
             "--net-latency" => {
                 let v = take_value(&mut args)?;
                 cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
@@ -227,7 +232,13 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         guests,
         hosts: m.hosts.clone(),
         dylib: dylib_for(cli)?,
-        env: vec![("TMPDIR".into(), scratch.to_string_lossy().into_owned())],
+        env: vec![
+            ("TMPDIR".into(), scratch.to_string_lossy().into_owned()),
+            (
+                "REWRITE_SCRATCH".into(),
+                scratch.to_string_lossy().into_owned(),
+            ),
+        ],
         disable_aslr: cli.disable_aslr,
         seed: cli.opts.seed,
         quantum: cli.quantum,
@@ -433,7 +444,7 @@ fn main() -> ExitCode {
         }
         Some("run") if rest.is_empty() && cli.manifest.is_some() => {
             let manifest = cli.manifest.clone().unwrap();
-            run_manifest(&cli, &manifest, &scratch_dir(&cli), false).map(|o| {
+            run_manifest(&cli, &manifest, &scratch_dir(&cli), cli.capture).map(|o| {
                 print_run_report(&o);
                 exit_from_run(&o)
             })

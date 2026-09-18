@@ -201,6 +201,7 @@ unsafe fn writev_virtual(fd: c_int, sock: u32, iov: *const libc::iovec, n: c_int
 }
 
 pub unsafe extern "C" fn my_read(fd: c_int, buf: *mut c_void, n: usize) -> isize {
+    sched::hook_event(sched::SITE_IO);
     if let Some(sock) = crate::net::lookup(fd) {
         return crate::net::recv_fd(fd, sock, buf.cast(), n, 0);
     }
@@ -208,6 +209,7 @@ pub unsafe extern "C" fn my_read(fd: c_int, buf: *mut c_void, n: usize) -> isize
 }
 
 pub unsafe extern "C" fn my_read_nocancel(fd: c_int, buf: *mut c_void, n: usize) -> isize {
+    sched::hook_event(sched::SITE_IO);
     if let Some(sock) = crate::net::lookup(fd) {
         return crate::net::recv_fd(fd, sock, buf.cast(), n, 0);
     }
@@ -215,6 +217,7 @@ pub unsafe extern "C" fn my_read_nocancel(fd: c_int, buf: *mut c_void, n: usize)
 }
 
 pub unsafe extern "C" fn my_readv(fd: c_int, iov: *const libc::iovec, n: c_int) -> isize {
+    sched::hook_event(sched::SITE_IO);
     if let Some(sock) = crate::net::lookup(fd) {
         return readv_virtual(fd, sock, iov, n);
     }
@@ -222,6 +225,7 @@ pub unsafe extern "C" fn my_readv(fd: c_int, iov: *const libc::iovec, n: c_int) 
 }
 
 pub unsafe extern "C" fn my_readv_nocancel(fd: c_int, iov: *const libc::iovec, n: c_int) -> isize {
+    sched::hook_event(sched::SITE_IO);
     if let Some(sock) = crate::net::lookup(fd) {
         return readv_virtual(fd, sock, iov, n);
     }
@@ -229,6 +233,7 @@ pub unsafe extern "C" fn my_readv_nocancel(fd: c_int, iov: *const libc::iovec, n
 }
 
 pub unsafe extern "C" fn my_write(fd: c_int, buf: *const c_void, n: usize) -> isize {
+    sched::hook_event(sched::SITE_IO);
     if let Some(sock) = crate::net::lookup(fd) {
         return crate::net::send_fd(fd, sock, buf.cast(), n, 0);
     }
@@ -236,6 +241,7 @@ pub unsafe extern "C" fn my_write(fd: c_int, buf: *const c_void, n: usize) -> is
 }
 
 pub unsafe extern "C" fn my_write_nocancel(fd: c_int, buf: *const c_void, n: usize) -> isize {
+    sched::hook_event(sched::SITE_IO);
     if let Some(sock) = crate::net::lookup(fd) {
         return crate::net::send_fd(fd, sock, buf.cast(), n, 0);
     }
@@ -275,10 +281,12 @@ unsafe fn writev_managed(
 }
 
 pub unsafe extern "C" fn my_writev(fd: c_int, iov: *const libc::iovec, n: c_int) -> isize {
+    sched::hook_event(sched::SITE_IO);
     writev_managed(fd, iov, n, || unsafe { libc::writev(fd, iov, n) })
 }
 
 pub unsafe extern "C" fn my_writev_nocancel(fd: c_int, iov: *const libc::iovec, n: c_int) -> isize {
+    sched::hook_event(sched::SITE_IO);
     writev_managed(fd, iov, n, || unsafe { writev_nocancel(fd, iov, n) })
 }
 
@@ -293,19 +301,21 @@ fn close_managed(fd: c_int, real: impl Fn() -> c_int) -> c_int {
         }
         return rc;
     }
-    let wake = my_id().is_some() && shared_object(fd);
     let rc = real();
-    // The last writer closing is a reader's EOF
-    if wake {
+    // The last writer closing is a reader's EOF, and a closed file gives
+    // up its locks
+    if my_id().is_some() {
         wake_io();
     }
     rc
 }
 
 pub unsafe extern "C" fn my_close(fd: c_int) -> c_int {
+    sched::hook_event(sched::SITE_IO);
     close_managed(fd, || unsafe { libc::close(fd) })
 }
 
 pub unsafe extern "C" fn my_close_nocancel(fd: c_int) -> c_int {
+    sched::hook_event(sched::SITE_IO);
     close_managed(fd, || unsafe { close_nocancel(fd) })
 }

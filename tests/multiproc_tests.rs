@@ -22,8 +22,8 @@ impl RunReport {
     }
 }
 
-/// One `rewrite repeat` run for the guests' captured stdout, then one
-/// `rewrite run` for the aggregated report.
+/// One `rewrite run --capture`: the guests' stdout from the scratch
+/// directory and the aggregated report from the launcher's stderr.
 fn run_manifest(manifest: &Path, scratch: &Path, seed: u64, guests: usize) -> RunReport {
     run_manifest_with(manifest, scratch, seed, guests, &[])
 }
@@ -36,31 +36,8 @@ fn run_manifest_with(
     extra: &[&str],
 ) -> RunReport {
     common::supervisor_dylib();
-    let out = Command::new(common::rewrite_bin())
-        .args([
-            "repeat",
-            "--runs",
-            "1",
-            "--seed",
-            &seed.to_string(),
-            "--scratch",
-        ])
-        .arg(scratch)
-        .arg("--manifest")
-        .arg(manifest)
-        .output()
-        .expect("rewrite repeat");
-    assert!(
-        out.status.success(),
-        "seed {seed}: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = (0..guests)
-        .map(|i| std::fs::read_to_string(scratch.join(format!("stdout.{i}"))).unwrap())
-        .collect();
     let report = Command::new(common::rewrite_bin())
-        .args(["run", "--seed", &seed.to_string()])
+        .args(["run", "--capture", "--seed", &seed.to_string()])
         .args(extra)
         .arg("--scratch")
         .arg(scratch)
@@ -68,7 +45,14 @@ fn run_manifest_with(
         .arg(manifest)
         .output()
         .expect("rewrite run");
-    assert!(report.status.success());
+    assert!(
+        report.status.success(),
+        "seed {seed}: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let stdout = (0..guests)
+        .map(|i| std::fs::read_to_string(scratch.join(format!("stdout.{i}"))).unwrap())
+        .collect();
     let fields = String::from_utf8_lossy(&report.stderr)
         .lines()
         .filter_map(|l| l.split_once('='))
@@ -528,4 +512,98 @@ fn poll_server_multiplexes_clients_and_times_one_out() {
 #[test]
 fn kevent_server_multiplexes_clients_and_times_one_out() {
     check_poll_server("kevent");
+}
+
+#[test]
+fn a_locked_file_counter_is_always_exact() {
+    let dir = common::scratch_dir("multiproc_flock");
+    common::build_c("counter_file", &dir, &[]);
+    let manifest = dir.join("flock.manifest");
+    std::fs::write(
+        &manifest,
+        "host a\n    counter_file counter.txt 4 300 --flock\n",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let mut waited = 0;
+    for seed in 1..=8u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 1);
+        assert_eq!(r.stdout[0], "total=1200 expected=1200\n", "seed {seed}");
+        waited += (1..=4)
+            .map(|p| r.u64(&format!("p{p}.io_waits")))
+            .sum::<u64>();
+    }
+    assert!(waited > 0, "no worker ever had to wait for the lock");
+}
+
+/// First seed in `seeds` whose run prints something other than `exact`.
+fn find_lost_update(
+    manifest: &Path,
+    scratch: &Path,
+    seeds: std::ops::RangeInclusive<u64>,
+    extra: &[&str],
+    exact: &str,
+) -> (u64, RunReport) {
+    for seed in seeds {
+        let r = run_manifest_with(manifest, scratch, seed, 1, extra);
+        assert!(
+            r.stdout[0].starts_with("total="),
+            "seed {seed}: {}",
+            r.stdout[0]
+        );
+        if r.stdout[0] != exact {
+            return (seed, r);
+        }
+    }
+    panic!("no seed lost an update");
+}
+
+#[test]
+fn an_unlocked_file_counter_loses_updates_reproducibly() {
+    let dir = common::scratch_dir("multiproc_counter");
+    common::build_c("counter_file", &dir, &[]);
+    let manifest = dir.join("racy.manifest");
+    std::fs::write(&manifest, "host a\n    counter_file counter.txt 4 500\n").unwrap();
+    let scratch = dir.join("scratch");
+    // Branch hooks only: the switch between the read and the write comes
+    // from the I/O calls being hook events.
+    let (seed, lost) = find_lost_update(
+        &manifest,
+        &scratch,
+        1..=20,
+        &[],
+        "total=2000 expected=2000\n",
+    );
+    for _ in 0..5 {
+        let again = run_manifest(&manifest, &scratch, seed, 1);
+        assert_eq!(again.stdout, lost.stdout, "seed {seed} not repeatable");
+        assert_eq!(
+            again.fields["run.schedule_hash"],
+            lost.fields["run.schedule_hash"]
+        );
+    }
+}
+
+#[test]
+fn a_shared_mapping_races_only_with_memory_hooks() {
+    let dir = common::scratch_dir("multiproc_map");
+    common::build_c("shared_map", &dir, &[]);
+    let manifest = dir.join("map.manifest");
+    std::fs::write(&manifest, "host a\n    shared_map\n").unwrap();
+    let scratch = dir.join("scratch");
+    let exact = "total=400000 expected=400000\n";
+    for seed in 1..=4u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 1);
+        assert_eq!(r.stdout[0], exact, "branch hooks only, seed {seed}");
+    }
+    let sparse = ["--mem-hook-rate", "1/16"];
+    let (seed, lost) = find_lost_update(&manifest, &scratch, 1..=40, &sparse, exact);
+    for _ in 0..5 {
+        let again = run_manifest_with(&manifest, &scratch, seed, 1, &sparse);
+        assert_eq!(again.stdout, lost.stdout, "seed {seed} not repeatable");
+        assert_eq!(
+            again.fields["run.schedule_hash"],
+            lost.fields["run.schedule_hash"]
+        );
+    }
 }

@@ -187,6 +187,7 @@ pub unsafe extern "C" fn my_kevent(
     nevents: c_int,
     timeout: *const libc::timespec,
 ) -> c_int {
+    sched::hook_event(sched::SITE_WAIT);
     if my_id().is_none() {
         return libc::kevent(kq, changes, nchanges, events, nevents, timeout);
     }

@@ -18,6 +18,7 @@ use crate::determinism::{
     my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_gettimeofday,
     my_mach_absolute_time, my_mach_continuous_time, my_time,
 };
+use crate::files::{my_flock, my_fsync, my_lseek, my_pread, my_pwrite, rewrite_open_shim};
 use crate::io::{
     close_nocancel, my_close, my_close_nocancel, my_read, my_read_nocancel, my_readv,
     my_readv_nocancel, my_write, my_write_nocancel, my_writev, my_writev_nocancel, read_nocancel,
@@ -605,6 +606,12 @@ interposers! {
     my_freeaddrinfo => libc::freeaddrinfo,
     my_getifaddrs => libc::getifaddrs,
     my_freeifaddrs => libc::freeifaddrs,
+    my_flock => libc::flock,
+    my_pread => libc::pread,
+    my_pwrite => libc::pwrite,
+    my_lseek => libc::lseek,
+    my_fsync => libc::fsync,
+    rewrite_open_shim => libc::open,
     my_kevent => libc::kevent,
     my_poll => libc::poll,
     my_select => libc::select,

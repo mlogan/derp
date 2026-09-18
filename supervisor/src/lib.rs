@@ -8,6 +8,7 @@
 mod alloc;
 mod coord;
 mod determinism;
+mod files;
 mod interpose;
 mod io;
 mod kq;

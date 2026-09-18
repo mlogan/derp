@@ -9,7 +9,7 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use crate::shared::{self, Handoff, Shared};
-use crate::stubdata::Page;
+use crate::stubdata::Info;
 
 pub struct Config {
     pub seed: u64,
@@ -54,11 +54,10 @@ pub enum State {
 static SHARED: AtomicPtr<Shared> = AtomicPtr::new(std::ptr::null_mut());
 /// This process's index in the shared process table
 static PID: AtomicU32 = AtomicU32::new(0);
-static PAGE: AtomicUsize = AtomicUsize::new(0);
-static MAPPED_FIXED: AtomicU32 = AtomicU32::new(0);
-/// The quantum counter is per process until it moves into the shared
-/// state, so hooks are accounted locally: `LAST_QUANTUM` is what was last
-/// installed and `HOOKS` what earlier quanta consumed.
+static INFO: crate::spin::SpinLock<Option<Info>> = crate::spin::SpinLock::new(None);
+/// Hooks are attributed to the process that consumed them:
+/// `LAST_QUANTUM` is what this process last saw in the counter and
+/// `HOOKS` what it consumed before that.
 static LAST_QUANTUM: AtomicI64 = AtomicI64::new(0);
 static HOOKS: AtomicI64 = AtomicI64::new(0);
 
@@ -119,22 +118,18 @@ extern "C" {
     fn rewrite_scheduler_yield();
 }
 
-fn page() -> Option<Page> {
-    Page::from_base(PAGE.load(Ordering::Relaxed))
-}
-
 /// Fold the hooks consumed from the current quantum into `HOOKS`.
 fn settle_hooks() {
-    if let Some(page) = page() {
-        let remaining = unsafe { page.counter().read() };
+    if let Some(sh) = shared() {
+        let remaining = unsafe { sh.counter().read() };
         let last = LAST_QUANTUM.swap(remaining, Ordering::Relaxed);
         HOOKS.fetch_add(last - remaining, Ordering::Relaxed);
     }
 }
 
 fn install_quantum(q: i64) {
-    if let Some(page) = page() {
-        unsafe { page.counter().write(q) };
+    if let Some(sh) = shared() {
+        unsafe { sh.counter().write(q) };
         LAST_QUANTUM.store(q, Ordering::Relaxed);
     }
 }
@@ -144,31 +139,46 @@ extern "C" {
     fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: i32) -> i32;
 }
 
-/// Map `len` bytes of `fd` (or anonymous memory for -1) at `MAP_ADDR`.
-/// An `mmap` hint is not enough: the kernel ignores it now and then. A
-/// fixed `mach_vm_allocate` fails instead of replacing what is there, so
-/// mapping over that reservation with `MAP_FIXED` cannot clobber anything.
-fn map_state(fd: i32, len: usize) -> Option<*mut Shared> {
-    let mut addr = shared::MAP_ADDR as u64;
-    let reserved = unsafe { mach_vm_allocate(mach_task_self_, &raw mut addr, len as u64, 0) } == 0;
-    let mut flags = libc::MAP_SHARED;
-    if reserved {
-        flags |= libc::MAP_FIXED;
+/// Set up the fixed region the stubs address: this process's private page
+/// at `STUB_BASE`, then `len` bytes of `fd` (or of anonymous memory for -1).
+/// The stubs hard-code the address, so nothing else will do. An `mmap` hint
+/// is not enough: the kernel ignores it now and then. A fixed
+/// `mach_vm_allocate` fails instead of replacing what is there, so mapping
+/// over that reservation with `MAP_FIXED` cannot clobber anything.
+fn map_region(fd: i32, len: usize) -> *mut Shared {
+    let mut addr = shared::STUB_BASE as u64;
+    let total = (shared::PRIVATE_SIZE + len) as u64;
+    if unsafe { mach_vm_allocate(mach_task_self_, &raw mut addr, total, 0) } != 0 {
+        fatal("the fixed scheduler region is occupied in this process");
     }
-    if fd < 0 {
-        flags |= libc::MAP_ANON;
-    }
-    let p = unsafe {
-        libc::mmap(
-            shared::MAP_ADDR as *mut c_void,
-            len,
-            libc::PROT_READ | libc::PROT_WRITE,
-            flags,
-            fd,
-            0,
-        )
+    let map = |at: usize, len: usize, flags: i32, fd: i32| {
+        let p = unsafe {
+            libc::mmap(
+                at as *mut c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags | libc::MAP_FIXED,
+                fd,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            fatal("mapping the fixed scheduler region failed");
+        }
     };
-    (p != libc::MAP_FAILED).then_some(p.cast())
+    map(
+        shared::STUB_BASE,
+        shared::PRIVATE_SIZE,
+        libc::MAP_PRIVATE | libc::MAP_ANON,
+        -1,
+    );
+    let state_flags = if fd < 0 {
+        libc::MAP_SHARED | libc::MAP_ANON
+    } else {
+        libc::MAP_SHARED
+    };
+    map(shared::MAP_ADDR, len, state_flags, fd);
+    shared::MAP_ADDR as *mut Shared
 }
 
 fn map_shared_file(path: &str) -> Option<(*mut Shared, usize)> {
@@ -179,31 +189,22 @@ fn map_shared_file(path: &str) -> Option<(*mut Shared, usize)> {
             return None;
         }
         let mut st: libc::stat = std::mem::zeroed();
-        let mapped = if libc::fstat(fd, &raw mut st) == 0 {
+        let mapped = (libc::fstat(fd, &raw mut st) == 0).then(|| {
             let len = st.st_size as usize;
-            map_state(fd, len).map(|p| (p, len))
-        } else {
-            None
-        };
+            (map_region(fd, len), len)
+        });
         libc::close(fd);
         mapped
     }
 }
 
-fn map_private_state() -> *mut Shared {
-    map_state(-1, Shared::SIZE).unwrap_or_else(|| fatal("mapping scheduler state failed"))
+fn scheduler_slot() -> *mut usize {
+    (shared::STUB_BASE + shared::SLOT_OFFSET as usize) as *mut usize
 }
 
 fn fatal(msg: &str) -> ! {
     crate::report::log(msg);
     std::process::abort();
-}
-
-fn note_placement(mem: *mut Shared) {
-    MAPPED_FIXED.store(
-        u32::from(mem as usize == shared::MAP_ADDR),
-        Ordering::Relaxed,
-    );
 }
 
 /// Attach to the state the launcher prepared; it registered this process
@@ -232,13 +233,12 @@ fn join_run(path: &str) -> (&'static Shared, usize) {
     p.state = shared::P_LIVE;
     drop(s);
     PID.store(pid, Ordering::Relaxed);
-    note_placement(mem);
     (sh, me)
 }
 
 /// No launcher: a run of this one process, with the baton already ours.
 fn start_private_run(cfg: &Config) -> (&'static Shared, usize) {
-    let mem = map_private_state();
+    let mem = map_region(-1, Shared::SIZE);
     let sh = unsafe { Shared::init(mem, cfg.seed, cfg.quantum_lo, cfg.quantum_hi) };
     let mut s = sh.lock();
     let pid = s.add_proc(0, 0);
@@ -248,30 +248,33 @@ fn start_private_run(cfg: &Config) -> (&'static Shared, usize) {
     s.threads[me].pthread = unsafe { libc::pthread_self() } as u64;
     s.hand_off(None, 0);
     drop(s);
-    note_placement(mem);
     (sh, me)
 }
 
+/// Environment variable for runs without scheduling: the stubs get their
+/// region but no scheduler, and no thread is registered, so every
+/// interposer passes through. Measures the cost of the stubs alone.
+const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
+
 /// Join the run's scheduler (or start a private one when there is no
 /// launcher), then park the main thread until it is handed the baton.
-pub fn init(page: Option<Page>, cfg: &Config) {
+pub fn init(info: Option<Info>, cfg: &Config) {
+    *INFO.lock() = info;
+    if std::env::var_os(PASSIVE_VAR).is_some() {
+        map_region(-1, Shared::SIZE);
+        return;
+    }
     let mut key: libc::pthread_key_t = 0;
     let rc =
         unsafe { libc::pthread_key_create(&raw mut key, Some(crate::interpose::thread_teardown)) };
     assert_eq!(rc, 0, "pthread_key_create failed");
     ID_KEY.store(key as usize, Ordering::Relaxed);
-    if let Some(page) = page {
-        PAGE.store(page.base(), Ordering::Relaxed);
-        unsafe {
-            page.slot()
-                .write(rewrite_scheduler_yield as *const () as usize);
-        }
-    }
 
     let (sh, me) = match std::env::var(shared::SHARED_VAR) {
         Ok(path) => join_run(&path),
         Err(_) => start_private_run(cfg),
     };
+    unsafe { scheduler_slot().write(rewrite_scheduler_yield as *const () as usize) };
     SHARED.store(std::ptr::from_ref(sh).cast_mut(), Ordering::Relaxed);
     set_my_id(me);
     wait_for_baton(me);
@@ -356,10 +359,10 @@ pub fn report(out: &mut String) {
         return;
     }
     settle_hooks();
-    if let Some(page) = page() {
-        let _ = writeln!(out, "seed={}", page.seed());
-        let _ = writeln!(out, "sites={}", page.sites());
-        let _ = writeln!(out, "mem_sites={}", page.mem_sites());
+    if let Some(info) = *INFO.lock() {
+        let _ = writeln!(out, "seed={}", info.seed);
+        let _ = writeln!(out, "sites={}", info.sites);
+        let _ = writeln!(out, "mem_sites={}", info.mem_sites);
         let _ = writeln!(out, "hooks={}", HOOKS.load(Ordering::Relaxed));
     }
     let (threads, expiries, switches, hash) =
@@ -369,11 +372,6 @@ pub fn report(out: &mut String) {
     let _ = writeln!(out, "expiries={expiries}");
     let _ = writeln!(out, "switches={switches}");
     let _ = writeln!(out, "schedule_hash={hash:016x}");
-    let _ = writeln!(
-        out,
-        "shared_fixed={}",
-        MAPPED_FIXED.load(Ordering::Relaxed) == 1
-    );
     for (name, c) in crate::interpose::COUNT_NAMES
         .iter()
         .zip(crate::interpose::COUNTS.iter())

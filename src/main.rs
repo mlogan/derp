@@ -23,7 +23,7 @@ options:
   --seed S                             run seed (default 0)
   --mem-hook-rate R                    0, 1 or a fraction like 1/16 (default 0)
   --quantum LO..HI                     hook events per quantum (default 1000..10000)
-  --no-supervisor                      run the rewritten binary without the dylib
+  --no-supervisor                      no scheduling: the dylib only provides the stubs' counter
   --aslr                               leave ASLR on
   --native                             run the original binary without the dylib
   --manifest FILE                      processes to start, by virtual host
@@ -119,7 +119,7 @@ fn read_macho(path: &Path) -> Fallible<MachO> {
 }
 
 fn copy(input: &Path, output: &Path) -> Fallible<()> {
-    write_exe(output, &read_macho(input)?.emit(&[], &[], &[])?)
+    write_exe(output, &read_macho(input)?.emit(&[], &[])?)
 }
 
 fn do_rewrite(input: &Path, output: &Path, opts: &Options) -> Fallible<rw::Stats> {
@@ -136,7 +136,7 @@ fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
     let name = format!(
-        "{}.rw-{}-{}of{}-{mtime}",
+        "{}.rw2-{}-{}of{}-{mtime}",
         input.file_name().unwrap_or_default().to_string_lossy(),
         opts.seed,
         opts.mem_rate.0,
@@ -154,6 +154,16 @@ fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
     Ok(out)
 }
 
+/// Every rewritten binary needs the dylib; only native runs go without.
+fn dylib_for(cli: &Cli) -> Fallible<Option<PathBuf>> {
+    if cli.native {
+        return Ok(None);
+    }
+    launch::default_dylib()
+        .map(Some)
+        .ok_or_else(|| "supervisor dylib not found next to the rewrite binary".into())
+}
+
 fn run_guest(
     exe: PathBuf,
     cli: &Cli,
@@ -161,23 +171,16 @@ fn run_guest(
     quiet: bool,
     stdout: Option<PathBuf>,
 ) -> Fallible<launch::Outcome> {
-    let dylib = if cli.supervisor && !cli.native {
-        Some(
-            launch::default_dylib()
-                .ok_or("supervisor dylib not found next to the rewrite binary")?,
-        )
-    } else {
-        None
-    };
     let cfg = Launch {
         exe,
         args,
-        dylib,
+        dylib: dylib_for(cli)?,
         env: Vec::new(),
         disable_aslr: cli.disable_aslr,
         stdout,
         seed: cli.opts.seed,
         quantum: cli.quantum,
+        passive: !cli.supervisor,
     };
     let outcome = launch::launch(&cfg)?;
     if !quiet {
@@ -243,22 +246,15 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
     }
     prepare_scratch(scratch)?;
     let scratch = std::fs::canonicalize(scratch)?;
-    let dylib = if cli.supervisor && !cli.native {
-        Some(
-            launch::default_dylib()
-                .ok_or("supervisor dylib not found next to the rewrite binary")?,
-        )
-    } else {
-        None
-    };
     let run = Run {
         guests,
-        dylib,
+        dylib: dylib_for(cli)?,
         env: vec![("TMPDIR".into(), scratch.to_string_lossy().into_owned())],
         disable_aslr: cli.disable_aslr,
         seed: cli.opts.seed,
         quantum: cli.quantum,
         cwd: Some(scratch),
+        passive: !cli.supervisor,
     };
     let outcome = launch::launch_run(&run)?;
     if outcome.deadlock {
@@ -334,6 +330,7 @@ fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
     let native = time(&prog, &plain)?;
     plain.native = false;
     let rewritten_t = time(&rewritten, &plain)?;
+    // Native timing has no dylib; the rewritten one loads it passively.
     println!("native    {native:.4}s");
     println!(
         "rewritten {rewritten_t:.4}s  ({:.2}x)",

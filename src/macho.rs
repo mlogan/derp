@@ -2,9 +2,13 @@
 //!
 //! Reads the header, load commands, segments and sections; provides the
 //! function table from `LC_FUNCTION_STARTS`; and emits a copy of the image
-//! with patched text words and two new segments (`__STUBD`, `__STUB`)
-//! inserted in front of `__LINKEDIT`. The old code signature is dropped so
+//! with patched text words and one new segment (`__STUB`) inserted in
+//! front of `__LINKEDIT`. The old code signature is dropped so
 //! `codesign -s -` can replace it.
+//!
+//! A default-linked binary has only a few dozen bytes between its load
+//! commands and its first section, so the new segment carries no section
+//! header and commands nothing needs at run time give up their space.
 
 use std::fmt;
 
@@ -16,6 +20,8 @@ pub const PAGE: u64 = 0x4000;
 pub const LC_SEGMENT_64: u32 = 0x19;
 pub const LC_SYMTAB: u32 = 0x2;
 pub const LC_DYSYMTAB: u32 = 0xB;
+pub const LC_UUID: u32 = 0x1B;
+pub const LC_SOURCE_VERSION: u32 = 0x2A;
 pub const LC_DYLD_INFO: u32 = 0x22;
 pub const LC_DYLD_INFO_ONLY: u32 = 0x8000_0022;
 pub const LC_CODE_SIGNATURE: u32 = 0x1D;
@@ -32,12 +38,13 @@ pub const VM_PROT_READ: u32 = 1;
 pub const VM_PROT_WRITE: u32 = 2;
 pub const VM_PROT_EXECUTE: u32 = 4;
 
-pub const STUB_DATA_SEGMENT: &str = "__STUBD";
 pub const STUB_TEXT_SEGMENT: &str = "__STUB";
 
 const HEADER_SIZE: usize = 32;
 const SEGMENT_CMD_SIZE: usize = 72;
 const SECTION_SIZE: usize = 80;
+/// `codesign` adds `LC_CODE_SIGNATURE` back and needs room for it
+const SIGNATURE_CMD_SIZE: usize = 16;
 
 #[derive(Debug)]
 pub enum Error {
@@ -359,9 +366,9 @@ impl MachO {
         first.saturating_sub(end)
     }
 
-    /// Virtual addresses the new segments will occupy: the `__STUBD` data
-    /// page and the `__STUB` text right after it. Both take over the range
-    /// currently assigned to `__LINKEDIT`, which is pushed up in memory.
+    /// Virtual address the `__STUB` segment will occupy: it takes over the
+    /// start of the range currently assigned to `__LINKEDIT`, which is
+    /// pushed up in memory.
     pub fn plan_layout(&self) -> Result<Layout, Error> {
         let linkedit = self
             .segment("__LINKEDIT")
@@ -377,36 +384,38 @@ impl MachO {
                 "__LINKEDIT is not last in the file".into(),
             ));
         }
-        let data_addr = linkedit.vmaddr;
-        let text_addr = data_addr + PAGE;
+        let text_addr = linkedit.vmaddr;
         if text_addr.abs_diff(text.vmaddr) >= 128 << 20 {
             return Err(Error::BadLayout(
                 "stub segment is out of b range of __TEXT".into(),
             ));
         }
-        Ok(Layout {
-            data_addr,
-            text_addr,
-        })
+        Ok(Layout { text_addr })
+    }
+
+    /// Commands that may be dropped to make header room, in the order they
+    /// are given up. None of them is read at run time; `LC_UUID` is not on
+    /// the list because dyld refuses an image without one. Dropping
+    /// `LC_FUNCTION_STARTS` orphans its bytes in `__LINKEDIT` and costs
+    /// debuggers their function boundaries, so it goes last.
+    fn droppable(&self, c: &Command) -> Option<usize> {
+        match c.cmd {
+            LC_DATA_IN_CODE if self.linkedit_data(LC_DATA_IN_CODE).is_none_or(|d| d.1 == 0) => {
+                Some(0)
+            }
+            LC_SOURCE_VERSION => Some(1),
+            LC_FUNCTION_STARTS => Some(2),
+            _ => None,
+        }
     }
 
     /// Emit the rewritten image: `patches` are `(address, word)` pairs
-    /// applied to file-backed text, `stub_data` becomes the `__STUBD` page and
-    /// `stub_text` the `__STUB` segment. The result is unsigned.
-    pub fn emit(
-        &self,
-        patches: &[(u64, u32)],
-        stub_data: &[u8],
-        stub_text: &[u8],
-    ) -> Result<Vec<u8>, Error> {
+    /// applied to file-backed text and `stub_text` becomes the `__STUB`
+    /// segment (none when empty). The result is unsigned.
+    pub fn emit(&self, patches: &[(u64, u32)], stub_text: &[u8]) -> Result<Vec<u8>, Error> {
         let layout = self.plan_layout()?;
         let linkedit = self.segment("__LINKEDIT").unwrap().clone();
-        if stub_data.len() as u64 > PAGE {
-            return Err(Error::BadLayout("stub data exceeds one page".into()));
-        }
-        let data_vmsize = PAGE;
-        let text_vmsize = round_up(stub_text.len().max(1) as u64, PAGE);
-        let inserted = data_vmsize + text_vmsize;
+        let inserted = round_up(stub_text.len() as u64, PAGE);
 
         // The code signature is the tail of __LINKEDIT; drop it and let
         // codesign append a fresh one.
@@ -423,34 +432,25 @@ impl MachO {
             new_linkedit_size = sig_off - linkedit.fileoff;
         }
 
-        let mut commands: Vec<Command> = Vec::with_capacity(self.commands.len() + 2);
+        let mut commands: Vec<Command> = Vec::with_capacity(self.commands.len() + 1);
+        // Index into `commands` and drop rank of each droppable command
+        let mut optional: Vec<(usize, usize)> = Vec::new();
         for (i, c) in self.commands.iter().enumerate() {
             if c.cmd == LC_CODE_SIGNATURE {
                 continue;
             }
             if i == linkedit.cmd_index {
-                commands.push(segment_command(
-                    STUB_DATA_SEGMENT,
-                    "__data",
-                    layout.data_addr,
-                    data_vmsize,
-                    linkedit.fileoff,
-                    data_vmsize,
-                    VM_PROT_READ | VM_PROT_WRITE,
-                    0,
-                ));
-                commands.push(segment_command(
-                    STUB_TEXT_SEGMENT,
-                    "__text",
-                    layout.text_addr,
-                    text_vmsize,
-                    linkedit.fileoff + data_vmsize,
-                    text_vmsize,
-                    VM_PROT_READ | VM_PROT_EXECUTE,
-                    0x8000_0400, // S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
-                ));
+                if inserted > 0 {
+                    commands.push(segment_command(
+                        STUB_TEXT_SEGMENT,
+                        layout.text_addr,
+                        inserted,
+                        linkedit.fileoff,
+                        VM_PROT_READ | VM_PROT_EXECUTE,
+                    ));
+                }
                 let mut b = c.bytes.clone();
-                put_u64(&mut b, 24, layout.text_addr + text_vmsize);
+                put_u64(&mut b, 24, layout.text_addr + inserted);
                 put_u64(&mut b, 32, round_up(new_linkedit_size, PAGE));
                 put_u64(&mut b, 40, linkedit.fileoff + inserted);
                 put_u64(&mut b, 48, new_linkedit_size);
@@ -460,6 +460,9 @@ impl MachO {
                 });
                 continue;
             }
+            if let Some(rank) = self.droppable(c) {
+                optional.push((commands.len(), rank));
+            }
             let mut b = c.bytes.clone();
             shift_linkedit_offsets(c.cmd, &mut b, inserted);
             commands.push(Command {
@@ -468,14 +471,25 @@ impl MachO {
             });
         }
 
-        let sizeofcmds: usize = commands.iter().map(|c| c.bytes.len()).sum();
         let old_end = HEADER_SIZE + self.header.sizeofcmds as usize;
         let room = self.header_room() + self.header.sizeofcmds as usize;
-        if sizeofcmds > room {
-            return Err(Error::NoHeaderRoom {
-                need: sizeofcmds,
-                have: room,
-            });
+        let size = |cmds: &[Command]| cmds.iter().map(|c| c.bytes.len()).sum::<usize>();
+        let need = size(&commands) + SIGNATURE_CMD_SIZE;
+        optional.sort_by_key(|&(_, rank)| rank);
+        let mut dropped = Vec::new();
+        for &(index, _) in &optional {
+            if size(&commands) + SIGNATURE_CMD_SIZE - size_of_dropped(&commands, &dropped) <= room {
+                break;
+            }
+            dropped.push(index);
+        }
+        dropped.sort_unstable();
+        for &index in dropped.iter().rev() {
+            commands.remove(index);
+        }
+        let sizeofcmds = size(&commands);
+        if sizeofcmds + SIGNATURE_CMD_SIZE > room {
+            return Err(Error::NoHeaderRoom { need, have: room });
         }
 
         let mut out = Vec::with_capacity(self.data.len() + inserted as usize);
@@ -503,8 +517,6 @@ impl MachO {
             put_u32(&mut out, off, word);
         }
 
-        out.extend_from_slice(stub_data);
-        out.resize(linkedit.fileoff as usize + data_vmsize as usize, 0);
         out.extend_from_slice(stub_text);
         out.resize(linkedit.fileoff as usize + inserted as usize, 0);
         let le_start = linkedit.fileoff as usize;
@@ -513,44 +525,29 @@ impl MachO {
     }
 }
 
+fn size_of_dropped(commands: &[Command], dropped: &[usize]) -> usize {
+    dropped.iter().map(|&i| commands[i].bytes.len()).sum()
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Layout {
-    pub data_addr: u64,
     pub text_addr: u64,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn segment_command(
-    segname: &str,
-    sectname: &str,
-    vmaddr: u64,
-    vmsize: u64,
-    fileoff: u64,
-    filesize: u64,
-    prot: u32,
-    sect_flags: u32,
-) -> Command {
-    let mut b = vec![0u8; SEGMENT_CMD_SIZE + SECTION_SIZE];
-    let len = b.len() as u32;
+/// A file-backed segment command without section headers. The kernel and
+/// dyld map segments; sections only matter to tools, and a section header
+/// costs 80 bytes of header room that default-linked binaries lack.
+fn segment_command(segname: &str, vmaddr: u64, size: u64, fileoff: u64, prot: u32) -> Command {
+    let mut b = vec![0u8; SEGMENT_CMD_SIZE];
     put_u32(&mut b, 0, LC_SEGMENT_64);
-    put_u32(&mut b, 4, len);
+    put_u32(&mut b, 4, SEGMENT_CMD_SIZE as u32);
     set_name16(&mut b[8..24], segname);
     put_u64(&mut b, 24, vmaddr);
-    put_u64(&mut b, 32, vmsize);
+    put_u64(&mut b, 32, size);
     put_u64(&mut b, 40, fileoff);
-    put_u64(&mut b, 48, filesize);
+    put_u64(&mut b, 48, size);
     put_u32(&mut b, 56, prot);
     put_u32(&mut b, 60, prot);
-    put_u32(&mut b, 64, 1);
-    put_u32(&mut b, 68, 0);
-    let s = &mut b[SEGMENT_CMD_SIZE..];
-    set_name16(&mut s[0..16], sectname);
-    set_name16(&mut s[16..32], segname);
-    put_u64(s, 32, vmaddr);
-    put_u64(s, 40, filesize);
-    put_u32(s, 48, fileoff as u32);
-    put_u32(s, 52, 2);
-    put_u32(s, 64, sect_flags);
     Command {
         cmd: LC_SEGMENT_64,
         bytes: b,

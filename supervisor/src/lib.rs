@@ -1,7 +1,7 @@
 //! Supervisor dylib, injected into the guest with `DYLD_INSERT_LIBRARIES`.
 //! Its constructor runs before the guest's `main`: it finds the rewritten
-//! image's `__STUBD` page, fills the scheduler slot, seeds the quantum
-//! counter, and arranges for a report to be written at exit.
+//! image's `__STUB` header, sets up the fixed region its stubs address,
+//! joins the run's scheduler, and arranges for a report to be written at exit.
 
 #![allow(clippy::missing_safety_doc)]
 
@@ -26,7 +26,7 @@ extern "C" fn init() {
     let config = sched::Config::from_env();
     let page = stubdata::find();
     if page.is_none() {
-        report::log("no __STUBD page in the main image; scheduling only at blocking calls");
+        report::log("main image is not rewritten; scheduling only at blocking calls");
     }
     determinism::init(config.seed);
     sched::init(page, &config);

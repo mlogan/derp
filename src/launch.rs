@@ -29,7 +29,12 @@ pub struct Launch {
     pub seed: u64,
     /// Hook events per quantum, inclusive range
     pub quantum: (u32, u32),
+    /// Inject the dylib without scheduling: see `Run::passive`
+    pub passive: bool,
 }
+
+/// Tells the supervisor to set up the stubs' region and nothing else
+pub const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
 
 pub const DEFAULT_QUANTUM: (u32, u32) = (1000, 10000);
 
@@ -104,6 +109,10 @@ pub struct Run {
     pub quantum: (u32, u32),
     /// Working directory for every guest
     pub cwd: Option<PathBuf>,
+    /// Rewritten binaries need the dylib for the region their stubs
+    /// address. Passive runs get that and no scheduler, which measures the
+    /// stubs alone.
+    pub passive: bool,
 }
 
 #[derive(Debug)]
@@ -142,6 +151,7 @@ fn spawn(run: &Run, guest: &Guest, extra_env: &[(String, String)]) -> io::Result
     let ours = [
         "DYLD_INSERT_LIBRARIES",
         REPORT_FD_VAR,
+        PASSIVE_VAR,
         shared::SHARED_VAR,
         shared::PROC_VAR,
     ];
@@ -317,9 +327,10 @@ fn wait_any(children: &mut [Child]) -> io::Result<usize> {
 /// Run every guest to completion under one scheduler. The launcher's
 /// stdin/stdout/stderr are inherited unless a guest redirects stdout.
 pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
-    let coord = match &run.dylib {
-        Some(_) => Some(Coordinator::create(run.seed, run.quantum)?),
-        None => None,
+    let coord = if run.dylib.is_some() && !run.passive {
+        Some(Coordinator::create(run.seed, run.quantum)?)
+    } else {
+        None
     };
     let mut children: Vec<Child> = Vec::new();
     let result = supervise(run, coord.as_ref(), &mut children);
@@ -373,6 +384,9 @@ fn supervise(
                 format!("{}..{}", run.quantum.0, run.quantum.1),
             ),
         ];
+        if run.passive {
+            env.push((PASSIVE_VAR.into(), "1".into()));
+        }
         if let Some(coord) = coord {
             let pid = coord.register(guest.host);
             debug_assert_eq!(pid as usize, children.len());
@@ -436,6 +450,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         seed: cfg.seed,
         quantum: cfg.quantum,
         cwd: None,
+        passive: cfg.passive,
     };
     let mut out = launch_run(&run)?;
     Ok(out.guests.remove(0))

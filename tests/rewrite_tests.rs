@@ -17,9 +17,10 @@ fn loops_branch_only_matches_native() {
     assert_eq!(native.exit_code(), Some(0));
     assert!(expected.starts_with("primes="));
 
-    let (standalone, text) = run(&rw_path, &["1"], None, 0);
-    assert_eq!(standalone.exit_code(), Some(0));
+    let (passive, text) = common::run_passive(&rw_path, &["1"]);
+    assert_eq!(passive.exit_code(), Some(0));
     assert_eq!(text, expected);
+    assert_eq!(passive.report.get_u64("switches"), None);
 
     let (supervised, text) = run(&rw_path, &["1"], Some(common::supervisor_dylib()), 0);
     assert_eq!(supervised.exit_code(), Some(0));
@@ -74,6 +75,7 @@ fn stubs_are_slide_proof() {
         stdout: None,
         seed: 0,
         quantum: launch::DEFAULT_QUANTUM,
+        passive: false,
     };
     // Output goes to the test's stdout here; only the status is checked.
     let o = launch::launch(&cfg).unwrap();

@@ -88,8 +88,6 @@ fn two_loops_processes_share_one_schedule() {
         // switches with both processes consuming hooks.
         assert!(r.u64("run.switches") > 100, "{:?}", r.fields);
         assert!(r.u64("p0.hooks") > 0 && r.u64("p1.hooks") > 0);
-        assert_eq!(r.fields["p0.shared_fixed"], "true");
-        assert_eq!(r.fields["p1.shared_fixed"], "true");
         let again = run_manifest(&manifest, &scratch, seed, 2);
         assert_eq!(
             r.fields["run.schedule_hash"], again.fields["run.schedule_hash"],

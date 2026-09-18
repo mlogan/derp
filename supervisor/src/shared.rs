@@ -17,11 +17,24 @@ use crate::rng::Rng;
 pub const MAGIC: u64 = 0x0031_4448_5357_5252;
 pub const MAX_THREADS: usize = 1024;
 pub const MAX_PROCS: usize = 256;
-/// Where guests map the file. Low addresses are unreliable: whatever the
-/// kernel places first above the dyld shared region varies between
-/// launches. Above the GPU carveout (which ends at `0x70_0000_0000`) only
-/// hinted mappings appear, growing up from its end.
-pub const MAP_ADDR: usize = 0x78_0000_0000;
+/// Base of the fixed region every guest sets up. The stubs materialize
+/// this address with one `movz`, so it has a single non-zero 16-bit chunk.
+/// Low addresses are unreliable: whatever the kernel places first above the
+/// dyld shared region varies between launches. Above the GPU carveout
+/// (which ends at `0x70_0000_0000`) only hinted mappings appear, growing up
+/// from its end.
+pub const STUB_BASE: usize = 0x78_0000_0000;
+/// The first page of the region is private to each process; the stubs
+/// load the scheduler entry point from `STUB_BASE + SLOT_OFFSET`.
+pub const PRIVATE_SIZE: usize = 0x4000;
+pub const SLOT_OFFSET: u32 = 0;
+/// Where guests map the file
+pub const MAP_ADDR: usize = STUB_BASE + PRIVATE_SIZE;
+/// Offset of the quantum counter from `STUB_BASE`, in reach of an
+/// unsigned-offset `ldr`
+pub const COUNTER_OFFSET: u32 = PRIVATE_SIZE as u32 + 16;
+const _: () = assert!(COUNTER_OFFSET.is_multiple_of(8) && COUNTER_OFFSET < 0x8000);
+const _: () = assert!(STUB_BASE & !(0xFFFF << 32) == 0);
 /// Environment variable naming the shared file
 pub const SHARED_VAR: &str = "REWRITE_SHARED";
 /// Environment variable carrying the guest's process index
@@ -86,8 +99,8 @@ pub struct State {
     pub switches: u64,
     pub expiries: u64,
     pub trace_hash: u64,
-    /// Quantum for whichever thread runs next; the quantum counter still
-    /// lives in each process's `__STUBD` page, so the receiver installs it.
+    /// Quantum for whichever thread runs next, installed by the receiver
+    /// so that hooks can be attributed to processes
     pub pending_quantum: i64,
     pub current: u32,
     pub nthreads: u32,
@@ -101,6 +114,9 @@ pub struct State {
 pub struct Shared {
     magic: u64,
     size: u64,
+    /// Hook events left in the quantum. The stubs decrement it without the
+    /// lock: only the baton holder runs guest code.
+    counter: UnsafeCell<i64>,
     lock: AtomicU32,
     state: UnsafeCell<State>,
 }
@@ -211,6 +227,10 @@ impl Shared {
             std::hint::spin_loop();
         }
         Guard { shared: self }
+    }
+
+    pub fn counter(&self) -> *mut i64 {
+        self.counter.get()
     }
 
     fn park_word(&self, id: usize) -> *mut c_void {
@@ -415,5 +435,16 @@ impl State {
         self.threads[..self.nthreads as usize]
             .iter()
             .any(|t| t.state != T_EXITED && t.state != T_FREE)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stubs_can_reach_the_counter() {
+        let offset = std::mem::offset_of!(Shared, counter);
+        assert_eq!(PRIVATE_SIZE + offset, COUNTER_OFFSET as usize);
     }
 }

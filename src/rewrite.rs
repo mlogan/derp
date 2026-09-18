@@ -1,22 +1,28 @@
 //! Rewrites the program text: every hooked site becomes a branch to a stub
-//! in `__STUB` that decrements the shared quantum counter, calls the
+//! in `__STUB` that decrements the run's quantum counter, calls the
 //! scheduler when it expires, and then performs the original branch or
 //! memory access.
+//!
+//! The counter and the scheduler slot are not in the image: they live in
+//! the fixed region the supervisor sets up at `shared::STUB_BASE`, which a
+//! stub reaches with one `movz`. A default-linked binary has header room
+//! for one new segment but not for a second, writable one, so a rewritten
+//! binary only runs with the supervisor injected.
 
 use crate::decode::{self, Class, FP, SP};
-use crate::macho::{self, MachO, PAGE};
+use crate::macho::{self, MachO};
 use crate::rng::Rng;
+use crate::shared::{COUNTER_OFFSET, SLOT_OFFSET, STUB_BASE};
 use crate::stub;
 
-/// Layout of the `__STUBD` data page shared between the stubs and the
-/// supervisor. Offsets are stable; the supervisor reads them.
-pub const DATA_COUNTER: u32 = 0;
-pub const DATA_SLOT: u32 = 8;
-pub const DATA_MAGIC: u32 = 16;
-pub const DATA_SITES: u32 = 24;
-pub const DATA_MEM_SITES: u32 = 32;
-pub const DATA_SEED: u32 = 40;
-pub const MAGIC: u64 = 0x0031_3030_5453_5752; // "RWST001" little-endian
+/// Read-only header at the start of `__STUB`, in front of the stub code.
+/// Offsets are stable; the supervisor reads them.
+pub const HEADER_MAGIC: u32 = 0;
+pub const HEADER_SITES: u32 = 8;
+pub const HEADER_MEM_SITES: u32 = 16;
+pub const HEADER_SEED: u32 = 24;
+pub const HEADER_SIZE: u64 = 32;
+pub const MAGIC: u64 = 0x0032_3030_5453_5752; // "RWST002" little-endian
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -147,7 +153,6 @@ enum Guard {
 
 struct Builder {
     text_addr: u64,
-    data_addr: u64,
     code: Vec<u32>,
     patches: Vec<(u64, u32)>,
 }
@@ -184,16 +189,10 @@ impl Builder {
             Some(self.code.len() - 1)
         };
         self.emit(stub::STP_X0_X1_PRE);
-        let adrp_pc = self.pc();
-        self.emit(
-            stub::adrp(0, adrp_pc, self.data_addr).ok_or(Error::OutOfRange {
-                site: adrp_pc,
-                target: self.data_addr,
-            })?,
-        );
-        self.emit(stub::ldr_x_imm(1, 0, DATA_COUNTER));
+        self.emit(stub::movz_x(0, STUB_BASE as u64).expect("STUB_BASE fits one movz"));
+        self.emit(stub::ldr_x_imm(1, 0, COUNTER_OFFSET));
         self.emit(stub::SUB_X1_X1_1);
-        self.emit(stub::str_x_imm(1, 0, DATA_COUNTER));
+        self.emit(stub::str_x_imm(1, 0, COUNTER_OFFSET));
         let cbz_at = self.code.len();
         self.emit(0);
         let resume = self.pc();
@@ -220,10 +219,9 @@ impl Builder {
             expired,
         )
         .unwrap();
+        // x0 still holds STUB_BASE here
         self.emit(stub::STR_X30_PRE);
-        let adrp_pc = self.pc();
-        self.emit(stub::adrp(0, adrp_pc, self.data_addr).unwrap());
-        self.emit(stub::ldr_x_imm(0, 0, DATA_SLOT));
+        self.emit(stub::ldr_x_imm(0, 0, SLOT_OFFSET));
         let skip_at = self.code.len();
         self.emit(0);
         self.emit(stub::BLR_X0);
@@ -278,8 +276,7 @@ fn function_ranges(m: &MachO) -> Result<Vec<(u64, u64)>, Error> {
 pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
     let layout = m.plan_layout()?;
     let mut b = Builder {
-        text_addr: layout.text_addr,
-        data_addr: layout.data_addr,
+        text_addr: layout.text_addr + HEADER_SIZE,
         code: Vec::new(),
         patches: Vec::new(),
     };
@@ -408,18 +405,17 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
         }
     }
 
-    let mut data = vec![0u8; PAGE as usize];
+    let mut stub_text = vec![0u8; HEADER_SIZE as usize];
     let put = |d: &mut [u8], off: u32, v: u64| {
         d[off as usize..off as usize + 8].copy_from_slice(&v.to_le_bytes());
     };
-    put(&mut data, DATA_MAGIC, MAGIC);
-    put(&mut data, DATA_SITES, b.patches.len() as u64);
-    put(&mut data, DATA_MEM_SITES, stats.mem_sites as u64);
-    put(&mut data, DATA_SEED, opts.seed);
-
-    let stub_text: Vec<u8> = b.code.iter().flat_map(|w| w.to_le_bytes()).collect();
+    put(&mut stub_text, HEADER_MAGIC, MAGIC);
+    put(&mut stub_text, HEADER_SITES, b.patches.len() as u64);
+    put(&mut stub_text, HEADER_MEM_SITES, stats.mem_sites as u64);
+    put(&mut stub_text, HEADER_SEED, opts.seed);
+    stub_text.extend(b.code.iter().flat_map(|w| w.to_le_bytes()));
     stats.stub_bytes = stub_text.len();
-    let image = m.emit(&b.patches, &data, &stub_text)?;
+    let image = m.emit(&b.patches, &stub_text)?;
     Ok(Rewritten { image, stats })
 }
 

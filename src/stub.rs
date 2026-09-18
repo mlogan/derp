@@ -56,14 +56,15 @@ pub fn br(rn: u8) -> u32 {
     0xD61F_0000 | (u32::from(rn) << 5)
 }
 
-/// `adrp xd, page(target)`; pages are 4 KB for this instruction
-pub fn adrp(rd: u8, pc: u64, target: u64) -> Option<u32> {
-    let delta = ((target >> 12) as i64).wrapping_sub((pc >> 12) as i64);
-    if !(-(1 << 20)..(1 << 20)).contains(&delta) {
-        return None;
-    }
-    let imm = delta as u32 & 0x1F_FFFF;
-    Some(0x9000_0000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | u32::from(rd))
+/// `movz xd, #imm16, lsl #shift` for a value with one non-zero 16-bit chunk
+pub fn movz_x(rd: u8, value: u64) -> Option<u32> {
+    let shift = if value == 0 {
+        0
+    } else {
+        value.trailing_zeros() / 16
+    };
+    let imm = value >> (shift * 16);
+    (imm <= 0xFFFF).then(|| 0xD280_0000 | (shift << 21) | ((imm as u32) << 5) | u32::from(rd))
 }
 
 /// `ldr xt, [xn, #imm]`, `imm` a multiple of 8 below 32 KB
@@ -92,9 +93,10 @@ mod tests {
         assert_eq!(tbz(7, 40, false, 0x1018, 0x1000), Some(0xB647_FF47));
         assert_eq!(tbz(2, 3, true, 0x101C, 0x1000), Some(0x371F_FF22));
         assert_eq!(br(9), 0xD61F_0120);
-        assert_eq!(adrp(0, 0x1000_0040, 0x1000_0000), Some(0x9000_0000));
-        assert_eq!(adrp(0, 0x1000_0040, 0x1000_2000), Some(0xD000_0000));
-        assert_eq!(adrp(0, 0x1000_2040, 0x1000_0000), Some(0xD0FF_FFE0));
+        assert_eq!(movz_x(0, 0x78_0000_0000), Some(0xD2C0_0F00));
+        assert_eq!(movz_x(3, 0x1234), Some(0xD282_4683));
+        assert_eq!(movz_x(0, 0), Some(0xD280_0000));
+        assert_eq!(movz_x(0, 0x1_0001), None);
         assert_eq!(ldr_x_imm(1, 0, 0), 0xF940_0001);
         assert_eq!(ldr_x_imm(1, 0, 8), 0xF940_0401);
         assert_eq!(str_x_imm(1, 0, 0), 0xF900_0001);

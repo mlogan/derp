@@ -256,9 +256,14 @@ Overhead on `loops 3` today (release build):
       against kernel loopback; quantum defaults
 - [ ] `docs/MULTIPROC_RESULTS.md`
 
-### Open questions for Mark
-- Day 2: rewritten binaries now need the dylib (passive mode replaces
-  standalone). The alternative that keeps standalone working is a second
-  stub flavor for binaries with header room; it was not built.
+### Decisions confirmed by Mark (2026-09-18)
+- Rewritten binaries require the supervisor dylib; passive mode replaces
+  standalone runs. No second stub flavor.
+- No core pinning: the counter stays in the baton holder's L1 for the whole
+  quantum, and a switch costs 8-14 us against about 0.1 us for the line to
+  move. Spin-before-park is a day 10 experiment.
+
+### Still open
 - `LC_FUNCTION_STARTS` is dropped from tight binaries as the last resort.
 - `~/dev/worklog` does not exist, so no work log entry was made.
+- Branch `mlogan-multiproc` is not pushed.

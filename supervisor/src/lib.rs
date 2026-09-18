@@ -30,5 +30,12 @@ extern "C" fn init() {
     }
     determinism::init(config.seed);
     sched::init(page, &config);
+    // Identical guests must not draw identical entropy. Process 0 keeps
+    // the plain seed.
+    determinism::init(
+        config
+            .seed
+            .wrapping_add(u64::from(sched::pid()).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+    );
     report::install_exit_hook();
 }

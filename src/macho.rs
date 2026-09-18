@@ -395,9 +395,14 @@ impl MachO {
 
     /// Commands that may be dropped to make header room, in the order they
     /// are given up. None of them is read at run time; `LC_UUID` is not on
-    /// the list because dyld refuses an image without one. Dropping
-    /// `LC_FUNCTION_STARTS` orphans its bytes in `__LINKEDIT` and costs
-    /// debuggers their function boundaries, so it goes last.
+    /// the list because dyld refuses an image without one.
+    ///
+    /// `LC_FUNCTION_STARTS` goes last and only the smallest binaries lose
+    /// it (a default-linked C hello world is 8 bytes short without it; a
+    /// default-linked Rust program keeps it). The rewritten file then has
+    /// no function boundaries for debuggers and profilers, its table stays
+    /// as dead bytes in `__LINKEDIT`, and it cannot be rewritten again.
+    /// Linking the guest with `-Wl,-headerpad,0x1000` avoids all drops.
     fn droppable(&self, c: &Command) -> Option<usize> {
         match c.cmd {
             LC_DATA_IN_CODE if self.linkedit_data(LC_DATA_IN_CODE).is_none_or(|d| d.1 == 0) => {

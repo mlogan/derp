@@ -6,13 +6,13 @@ mod common;
 
 use std::path::Path;
 
-use common::{rewrite_to, run, seed_env};
+use common::{rewrite_to, run};
 use rewrite::rewrite::Options;
 
 const TWO_N: &str = "total=400000 expected=400000\n";
 
 fn supervised(exe: &Path, args: &[&str], seed: u64) -> (String, String) {
-    let (o, text) = run(exe, args, Some(common::supervisor_dylib()), seed_env(seed));
+    let (o, text) = run(exe, args, Some(common::supervisor_dylib()), seed);
     assert_eq!(o.exit_code(), Some(0), "seed {seed}: {text}");
     let hash = o
         .report
@@ -107,7 +107,7 @@ fn race_with_sparse_memory_hooks_reproduces_from_a_seed() {
 fn channel_output_is_correct_and_schedule_is_stable() {
     let dir = common::scratch_dir("channel");
     let exe = common::build_rust("channel", &dir);
-    let (native, expected) = run(&exe, &[], None, vec![]);
+    let (native, expected) = run(&exe, &[], None, 0);
     assert_eq!(native.exit_code(), Some(0));
     assert!(expected.contains("per_worker [2000, 2000, 2000]"));
     let rw = dir.join("channel.rw");

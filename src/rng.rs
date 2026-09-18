@@ -2,7 +2,9 @@
 //! stream for a given seed is fixed forever. Shared by the rewriter (memory
 //! hook selection) and the supervisor (quanta and thread choice).
 
+// `repr(C)`: lives in the scheduler state shared between processes.
 #[derive(Clone, Debug)]
+#[repr(C)]
 pub struct Rng {
     s: [u64; 4],
 }

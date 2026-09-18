@@ -18,7 +18,8 @@ use crate::determinism::{
     my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_gettimeofday,
     my_mach_absolute_time, my_mach_continuous_time, my_time,
 };
-use crate::sched::{self, my_id, State, SCHED};
+use crate::sched::{self, my_id, State};
+use crate::shared;
 
 #[repr(C)]
 struct Interpose {
@@ -120,12 +121,7 @@ extern "C" fn trampoline(p: *mut c_void) -> *mut c_void {
 pub extern "C" fn thread_teardown(value: *mut c_void) {
     let id = value as usize - 1;
     count(C_EXIT);
-    {
-        let mut guard = SCHED.lock().unwrap();
-        if let Some(s) = guard.as_mut() {
-            s.wake_all(join_key(id));
-        }
-    }
+    sched::wake_all(join_key(id));
     sched::yield_baton_as(id, State::Exited, 0);
 }
 
@@ -139,15 +135,14 @@ extern "C" fn my_pthread_create(
         return unsafe { libc::pthread_create(t, attr, f, arg) };
     }
     count(C_CREATE);
-    let id = SCHED.lock().unwrap().as_mut().unwrap().add_thread();
+    let id = sched::add_thread();
     let start = Box::into_raw(Box::new(Start { f, arg, id }));
     let rc = unsafe { libc::pthread_create(t, attr, trampoline, start.cast()) };
-    let mut guard = SCHED.lock().unwrap();
-    let s = guard.as_mut().unwrap();
     if rc == 0 {
-        s.threads[id].pthread = unsafe { *t };
+        let handle = unsafe { *t } as u64;
+        sched::with(|s, _| s.threads[id].pthread = handle);
     } else {
-        s.threads[id].state = State::Exited;
+        sched::with(|s, _| s.threads[id].state = shared::T_EXITED);
         drop(unsafe { Box::from_raw(start) });
     }
     rc
@@ -157,13 +152,11 @@ extern "C" fn my_pthread_join(t: libc::pthread_t, ret: *mut *mut c_void) -> c_in
     if my_id().is_some() {
         count(C_JOIN);
         loop {
-            let guard = SCHED.lock().unwrap();
-            let s = guard.as_ref().unwrap();
-            let Some(id) = s.find_pthread(t) else { break };
-            if s.threads[id].state == State::Exited {
-                break;
-            }
-            drop(guard);
+            let pending = sched::with(|s, pid| {
+                s.find_pthread(pid, t as u64)
+                    .filter(|&id| s.threads[id].state != shared::T_EXITED)
+            });
+            let Some(Some(id)) = pending else { break };
             sched::yield_baton(State::Blocked(join_key(id)), join_key(id) as u64);
         }
     }
@@ -189,47 +182,35 @@ extern "C" fn my_pthread_mutex_lock(m: *mut libc::pthread_mutex_t) -> c_int {
 extern "C" fn my_pthread_mutex_unlock(m: *mut libc::pthread_mutex_t) -> c_int {
     let rc = unsafe { libc::pthread_mutex_unlock(m) };
     if my_id().is_some() {
-        if let Some(s) = SCHED.lock().unwrap().as_mut() {
-            s.wake_all(m as usize);
-        }
+        sched::wake_all(m as usize);
     }
     rc
 }
 
 fn cond_enqueue(c: usize, me: usize, timed: bool) {
-    let mut guard = SCHED.lock().unwrap();
-    let s = guard.as_mut().unwrap();
-    s.threads[me].signaled = false;
-    s.threads[me].timed = timed;
-    s.threads[me].timed_out = false;
-    match s.cond_waiters.iter_mut().find(|(a, _)| *a == c) {
-        Some((_, q)) => q.push_back(me),
-        None => s
-            .cond_waiters
-            .push((c, std::collections::VecDeque::from([me]))),
-    }
+    sched::with(|s, _| s.cond_enqueue(me, c as u64, timed));
 }
 
 /// Returns true when signaled, false on timeout
 fn cond_block(c: usize, me: usize) -> bool {
     loop {
-        {
-            let mut guard = SCHED.lock().unwrap();
-            let s = guard.as_mut().unwrap();
+        let done = sched::with(|s, _| {
             let t = &mut s.threads[me];
             if t.signaled {
                 t.signaled = false;
                 t.timed = false;
-                return true;
+                return Some(true);
             }
             if t.timed_out {
                 t.timed = false;
                 t.timed_out = false;
-                if let Some((_, q)) = s.cond_waiters.iter_mut().find(|(a, _)| *a == c) {
-                    q.retain(|&w| w != me);
-                }
-                return false;
+                t.cond_key = 0;
+                return Some(false);
             }
+            None
+        });
+        if let Some(Some(signaled)) = done {
+            return signaled;
         }
         sched::yield_baton(State::Blocked(c), c as u64);
     }
@@ -273,20 +254,7 @@ extern "C" fn my_pthread_cond_timedwait(
 }
 
 fn cond_wake(c: usize, all: bool) {
-    let mut guard = SCHED.lock().unwrap();
-    let s = guard.as_mut().unwrap();
-    let Some(pos) = s.cond_waiters.iter().position(|(a, _)| *a == c) else {
-        return;
-    };
-    let ids: Vec<usize> = if all {
-        s.cond_waiters[pos].1.drain(..).collect()
-    } else {
-        s.cond_waiters[pos].1.pop_front().into_iter().collect()
-    };
-    for id in ids {
-        s.threads[id].signaled = true;
-        s.wake_thread(id);
-    }
+    sched::with(|s, pid| s.cond_wake(pid, c as u64, all));
 }
 
 extern "C" fn my_pthread_cond_signal(c: *mut libc::pthread_cond_t) -> c_int {
@@ -319,17 +287,17 @@ fn value_matches(addr: *mut c_void, value: u64, wide: bool) -> bool {
 /// Block on `addr` once. Returns false if the wait timed out.
 fn futex_block(addr: *mut c_void, timed: bool) -> bool {
     let me = my_id().unwrap();
-    {
-        let mut guard = SCHED.lock().unwrap();
-        let s = guard.as_mut().unwrap();
+    sched::with(|s, _| {
         s.threads[me].timed = timed;
         s.threads[me].timed_out = false;
-    }
+    });
     sched::yield_baton(State::Blocked(addr as usize), addr as usize as u64);
-    let mut guard = SCHED.lock().unwrap();
-    let t = &mut guard.as_mut().unwrap().threads[me];
-    t.timed = false;
-    !std::mem::take(&mut t.timed_out)
+    sched::with(|s, _| {
+        let t = &mut s.threads[me];
+        t.timed = false;
+        !std::mem::take(&mut t.timed_out)
+    })
+    .unwrap_or(true)
 }
 
 fn ulock_is_wide(op: u32) -> bool {
@@ -397,9 +365,7 @@ extern "C" fn my_ulock_wake(op: u32, addr: *mut c_void, wake_value: u64) -> c_in
     if my_id().is_none() {
         return unsafe { __ulock_wake(op, addr, wake_value) };
     }
-    if let Some(s) = SCHED.lock().unwrap().as_mut() {
-        s.wake_all(addr as usize);
-    }
+    sched::wake_all(addr as usize);
     0
 }
 
@@ -448,9 +414,7 @@ extern "C" fn my_os_sync_wake_by_address_any(addr: *mut c_void, size: usize, fla
     if my_id().is_none() {
         return unsafe { os_sync_wake_by_address_any(addr, size, flags) };
     }
-    if let Some(s) = SCHED.lock().unwrap().as_mut() {
-        s.wake_all(addr as usize);
-    }
+    sched::wake_all(addr as usize);
     0
 }
 
@@ -458,9 +422,7 @@ extern "C" fn my_os_sync_wake_by_address_all(addr: *mut c_void, size: usize, fla
     if my_id().is_none() {
         return unsafe { os_sync_wake_by_address_all(addr, size, flags) };
     }
-    if let Some(s) = SCHED.lock().unwrap().as_mut() {
-        s.wake_all(addr as usize);
-    }
+    sched::wake_all(addr as usize);
     0
 }
 
@@ -485,9 +447,7 @@ extern "C" fn my_dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isi
 extern "C" fn my_dispatch_semaphore_signal(sema: *mut c_void) -> isize {
     let rc = unsafe { dispatch_semaphore_signal(sema) };
     if my_id().is_some() {
-        if let Some(s) = SCHED.lock().unwrap().as_mut() {
-            s.wake_all(sema as usize);
-        }
+        sched::wake_all(sema as usize);
     }
     rc
 }

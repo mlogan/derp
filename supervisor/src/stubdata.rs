@@ -26,6 +26,16 @@ unsafe impl Send for Page {}
 unsafe impl Sync for Page {}
 
 impl Page {
+    pub fn base(self) -> usize {
+        self.base as usize
+    }
+
+    pub fn from_base(base: usize) -> Option<Page> {
+        (base != 0).then_some(Page {
+            base: base as *mut u8,
+        })
+    }
+
     pub fn counter(self) -> *mut i64 {
         unsafe { self.base.add(OFF_COUNTER).cast() }
     }

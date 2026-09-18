@@ -109,7 +109,7 @@ pub fn run(
     exe: &Path,
     args: &[&str],
     dylib: Option<PathBuf>,
-    env: Vec<(String, String)>,
+    seed: u64,
 ) -> (rewrite::launch::Outcome, String) {
     let tag = format!("{}-{:?}", std::process::id(), std::thread::current().id());
     let tag = tag.replace(|c: char| !c.is_ascii_alphanumeric(), "");
@@ -118,15 +118,13 @@ pub fn run(
         exe: exe.to_path_buf(),
         args: args.iter().map(std::convert::Into::into).collect(),
         dylib,
-        env,
+        env: Vec::new(),
         disable_aslr: true,
         stdout: Some(out_path.clone()),
+        seed,
+        quantum: rewrite::launch::DEFAULT_QUANTUM,
     };
     let outcome = rewrite::launch::launch(&cfg).expect("launch");
     let text = std::fs::read_to_string(&out_path).unwrap_or_default();
     (outcome, text)
-}
-
-pub fn seed_env(seed: u64) -> Vec<(String, String)> {
-    vec![("REWRITE_SEED".into(), seed.to_string())]
 }

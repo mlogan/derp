@@ -17,6 +17,8 @@ fn run_capture(
         env: Vec::new(),
         disable_aslr: true,
         stdout: Some(out_path.clone()),
+        seed: 0,
+        quantum: launch::DEFAULT_QUANTUM,
     };
     let outcome = launch::launch(&cfg).expect("launch");
     let text = std::fs::read_to_string(&out_path).unwrap_or_default();

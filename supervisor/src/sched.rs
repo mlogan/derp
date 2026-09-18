@@ -270,6 +270,12 @@ const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
 /// launcher), then park the main thread until it is handed the baton.
 pub fn init(info: Option<Info>, cfg: &Config) {
     *INFO.lock() = info;
+    if let Some(spins) = std::env::var("REWRITE_PARK_SPINS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        shared::PARK_SPINS.store(spins, Ordering::Relaxed);
+    }
     if std::env::var_os(PASSIVE_VAR).is_some() {
         map_region(-1, Shared::SIZE);
         return;

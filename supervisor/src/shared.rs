@@ -96,6 +96,9 @@ pub const P_EXITED: u32 = 3;
 
 const NO_THREAD: u32 = u32::MAX;
 
+/// Iterations a parking thread spins before it sleeps (`REWRITE_PARK_SPINS`)
+pub static PARK_SPINS: AtomicU32 = AtomicU32::new(0);
+
 #[repr(C)]
 pub struct ThreadRec {
     pub state: u32,
@@ -297,6 +300,14 @@ impl Shared {
     pub fn park(&self, id: usize, seen: u32) {
         let word = self.park_word(id);
         let atomic = unsafe { &*word.cast::<AtomicU32>() };
+        // Optionally spin first: a baton that comes straight back saves the
+        // sleep and the wake. Off by default; see the results write-up.
+        for _ in 0..PARK_SPINS.load(Ordering::Relaxed) {
+            if atomic.load(Ordering::Acquire) != seen {
+                return;
+            }
+            std::hint::spin_loop();
+        }
         while atomic.load(Ordering::Acquire) == seen {
             unsafe { __ulock_wait2(PARK_OP, word, u64::from(seen), 0, 0) };
         }

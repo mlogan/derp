@@ -75,15 +75,71 @@ Updated at the end of each work unit.
   hint and only logs when it misses. Not seen missing in 400 launches of
   hello world; if it shows up, give it the same reservation treatment.
 
-## Day 2 — Counter relocation, header room (in progress)
+## Day 2 — Counter relocation, header room ✅ (design differs from the plan)
 
-- [ ] Stub loads the counter through a pointer slot in `__STUBD`
-- [ ] Counter in the shared state; standalone binaries point at a local word
-- [ ] `__STUB` without a section header; slot in `__DATA` slack; drop
-      `LC_UUID`/`LC_SOURCE_VERSION`/empty `LC_DATA_IN_CODE` when short
-- [ ] Default-linked hello world rewrites and runs
-- [ ] Overhead on `loops.c` recorded
+What the plan assumed and what turned out to be true:
 
-## Days 3-12 — not started
+- The plan puts the counter pointer slot in `__DATA` slack. A
+  default-linked C hello world has **no `__DATA` segment**, only
+  `__DATA_CONST`, which dyld makes read-only.
+- Header room in that binary is 32 bytes. Dropping the old signature and
+  the optional commands frees at most 80 more, and `codesign` needs 16
+  back. One sectionless segment (72 bytes) fits; two do not.
+- **`LC_UUID` cannot be dropped**: dyld on macOS 26 aborts with "missing
+  LC_UUID load command". The drop order is an empty `LC_DATA_IN_CODE`,
+  `LC_SOURCE_VERSION`, then `LC_FUNCTION_STARTS` (tool-only; its bytes
+  stay orphaned in `__LINKEDIT`). Roomy binaries keep everything.
+
+So the image gets one segment, `__STUB`, read-execute, with no section
+header, and no writable page at all:
+
+- The stubs address a **fixed region at `0x78_0000_0000`** set up by the
+  supervisor: one private page per process (scheduler slot at offset 0),
+  then the shared state, whose `counter` sits at region offset `0x4010`.
+  A stub reaches both with `movz x0, #0x78, lsl #32`; the expired path
+  reuses x0. No `adrp`, no pointer slot, no extra load.
+- Per-hook cost is unchanged. A/B on `loops 3` the same afternoon: old
+  local-counter stub 1.61x and 1.66x, new stub 1.61x and 1.67x. The plan's
+  "counter relocation overhead" risk is retired.
+- **Consequence: a rewritten binary does not run without the dylib**
+  (it would fault on the unmapped region). The plan wanted standalone
+  binaries to keep working. `--no-supervisor` and `bench` now inject the
+  dylib with `REWRITE_PASSIVE=1`: it maps the region, registers no thread,
+  and every interposer passes through. Startup cost of that is under 1 ms.
+- The site counts, seed and magic (`RWST002`) moved to a 32-byte header
+  at the start of `__STUB`. Cache files are tagged `.rw2-`.
+- The supervisor reserves the whole region with one fixed
+  `mach_vm_allocate` and maps over it; failure is fatal in the guest
+  because the stubs hard-code the address.
+- Hooks are still attributed per process (each process settles what it
+  consumed when it gives the baton away).
+- Tests: a default-linked hello rewrites, signs and runs with hooks
+  counted; a roomy binary keeps its optional commands. A default-linked
+  Rust `channel.rs` also runs (checked by hand, 7,287 sites).
+- The test helpers still link guests with `-Wl,-headerpad,0x1000`; it is
+  no longer needed.
+
+Overhead on `loops 3` today (release build):
+
+| Mode | Time | vs native |
+|---|---|---|
+| native | 0.252 s | 1.00x |
+| rewritten, passive | 0.420 s | 1.66x |
+| supervised, branch hooks | 0.43 s | 1.71x |
+| supervised, rate 1/16 | 0.55 s | 2.2x |
+| supervised, rate 1 | 1.46 s | 5.8x |
+
+## Day 3 — Virtual pids and process lifecycle (next)
+
+- [ ] Launcher socket: `Register`, `Spawn` (rewrite on demand), `Report`
+- [ ] `posix_spawn`/`posix_spawnp`, `fork`, `execve` interposition
+- [ ] `waitpid`/`wait4` as scheduler waits; vpid translation in `getpid`,
+      `getppid`, `kill`
+- [ ] Spawned children are reaped by their parent, not the launcher, so
+      the launcher's "hand the baton on after the reap" path needs another
+      signal for them (kqueue `NOTE_EXIT` works on any pid)
+- [ ] `pipeline.c` spawns its stages
+
+## Days 4-12 — not started
 
 See the plan's implementation order.

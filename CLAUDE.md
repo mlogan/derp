@@ -424,7 +424,12 @@ See `TASKS_PHASE{N}.md`.
 `supervisor/` run native arm64 Mach-O binaries under a
 deterministic baton scheduler. Plan in `IMPLEMENTATION_PLAN_REWRITE.md`,
 progress in `TASKS_REWRITE.md`, results in `docs/REWRITE_RESULTS.md`.
-Guests must link with `-Wl,-headerpad,0x1000`.
+
+**Multi-process runs** (branch `mlogan-multiproc`): one scheduler in shared
+memory for several guests, `rewrite run --manifest FILE`. Plan in
+`IMPLEMENTATION_PLAN_MULTIPROC.md`, progress and deviations in
+`TASKS_MULTIPROC.md`. Rewritten binaries need the supervisor dylib (their
+stubs address a fixed region it maps); default-linked guests work.
 
 **Next Phase**: Not yet planned
 

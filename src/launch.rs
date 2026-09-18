@@ -3,9 +3,8 @@
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 
 use crate::coord::{Coordinator, Death, Totals};
@@ -13,9 +12,6 @@ use crate::shared;
 
 /// Not in the libc crate; from `<spawn.h>` on Darwin.
 const POSIX_SPAWN_DISABLE_ASLR: libc::c_short = 0x0100;
-
-/// Environment variable naming the fd the supervisor writes its report to.
-pub const REPORT_FD_VAR: &str = "REWRITE_REPORT_FD";
 
 pub struct Launch {
     pub exe: PathBuf,
@@ -31,6 +27,8 @@ pub struct Launch {
     pub quantum: (u32, u32),
     /// Inject the dylib without scheduling: see `Run::passive`
     pub passive: bool,
+    /// See `Run::rewrite`
+    pub rewrite: Option<crate::rewrite::Options>,
 }
 
 /// Tells the supervisor to set up the stubs' region and nothing else
@@ -113,20 +111,29 @@ pub struct Run {
     /// address. Passive runs get that and no scheduler, which measures the
     /// stubs alone.
     pub passive: bool,
+    /// How to rewrite programs the guests spawn; without it they are
+    /// expected to be rewritten already.
+    pub rewrite: Option<crate::rewrite::Options>,
 }
 
 #[derive(Debug)]
 pub struct RunOutcome {
-    /// In the order of `Run::guests`
+    /// Every process of the run in registration order: `Run::guests`
+    /// first, then the ones guests spawned
     pub guests: Vec<Outcome>,
+    /// How many of `guests` the launcher started itself
+    pub initial: usize,
     pub totals: Totals,
     /// The survivors were killed because every thread was blocked
     pub deadlock: bool,
 }
 
-struct Child {
+/// A process of the run as the launcher sees it, indexed like the shared
+/// process table
+struct Tracked {
     pid: libc::pid_t,
-    report_fd: libc::c_int,
+    /// Our own child (we reap it) rather than a guest's
+    ours: bool,
     status: Option<i32>,
     report: String,
 }
@@ -138,19 +145,15 @@ extern "C" {
     ) -> libc::c_int;
 }
 
-fn spawn(run: &Run, guest: &Guest, extra_env: &[(String, String)]) -> io::Result<Child> {
-    let mut fds = [0 as libc::c_int; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let (read_fd, write_fd) = (fds[0], fds[1]);
-    unsafe {
-        libc::fcntl(read_fd, libc::F_SETFD, libc::FD_CLOEXEC);
-    }
-
+/// `guest_sock`, when given, becomes the guest's `COORD_FD`.
+fn spawn(
+    run: &Run,
+    guest: &Guest,
+    extra_env: &[(String, String)],
+    guest_sock: Option<libc::c_int>,
+) -> io::Result<libc::pid_t> {
     let ours = [
         "DYLD_INSERT_LIBRARIES",
-        REPORT_FD_VAR,
         PASSIVE_VAR,
         shared::SHARED_VAR,
         shared::PROC_VAR,
@@ -169,7 +172,6 @@ fn spawn(run: &Run, guest: &Guest, extra_env: &[(String, String)]) -> io::Result
         s.extend(d.as_os_str().as_bytes());
         env.push(CString::new(s).unwrap());
     }
-    env.push(CString::new(format!("{REPORT_FD_VAR}={write_fd}")).unwrap());
     for (k, v) in run.env.iter().chain(extra_env) {
         env.push(CString::new(format!("{k}={v}")).unwrap());
     }
@@ -218,6 +220,9 @@ fn spawn(run: &Run, guest: &Guest, extra_env: &[(String, String)]) -> io::Result
         if let Some(p) = &cwd_c {
             posix_spawn_file_actions_addchdir_np(&raw mut actions, p.as_ptr());
         }
+        if let Some(sock) = guest_sock {
+            libc::posix_spawn_file_actions_adddup2(&raw mut actions, sock, shared::COORD_FD);
+        }
         let rc = libc::posix_spawn(
             &raw mut pid,
             exe.as_ptr(),
@@ -228,23 +233,25 @@ fn spawn(run: &Run, guest: &Guest, extra_env: &[(String, String)]) -> io::Result
         );
         libc::posix_spawn_file_actions_destroy(&raw mut actions);
         libc::posix_spawnattr_destroy(&raw mut attr);
-        libc::close(write_fd);
         rc
     };
     if rc != 0 {
-        unsafe { libc::close(read_fd) };
         return Err(io::Error::from_raw_os_error(rc));
     }
-    Ok(Child {
-        pid,
-        report_fd: read_fd,
-        status: None,
-        report: String::new(),
-    })
+    Ok(pid)
 }
 
-impl Child {
-    /// Reap if the process has ended; with `block`, wait for it.
+impl Tracked {
+    fn new(pid: libc::pid_t, ours: bool) -> Self {
+        Tracked {
+            pid,
+            ours,
+            status: None,
+            report: String::new(),
+        }
+    }
+
+    /// Reap one of our own children if it has ended; with `block`, wait.
     fn reap(&mut self, block: bool) -> bool {
         if self.status.is_some() {
             return true;
@@ -255,10 +262,6 @@ impl Child {
             return false;
         }
         self.status = Some(status);
-        // The only writer is dead, so this reads to EOF without blocking
-        // on the guest.
-        let mut f = unsafe { std::fs::File::from_raw_fd(self.report_fd) };
-        let _ = f.read_to_string(&mut self.report);
         true
     }
 
@@ -269,44 +272,76 @@ impl Child {
     }
 }
 
-/// Block until one of the unreaped children exits and return its index.
-/// Watches the specific pids: `waitpid(-1)` would steal children from
-/// other runs in the same launcher process.
-fn wait_any(children: &mut [Child]) -> io::Result<usize> {
-    let kq = unsafe { libc::kqueue() };
-    if kq < 0 {
-        return Err(io::Error::last_os_error());
+/// kqueue over the run's processes and its socket. Exits are watched per
+/// pid: `waitpid(-1)` would steal children from other runs in the same
+/// launcher process, and guests' own children are not ours to wait for.
+struct Events {
+    kq: libc::c_int,
+}
+
+enum Event {
+    Exited { index: usize, status: i32 },
+    Socket,
+}
+
+const SOCKET_UDATA: usize = usize::MAX;
+
+impl Events {
+    fn new() -> io::Result<Self> {
+        let kq = unsafe { libc::kqueue() };
+        if kq < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Events { kq })
     }
-    let result = (|| {
-        for (i, c) in children.iter_mut().enumerate() {
-            if c.status.is_some() {
-                continue;
-            }
+
+    fn add(&self, ident: usize, filter: i16, fflags: u32, udata: usize) -> bool {
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        ev.ident = ident;
+        ev.filter = filter;
+        ev.flags = libc::EV_ADD;
+        ev.fflags = fflags;
+        ev.udata = udata as *mut libc::c_void;
+        let rc = unsafe {
+            libc::kevent(
+                self.kq,
+                &raw const ev,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        rc >= 0
+    }
+
+    /// False when the process is already gone.
+    fn watch_exit(&self, pid: libc::pid_t, index: usize) -> bool {
+        self.add(
+            pid as usize,
+            libc::EVFILT_PROC,
+            libc::NOTE_EXIT | libc::NOTE_EXITSTATUS,
+            index,
+        )
+    }
+
+    fn watch_socket(&self, fd: libc::c_int) {
+        self.add(fd as usize, libc::EVFILT_READ, 0, SOCKET_UDATA);
+    }
+
+    fn wait(&self) -> io::Result<Event> {
+        loop {
             let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
-            ev.ident = c.pid as usize;
-            ev.filter = libc::EVFILT_PROC;
-            ev.flags = libc::EV_ADD | libc::EV_ONESHOT;
-            ev.fflags = libc::NOTE_EXIT;
-            ev.udata = i as *mut libc::c_void;
-            let rc = unsafe {
+            let n = unsafe {
                 libc::kevent(
-                    kq,
-                    &raw const ev,
-                    1,
-                    std::ptr::null_mut(),
+                    self.kq,
+                    std::ptr::null(),
                     0,
+                    &raw mut ev,
+                    1,
                     std::ptr::null(),
                 )
             };
-            // ESRCH: already a zombie
-            if rc < 0 && c.reap(true) {
-                return Ok(i);
-            }
-        }
-        loop {
-            let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
-            let n =
-                unsafe { libc::kevent(kq, std::ptr::null(), 0, &raw mut ev, 1, std::ptr::null()) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -314,14 +349,101 @@ fn wait_any(children: &mut [Child]) -> io::Result<usize> {
                 }
                 return Err(e);
             }
-            let i = ev.udata as usize;
-            if children[i].reap(true) {
-                return Ok(i);
+            if ev.udata as usize == SOCKET_UDATA {
+                return Ok(Event::Socket);
+            }
+            if ev.fflags & libc::NOTE_EXIT != 0 {
+                return Ok(Event::Exited {
+                    index: ev.udata as usize,
+                    status: ev.data as i32,
+                });
             }
         }
-    })();
-    unsafe { libc::close(kq) };
-    result
+    }
+}
+
+impl Drop for Events {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.kq) };
+    }
+}
+
+/// The launcher's end of the run's socket
+struct Channel {
+    fd: libc::c_int,
+    buf: Vec<u8>,
+}
+
+struct Frame {
+    kind: u8,
+    proc_index: u32,
+    payload: Vec<u8>,
+}
+
+impl Channel {
+    /// Returns the channel and the guests' end.
+    fn pair() -> io::Result<(Channel, libc::c_int)> {
+        let mut fds = [0 as libc::c_int; 2];
+        if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        for fd in fds {
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+        Ok((
+            Channel {
+                fd: fds[0],
+                buf: Vec::new(),
+            },
+            fds[1],
+        ))
+    }
+
+    /// Complete frames that have arrived, without blocking.
+    fn drain(&mut self) -> Vec<Frame> {
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = unsafe {
+                libc::recv(
+                    self.fd,
+                    chunk.as_mut_ptr().cast(),
+                    chunk.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if n <= 0 {
+                break;
+            }
+            self.buf.extend_from_slice(&chunk[..n as usize]);
+        }
+        let mut frames = Vec::new();
+        while self.buf.len() >= 4 {
+            let len = u32::from_le_bytes(self.buf[..4].try_into().unwrap()) as usize;
+            if len < 5 || self.buf.len() < 4 + len {
+                break;
+            }
+            let body: Vec<u8> = self.buf.drain(..4 + len).skip(4).collect();
+            frames.push(Frame {
+                kind: body[0],
+                proc_index: u32::from_le_bytes(body[1..5].try_into().unwrap()),
+                payload: body[5..].to_vec(),
+            });
+        }
+        frames
+    }
+
+    fn reply(&self, errno: i32, payload: &[u8]) {
+        let mut out = errno.to_le_bytes().to_vec();
+        out.extend((payload.len() as u32).to_le_bytes());
+        out.extend(payload);
+        unsafe { libc::send(self.fd, out.as_ptr().cast(), out.len(), 0) };
+    }
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.fd) };
+    }
 }
 
 /// Run every guest to completion under one scheduler. The launcher's
@@ -332,17 +454,14 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
     } else {
         None
     };
-    let mut children: Vec<Child> = Vec::new();
-    let result = supervise(run, coord.as_ref(), &mut children);
+    let mut procs: Vec<Tracked> = Vec::new();
+    let result = supervise(run, coord.as_ref(), &mut procs);
     if result.is_err() {
-        for c in &mut children {
-            c.kill();
-            c.reap(true);
-        }
+        kill_all(&mut procs);
     }
     let deadlock = result?;
     let totals = coord.as_ref().map(Coordinator::totals).unwrap_or_default();
-    let guests = children
+    let guests = procs
         .into_iter()
         .map(|c| {
             let mut report = Report::parse(&c.report);
@@ -365,17 +484,50 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
         .collect();
     Ok(RunOutcome {
         guests,
+        initial: run.guests.len(),
         totals,
         deadlock,
     })
 }
 
+fn kill_all(procs: &mut [Tracked]) {
+    for c in procs.iter_mut() {
+        c.kill();
+        if c.ours {
+            c.reap(true);
+        }
+    }
+}
+
+/// A guest asks where the rewritten form of a program it wants to run is.
+fn rewritten_path(run: &Run, payload: &[u8]) -> Result<Vec<u8>, i32> {
+    let path = Path::new(std::ffi::OsStr::from_bytes(payload));
+    let Some(opts) = &run.rewrite else {
+        return Ok(payload.to_vec());
+    };
+    match crate::cache::cached_rewrite(path, opts) {
+        Ok(p) => Ok(p.as_os_str().as_bytes().to_vec()),
+        Err(e) => {
+            eprintln!(
+                "rewrite: cannot rewrite {} for a guest: {e}",
+                path.display()
+            );
+            Err(libc::ENOEXEC)
+        }
+    }
+}
+
 /// Returns whether the run ended in a deadlock.
-fn supervise(
-    run: &Run,
-    coord: Option<&Coordinator>,
-    children: &mut Vec<Child>,
-) -> io::Result<bool> {
+fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -> io::Result<bool> {
+    let events = Events::new()?;
+    let mut channel = None;
+    let mut guest_sock = None;
+    if coord.is_some() {
+        let (c, g) = Channel::pair()?;
+        events.watch_socket(c.fd);
+        channel = Some(c);
+        guest_sock = Some(g);
+    }
     for guest in &run.guests {
         let mut env = vec![
             ("REWRITE_SEED".to_string(), run.seed.to_string()),
@@ -389,49 +541,118 @@ fn supervise(
         }
         if let Some(coord) = coord {
             let pid = coord.register(guest.host);
-            debug_assert_eq!(pid as usize, children.len());
+            debug_assert_eq!(pid as usize, procs.len());
             env.push((
                 shared::SHARED_VAR.into(),
                 coord.path().to_string_lossy().into_owned(),
             ));
             env.push((shared::PROC_VAR.into(), pid.to_string()));
         }
-        children.push(spawn(run, guest, &env)?);
+        let spawned = spawn(run, guest, &env, guest_sock);
+        if spawned.is_err() {
+            if let Some(g) = guest_sock {
+                unsafe { libc::close(g) };
+            }
+        }
+        procs.push(Tracked::new(spawned?, true));
     }
-    let mut deadlock = false;
+    if let Some(g) = guest_sock {
+        unsafe { libc::close(g) };
+    }
+
     if let Some(coord) = coord {
-        let pids: Vec<u32> = (0..children.len() as u32).collect();
-        let mut early = Vec::new();
+        let pids: Vec<u32> = (0..procs.len() as u32).collect();
         coord.wait_attached(
             &pids,
-            |pid| {
-                let died = children[pid as usize].reap(false);
-                if died && !early.contains(&pid) {
-                    early.push(pid);
-                }
-                died
-            },
+            |pid| procs[pid as usize].reap(false),
             std::time::Duration::from_secs(30),
         )?;
-        for pid in early {
-            let status = children[pid as usize].status.unwrap_or(0);
-            coord.process_died(pid, status);
+    }
+    // Guests that died before attaching were reaped above; the rest are
+    // watched. A failed watch means the process went in between.
+    let mut gone: Vec<usize> = Vec::new();
+    for (i, p) in procs.iter_mut().enumerate() {
+        if p.status.is_some() || !events.watch_exit(p.pid, i) {
+            p.reap(true);
+            gone.push(i);
+        }
+    }
+    if let Some(coord) = coord {
+        for &i in &gone {
+            coord.process_died(i as u32, procs[i].status.unwrap_or(0));
         }
         coord.start();
     }
-    while children.iter().any(|c| c.status.is_none()) {
-        let i = wait_any(children)?;
-        let Some(coord) = coord else { continue };
-        let status = children[i].status.unwrap_or(0);
-        if coord.process_died(i as u32, status) == Death::Deadlock {
-            deadlock = true;
-            for c in children.iter_mut() {
-                c.kill();
-                c.reap(true);
+
+    let mut deadlock = false;
+    while procs.iter().any(|c| c.status.is_none()) {
+        let event = events.wait()?;
+        // A dying guest's last frames may still be queued behind its exit
+        if let Some(ch) = channel.as_mut() {
+            for frame in ch.drain() {
+                handle_frame(run, ch, &events, procs, &mut gone, &frame);
+            }
+        }
+        if let Event::Exited { index, status } = event {
+            gone.push(index);
+            let p = &mut procs[index];
+            if p.ours {
+                p.reap(true);
+            } else {
+                p.status = Some(status);
+            }
+        }
+        for index in std::mem::take(&mut gone) {
+            let Some(coord) = coord else { continue };
+            let status = procs[index].status.unwrap_or(0);
+            if coord.process_died(index as u32, status) == Death::Deadlock {
+                deadlock = true;
+                kill_all(procs);
+                for p in procs.iter_mut() {
+                    p.status.get_or_insert(libc::SIGKILL);
+                }
             }
         }
     }
     Ok(deadlock)
+}
+
+fn handle_frame(
+    run: &Run,
+    channel: &Channel,
+    events: &Events,
+    procs: &mut Vec<Tracked>,
+    gone: &mut Vec<usize>,
+    frame: &Frame,
+) {
+    match frame.kind {
+        shared::MSG_SPAWN => match rewritten_path(run, &frame.payload) {
+            Ok(path) => channel.reply(0, &path),
+            Err(errno) => channel.reply(errno, &[]),
+        },
+        shared::MSG_SPAWNED if frame.payload.len() == 8 => {
+            let child = u32::from_le_bytes(frame.payload[..4].try_into().unwrap()) as usize;
+            let pid = i32::from_le_bytes(frame.payload[4..].try_into().unwrap());
+            while procs.len() <= child {
+                // Placeholder for a process whose spawn failed in the guest
+                let mut t = Tracked::new(0, false);
+                t.status = Some(0);
+                procs.push(t);
+            }
+            procs[child] = Tracked::new(pid, false);
+            if !events.watch_exit(pid, child) {
+                procs[child].status = Some(0);
+                gone.push(child);
+            }
+            channel.reply(0, &[]);
+        }
+        shared::MSG_REPORT => {
+            if let Some(p) = procs.get_mut(frame.proc_index as usize) {
+                p.report = String::from_utf8_lossy(&frame.payload).into_owned();
+            }
+        }
+        other => eprintln!("rewrite: unknown frame type {other} from a guest"),
+    }
 }
 
 /// Run one guest to completion.
@@ -451,6 +672,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         quantum: cfg.quantum,
         cwd: None,
         passive: cfg.passive,
+        rewrite: cfg.rewrite.clone(),
     };
     let mut out = launch_run(&run)?;
     Ok(out.guests.remove(0))

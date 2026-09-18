@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
+use rewrite::cache::{cached_rewrite, read_macho, rewrite_file, write_exe, Fallible};
 use rewrite::launch::{self, Guest, Launch, Run, RunOutcome};
-use rewrite::macho::{self, MachO};
 use rewrite::manifest;
 use rewrite::rewrite::{self as rw, Options};
 
@@ -105,53 +105,8 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
     Ok(cli)
 }
 
-type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
-
-fn write_exe(path: &Path, image: &[u8]) -> Fallible<()> {
-    std::fs::write(path, image)?;
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
-    macho::adhoc_sign(path)?;
-    Ok(())
-}
-
-fn read_macho(path: &Path) -> Fallible<MachO> {
-    Ok(MachO::parse(std::fs::read(path)?)?)
-}
-
 fn copy(input: &Path, output: &Path) -> Fallible<()> {
     write_exe(output, &read_macho(input)?.emit(&[], &[])?)
-}
-
-fn do_rewrite(input: &Path, output: &Path, opts: &Options) -> Fallible<rw::Stats> {
-    let r = rw::rewrite(&read_macho(input)?, opts)?;
-    write_exe(output, &r.image)?;
-    Ok(r.stats)
-}
-
-/// Rewrite into a cache file next to the program, keyed by options and
-/// the input's modification time.
-fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
-    let mtime = std::fs::metadata(input)?
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let name = format!(
-        "{}.rw2-{}-{}of{}-{mtime}",
-        input.file_name().unwrap_or_default().to_string_lossy(),
-        opts.seed,
-        opts.mem_rate.0,
-        opts.mem_rate.1
-    );
-    let out = input.with_file_name(name);
-    if !out.exists() {
-        let stats = do_rewrite(input, &out, opts)?;
-        eprintln!(
-            "rewrite: {} sites hooked -> {}",
-            stats.branch_sites + stats.call_sites + stats.mem_sites,
-            out.display()
-        );
-    }
-    Ok(out)
 }
 
 /// Every rewritten binary needs the dylib; only native runs go without.
@@ -181,6 +136,7 @@ fn run_guest(
         seed: cli.opts.seed,
         quantum: cli.quantum,
         passive: !cli.supervisor,
+        rewrite: (!cli.native).then(|| cli.opts.clone()),
     };
     let outcome = launch::launch(&cfg)?;
     if !quiet {
@@ -255,6 +211,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         quantum: cli.quantum,
         cwd: Some(scratch),
         passive: !cli.supervisor,
+        rewrite: (!cli.native).then(|| cli.opts.clone()),
     };
     let outcome = launch::launch_run(&run)?;
     if outcome.deadlock {
@@ -291,9 +248,11 @@ fn describe_status(o: &launch::Outcome) -> String {
     }
 }
 
-/// Exit status of a manifest run: the first guest that did not exit 0.
+/// Exit status of a manifest run: the first of the manifest's own
+/// processes that did not exit 0. What their children return is their
+/// business.
 fn exit_from_run(o: &RunOutcome) -> ExitCode {
-    o.guests
+    o.guests[..o.initial]
         .iter()
         .find(|g| g.exit_code() != Some(0))
         .map_or(ExitCode::SUCCESS, exit_from)
@@ -439,7 +398,7 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }),
         Some("rewrite") if rest.len() == 2 => {
-            do_rewrite(Path::new(&rest[0]), Path::new(&rest[1]), &cli.opts).map(|stats| {
+            rewrite_file(Path::new(&rest[0]), Path::new(&rest[1]), &cli.opts).map(|stats| {
                 eprintln!("{stats}");
                 ExitCode::SUCCESS
             })

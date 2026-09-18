@@ -20,6 +20,7 @@ fn run_capture(
         seed: 0,
         quantum: launch::DEFAULT_QUANTUM,
         passive: false,
+        rewrite: None,
     };
     let outcome = launch::launch(&cfg).expect("launch");
     let text = std::fs::read_to_string(&out_path).unwrap_or_default();

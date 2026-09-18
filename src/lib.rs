@@ -2,6 +2,7 @@
 //! of memory accesses of an aarch64 Mach-O executable, then run it under a
 //! supervisor that owns the thread schedule.
 
+pub mod cache;
 pub mod coord;
 pub mod decode;
 pub mod launch;

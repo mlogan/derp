@@ -88,7 +88,7 @@ impl Coordinator {
     /// process and thread ids follow launch order.
     pub fn register(&self, host: u32) -> u32 {
         let mut s = self.shared.lock();
-        let pid = s.add_proc(host, 0);
+        let pid = s.add_proc(host, shared::NO_PROC);
         s.add_thread(pid);
         pid
     }

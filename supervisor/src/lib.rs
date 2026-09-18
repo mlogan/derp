@@ -6,8 +6,10 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod alloc;
+mod coord;
 mod determinism;
 mod interpose;
+mod process;
 mod report;
 #[path = "../../src/rng.rs"]
 mod rng;

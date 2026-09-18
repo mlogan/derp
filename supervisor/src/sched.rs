@@ -222,7 +222,12 @@ fn join_run(path: &str) -> (&'static Shared, usize) {
         .unwrap_or_else(|| fatal("REWRITE_PROC missing"));
     let mut s = sh.lock();
     let n = s.nthreads as usize;
-    let Some(me) = s.threads[..n].iter().position(|t| t.pid == pid) else {
+    // After an `execve` the process has older, retired threads: take the
+    // one that is still alive.
+    let Some(me) = s.threads[..n]
+        .iter()
+        .position(|t| t.pid == pid && t.state != shared::T_EXITED)
+    else {
         drop(s);
         fatal("launcher did not register this process");
     };
@@ -241,7 +246,7 @@ fn start_private_run(cfg: &Config) -> (&'static Shared, usize) {
     let mem = map_region(-1, Shared::SIZE);
     let sh = unsafe { Shared::init(mem, cfg.seed, cfg.quantum_lo, cfg.quantum_hi) };
     let mut s = sh.lock();
-    let pid = s.add_proc(0, 0);
+    let pid = s.add_proc(0, shared::NO_PROC);
     s.procs[pid as usize].state = shared::P_LIVE;
     s.procs[pid as usize].real_pid = unsafe { libc::getpid() };
     let me = s.add_thread(pid);
@@ -271,11 +276,42 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     ID_KEY.store(key as usize, Ordering::Relaxed);
 
     let (sh, me) = match std::env::var(shared::SHARED_VAR) {
-        Ok(path) => join_run(&path),
+        Ok(path) => {
+            crate::coord::connect();
+            crate::process::init();
+            join_run(&path)
+        }
         Err(_) => start_private_run(cfg),
     };
     unsafe { scheduler_slot().write(rewrite_scheduler_yield as *const () as usize) };
     SHARED.store(std::ptr::from_ref(sh).cast_mut(), Ordering::Relaxed);
+    set_my_id(me);
+    wait_for_baton(me);
+}
+
+/// In the child of a `fork`: become process `child`, whose main thread the
+/// parent registered, and park until that thread is given the baton.
+pub fn become_forked_child(child: u32) {
+    let Some(sh) = shared() else { return };
+    let me = {
+        let mut s = sh.lock();
+        let n = s.nthreads as usize;
+        let me = s.threads[..n]
+            .iter()
+            .position(|t| t.pid == child)
+            .expect("forked child has no thread record");
+        s.threads[me].pthread = unsafe { libc::pthread_self() } as u64;
+        let p = &mut s.procs[child as usize];
+        p.real_pid = unsafe { libc::getpid() };
+        p.mapped_at = shared::MAP_ADDR as u64;
+        p.state = shared::P_LIVE;
+        me
+    };
+    PID.store(child, Ordering::Relaxed);
+    HOOKS.store(0, Ordering::Relaxed);
+    for c in &crate::interpose::COUNTS {
+        c.store(0, Ordering::Relaxed);
+    }
     set_my_id(me);
     wait_for_baton(me);
 }

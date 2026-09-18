@@ -129,3 +129,66 @@ fn a_guest_that_dies_holding_the_baton_does_not_hang_the_run() {
     assert_eq!(String::from_utf8_lossy(&out.stdout), "ok\n");
     assert!(!out.status.success());
 }
+
+/// Output of a single-program manifest run whose processes share stdout.
+fn run_spawn_tree(manifest: &Path, scratch: &Path, seed: u64) -> (Vec<String>, String) {
+    let r = run_manifest(manifest, scratch, seed, 1);
+    let lines = r.stdout[0].lines().map(str::to_string).collect();
+    assert_eq!(r.u64("run.processes"), 5, "{:?}", r.fields);
+    (lines, r.fields["run.schedule_hash"].clone())
+}
+
+#[test]
+fn spawned_forked_and_execed_children_join_the_schedule() {
+    let dir = common::scratch_dir("multiproc_spawn");
+    common::build_c("spawn_tree", &dir, &[]);
+    let manifest = dir.join("tree.manifest");
+    std::fs::write(&manifest, "host a\n    spawn_tree\n").unwrap();
+    let scratch = dir.join("scratch");
+
+    let mut orders = Vec::new();
+    for seed in 1..=4u64 {
+        let (lines, hash) = run_spawn_tree(&manifest, &scratch, seed);
+        assert_eq!(lines[0], "parent pid=1000 ppid=1", "seed {seed}");
+        assert!(
+            lines.contains(&"spawned 1001 1002 1003 1004".to_string()),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.last().unwrap().split(" sum=").next(),
+            Some("no more children: -1")
+        );
+        let mut sorted = lines.clone();
+        sorted.sort();
+        let children: Vec<&String> = sorted.iter().filter(|l| l.starts_with("child")).collect();
+        assert_eq!(children.len(), 4, "{lines:?}");
+        for (i, line) in children.iter().enumerate() {
+            let expect = format!("child {i} pid={} ppid=1000 sum=", 1001 + i);
+            assert!(line.starts_with(&expect), "{line}");
+        }
+        let reaped: Vec<&String> = sorted.iter().filter(|l| l.starts_with("reaped")).collect();
+        let expect: Vec<String> = (0..4)
+            .map(|i| format!("reaped {} exit={}", 1001 + i, 10 + i))
+            .collect();
+        assert_eq!(
+            reaped.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            expect
+        );
+        // The first reap names a pid, so it is child 1 whatever the schedule
+        let first = lines.iter().find(|l| l.starts_with("reaped")).unwrap();
+        assert_eq!(first, "reaped 1002 exit=11");
+
+        let (again, hash2) = run_spawn_tree(&manifest, &scratch, seed);
+        assert_eq!(
+            (again, hash2),
+            (lines.clone(), hash),
+            "seed {seed} not repeatable"
+        );
+        orders.push(lines);
+    }
+    orders.dedup();
+    assert!(
+        orders.len() > 1,
+        "every seed interleaved the output the same way"
+    );
+}

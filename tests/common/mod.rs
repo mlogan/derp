@@ -139,6 +139,7 @@ fn run_mode(
         seed,
         quantum: rewrite::launch::DEFAULT_QUANTUM,
         passive,
+        rewrite: None,
     };
     let outcome = rewrite::launch::launch(&cfg).expect("launch");
     let text = std::fs::read_to_string(&out_path).unwrap_or_default();

@@ -41,6 +41,32 @@ pub const SHARED_VAR: &str = "REWRITE_SHARED";
 pub const PROC_VAR: &str = "REWRITE_PROC";
 /// Switch site recorded when the launcher hands the baton on for a dead process
 pub const SITE_PROCESS_DIED: u64 = u64::MAX;
+/// Key a process's threads block on in `waitpid`; never a real address
+pub const WAIT_KEY: u64 = 0x7FFF_FFFF_0000;
+/// `ProcRec::parent` of the processes the launcher started
+pub const NO_PROC: u32 = u32::MAX;
+/// First virtual pid; process `i` of the run is `VPID_BASE + i`. The
+/// launcher appears to guests as pid 1.
+pub const VPID_BASE: i32 = 1000;
+
+/// The run's one launcher socket, inherited by every guest at this
+/// descriptor: high enough that guest code does not pick it for `dup2`,
+/// below the default soft limit of 256.
+pub const COORD_FD: i32 = 240;
+/// Frame from a guest: `u32 length` of what follows, `u8 type`, `u32 proc`,
+/// payload. Reply to `MSG_SPAWN` and `MSG_SPAWNED`: `i32 errno`, `u32
+/// length`, payload. Only the baton holder talks, so frames never interleave.
+pub const MSG_SPAWN: u8 = 1;
+pub const MSG_SPAWNED: u8 = 2;
+pub const MSG_REPORT: u8 = 3;
+
+pub fn vpid_of(proc_index: u32) -> i32 {
+    VPID_BASE + proc_index as i32
+}
+
+pub fn proc_of(vpid: i32) -> Option<u32> {
+    (vpid >= VPID_BASE && vpid < VPID_BASE + MAX_PROCS as i32).then(|| (vpid - VPID_BASE) as u32)
+}
 
 pub const T_FREE: u32 = 0;
 pub const T_RUNNABLE: u32 = 1;
@@ -84,7 +110,10 @@ pub struct ProcRec {
     pub real_pid: i32,
     pub host: u32,
     pub parent: u32,
+    /// Raw wait status, valid once `state` is `P_EXITED`
     pub exit_status: i32,
+    /// The parent has collected the exit with `waitpid`
+    pub reaped: bool,
     /// Address the process mapped the shared file at, for the launcher's
     /// placement check
     pub mapped_at: u64,
@@ -414,6 +443,10 @@ impl State {
     pub fn process_died(&mut self, pid: u32, status: i32) -> Handoff {
         self.procs[pid as usize].state = P_EXITED;
         self.procs[pid as usize].exit_status = status;
+        let parent = self.procs[pid as usize].parent;
+        if parent != NO_PROC {
+            self.wake_all(parent, WAIT_KEY);
+        }
         let mut held = None;
         for (i, t) in self.live().iter_mut().enumerate() {
             if t.pid == pid && t.state != T_EXITED {
@@ -428,6 +461,22 @@ impl State {
             Some(id) => self.hand_off(Some((id, T_EXITED, 0)), SITE_PROCESS_DIED),
             None => Handoff::Stay,
         }
+    }
+
+    /// An exited, unreaped child of `parent`: the one named, or the lowest.
+    pub fn exited_child(&self, parent: u32, which: Option<u32>) -> Option<u32> {
+        (0..self.nprocs).find(|&i| {
+            let p = &self.procs[i as usize];
+            p.parent == parent && p.state == P_EXITED && !p.reaped && which.is_none_or(|w| w == i)
+        })
+    }
+
+    /// Whether `parent` has a child it could still wait for.
+    pub fn has_child(&self, parent: u32, which: Option<u32>) -> bool {
+        (0..self.nprocs).any(|i| {
+            let p = &self.procs[i as usize];
+            p.parent == parent && !p.reaped && which.is_none_or(|w| w == i)
+        })
     }
 
     /// True while some thread that has not exited belongs to a live process.

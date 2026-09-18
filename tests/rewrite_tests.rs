@@ -76,6 +76,7 @@ fn stubs_are_slide_proof() {
         seed: 0,
         quantum: launch::DEFAULT_QUANTUM,
         passive: false,
+        rewrite: None,
     };
     // Output goes to the test's stdout here; only the status is checked.
     let o = launch::launch(&cfg).unwrap();

@@ -18,6 +18,10 @@ use crate::determinism::{
     my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_gettimeofday,
     my_mach_absolute_time, my_mach_continuous_time, my_time,
 };
+use crate::process::{
+    my_execve, my_fork, my_getpid, my_getppid, my_kill, my_posix_spawn, my_posix_spawnp, my_wait,
+    my_wait4, my_waitpid,
+};
 use crate::sched::{self, my_id, State};
 use crate::shared;
 
@@ -519,6 +523,16 @@ interposers! {
     my_nanosleep => libc::nanosleep,
     my_usleep => libc::usleep,
     my_sleep => libc::sleep,
+    my_posix_spawn => libc::posix_spawn,
+    my_posix_spawnp => libc::posix_spawnp,
+    my_fork => libc::fork,
+    my_execve => libc::execve,
+    my_waitpid => libc::waitpid,
+    my_wait4 => libc::wait4,
+    my_wait => libc::wait,
+    my_getpid => libc::getpid,
+    my_getppid => libc::getppid,
+    my_kill => libc::kill,
     my_malloc => libc::malloc,
     my_calloc => libc::calloc,
     my_free => libc::free,

@@ -11,7 +11,15 @@ use std::ffi::c_void;
 
 use crate::spin::SpinLock;
 
-const REGION_HINT: usize = 0x3_0000_0000;
+extern "C" {
+    static mach_task_self_: u32;
+    fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: i32) -> i32;
+}
+
+/// Above the GPU carveout and below the scheduler's fixed region, where
+/// nothing else lands; low addresses are taken now and then by whatever
+/// the kernel maps first (see `shared::STUB_BASE`).
+const REGION_HINT: usize = 0x74_0000_0000;
 const REGION_SIZE: usize = 4 << 30;
 const HEADER: usize = 16;
 /// Small classes are multiples of 16 up to this size
@@ -62,12 +70,19 @@ impl Heap {
         if self.base != 0 || self.broken {
             return;
         }
+        // A fixed Mach allocation fails instead of replacing what is there,
+        // so MAP_FIXED over it is safe; an mmap hint alone is ignored by
+        // the kernel now and then.
+        let mut addr = REGION_HINT as u64;
+        let reserved =
+            unsafe { mach_vm_allocate(mach_task_self_, &raw mut addr, REGION_SIZE as u64, 0) } == 0;
+        let fixed = if reserved { libc::MAP_FIXED } else { 0 };
         let p = unsafe {
             libc::mmap(
                 REGION_HINT as *mut c_void,
                 REGION_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
+                libc::MAP_PRIVATE | libc::MAP_ANON | fixed,
                 -1,
                 0,
             )

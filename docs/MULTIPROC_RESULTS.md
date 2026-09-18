@@ -178,7 +178,9 @@ Yes, the way it reproduces the two-thread race.
   and the kernel ignores hints between roughly `0x5_0000_0000` and
   `0x70_0000_0000` (a hidden reservation, then the GPU carveout). A fixed
   `mach_vm_allocate` fails instead of replacing, so the region is reserved
-  that way and mapped over with `MAP_FIXED`.
+  that way and mapped over with `MAP_FIXED`. The supervisor's allocator
+  region got the same treatment and moved from `0x3_0000_0000` to
+  `0x74_0000_0000`.
 - stdio calls `read$NOCANCEL` and friends, not `read`; both are interposed.
 - `fcntl`, `ioctl` and `open` are variadic, and on arm64 Darwin variadic
   arguments travel on the stack. Stable Rust cannot declare that, so a
@@ -216,10 +218,6 @@ Yes, the way it reproduces the two-thread race.
   34 MB, sparse.
 - Files are not virtualized beyond the scratch directory; the first path
   opened outside it is logged.
-- The supervisor allocator's region at `0x3_0000_0000` still relies on an
-  `mmap` hint and only logs when it misses. It did not miss in 400 launches
-  of hello world, but the same stray mapping that bit the scheduler state
-  could bite it.
 - Hook overhead is unchanged from the first experiment (1.7x branch-only
   against a 1.3x target); the deferred stub work is still deferred.
 

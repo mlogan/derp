@@ -71,9 +71,9 @@ Updated at the end of each work unit.
   reservation, then the GPU carveout). The state is now reserved with a
   fixed `mach_vm_allocate` at `0x78_0000_0000` and mapped over with
   `MAP_FIXED`; 400/400 launches fixed.
-- The supervisor allocator's region at `0x3_0000_0000` still uses a plain
-  hint and only logs when it misses. Not seen missing in 400 launches of
-  hello world; if it shows up, give it the same reservation treatment.
+- The supervisor allocator's region had the same weakness (a plain hint at
+  `0x3_0000_0000`, logged when it missed). Fixed at the end: reserved with
+  `mach_vm_allocate` at `0x74_0000_0000`; 300/300 launches fixed.
 
 ## Day 2 — Counter relocation, header room ✅ (design differs from the plan)
 
@@ -335,8 +335,6 @@ Overhead on `loops 3` today (release build):
 
 ## Not done / follow-ups
 
-- The supervisor allocator's region still uses an `mmap` hint (see day 1
-  gotchas); give it the `mach_vm_allocate` treatment.
 - Unmodelled socket and kqueue features are listed under "Known
   limitations" in the results document.
 - Stub cost work from the first experiment is still deferred.

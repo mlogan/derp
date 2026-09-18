@@ -191,14 +191,74 @@ Overhead on `loops 3` today (release build):
   socket map across `dup`/`fork`/`execve`. Kernel pipes need no
   bookkeeping of ours.
 
-## Day 5 — Hosts and virtual stream sockets (next)
+## Day 5 — Hosts and virtual stream sockets ✅
 
-- [ ] Host table in the shared state from the manifest
-- [ ] Socket table, bind table keyed on host, rings, backlog
-- [ ] `socket`/`bind`/`listen`/`connect`/`accept`/`send`/`recv`/`close`
-      with placeholder fds and refcounts across `dup`/`fork`/`execve`
-- [ ] `tcp_echo.c` over TCP and `--unix`, server and client on two hosts
+- `supervisor/src/netstate.rs` (part of the shared state, so the
+  launcher compiles and unit-tests it): host table, 256 sockets with 64 KB
+  receive rings, listen queues, names per host, ephemeral ports per host
+  from 49152, per-process descriptor counts, and `deliver()` as the one
+  place bytes move. The state file is now about 17 MB, sparse.
+- `supervisor/src/net.rs`: the socket API. `read`/`write`/`readv`/
+  `writev`/`close` in `io.rs` route to it first.
+- **Descriptor identity instead of an fd table.** A virtual socket's
+  descriptor is a real, never connected `AF_UNIX` socket. Its `st_ino` is
+  unique and follows `dup`, `fork`, `execve`, close-on-exec and spawn file
+  actions (which are opaque to us), so any process identifies a descriptor
+  with one `fstat`. `O_NONBLOCK` lives on the placeholder too. What is
+  tracked is only how many descriptors each process holds, so the last
+  close (or a process death, swept by the launcher) sends FIN.
+- A new process (spawn, fork, or a new image after `execve`) counts the
+  virtual sockets it holds before it goes live, and `posix_spawn`/`fork`
+  in the parent wait in real time for that. Otherwise the parent closing
+  its copy right after the spawn could make the socket look unused.
+- `connect` completes once queued on the listener, as TCP does (the plan
+  had it park until `accept`); data sent before `accept` waits in the far
+  end's ring.
+- Errors per the plan: known host without listener `ECONNREFUSED`, unowned
+  subnet address `EHOSTUNREACH`, another host's address in `bind`
+  `EADDRNOTAVAIL`. An address outside `10.0.0.0/24` swaps the placeholder
+  for a kernel socket at the same descriptor, is logged once and counted
+  as `run.net_passthrough`.
+- `fcntl` is interposed through an assembly shim: variadic arguments are
+  on the stack on arm64 Darwin and stable Rust cannot declare that.
+- Manifest hosts become `10.0.0.1` upward in the shared host table and in
+  `REWRITE_HOSTS`. Single-program runs are on host `h0`.
+- Report: `run.net_connections`, `run.net_bytes`, `run.net_passthrough`.
+- Tests: seven unit tests of the state machine; `tcp_echo.c` over TCP
+  between two hosts and over a UNIX-domain name on one host (names are per
+  host, so that form cannot cross hosts as the plan's day table implied).
+  Four connections, 820,120 bytes, 0 pass-through, 100 identical runs.
 
-## Days 6-12 — not started
+## Remaining
 
-See the plan's implementation order.
+### Day 6 — options, datagrams, names, in-flight queue
+- [ ] `setsockopt`/`getsockopt` answered from socket state (`SO_ERROR`,
+      `SO_RCVTIMEO`/`SO_SNDTIMEO` need the virtual clock, day 7),
+      `ioctl(FIONREAD)` (variadic: same shim as `fcntl`), non-blocking
+      `connect` with `EINPROGRESS`
+- [ ] Datagram sockets (`socket()` still passes `SOCK_DGRAM` to the kernel)
+- [ ] `gethostname`, `getaddrinfo`, `getifaddrs`
+- [ ] `deliver` through an in-flight queue with `deliver_at`
+- [ ] `udp_ping.c`, `two_hosts.c`
+- [ ] SIGPIPE on a write to a closed peer (today only `EPIPE`)
+
+### Day 7 — shared virtual clock and timers
+- [ ] Clock into the shared state (still per-process atomics in
+      `determinism.rs`); deadline-ordered timed waits replace "release
+      when idle"; sleeps become timed waits
+- [ ] `poll`/`select` over mixed real and virtual descriptors (today they
+      pass through and see the placeholder, which is never ready)
+
+### Days 8-12
+- [ ] `kevent` emulation; `poll_server.c`; `--net-latency`
+- [ ] `counter_file.c`, `shared_map.c`; I/O calls as hook events; `flock`
+- [ ] `net.rs`; switch cost in-process vs cross-process; throughput
+      against kernel loopback; quantum defaults
+- [ ] `docs/MULTIPROC_RESULTS.md`
+
+### Open questions for Mark
+- Day 2: rewritten binaries now need the dylib (passive mode replaces
+  standalone). The alternative that keeps standalone working is a second
+  stub flavor for binaries with header room; it was not built.
+- `LC_FUNCTION_STARTS` is dropped from tight binaries as the last resort.
+- `~/dev/worklog` does not exist, so no work log entry was made.

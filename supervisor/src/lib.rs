@@ -10,6 +10,7 @@ mod coord;
 mod determinism;
 mod interpose;
 mod io;
+mod net;
 mod process;
 mod report;
 #[path = "../../src/rng.rs"]

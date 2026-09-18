@@ -31,6 +31,10 @@ pub struct Launch {
     pub rewrite: Option<crate::rewrite::Options>,
 }
 
+/// `name=address` pairs of the run's virtual hosts, for test programs;
+/// real programs learn about peers from their own arguments.
+pub const HOSTS_VAR: &str = "REWRITE_HOSTS";
+
 /// Tells the supervisor to set up the stubs' region and nothing else
 pub const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
 
@@ -99,6 +103,9 @@ pub struct Guest {
 /// Several guests under one scheduler
 pub struct Run {
     pub guests: Vec<Guest>,
+    /// Virtual hosts by name; `Guest::host` indexes this. Host `i` gets
+    /// the address `10.0.0.(i + 1)`.
+    pub hosts: Vec<String>,
     pub dylib: Option<PathBuf>,
     /// Extra `KEY=VALUE` pairs for every guest's environment
     pub env: Vec<(String, String)>,
@@ -547,6 +554,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
         channel = Some(c);
         guest_sock = Some(g);
     }
+    let host_table = coord.map(|c| c.add_hosts(&run.hosts));
     for guest in &run.guests {
         let mut env = vec![
             ("REWRITE_SEED".to_string(), run.seed.to_string()),
@@ -559,6 +567,9 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
             env.push((PASSIVE_VAR.into(), "1".into()));
         }
         env.push((shared::EXTERNAL_VAR.into(), external_objects()));
+        if let Some(table) = &host_table {
+            env.push((HOSTS_VAR.into(), table.clone()));
+        }
         if let Some(coord) = coord {
             let pid = coord.register(guest.host);
             debug_assert_eq!(pid as usize, procs.len());
@@ -685,6 +696,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
             host: 0,
             stdout: cfg.stdout.clone(),
         }],
+        hosts: vec!["h0".into()],
         dylib: cfg.dylib.clone(),
         env: cfg.env.clone(),
         disable_aslr: cfg.disable_aslr,

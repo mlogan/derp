@@ -23,6 +23,11 @@ pub struct Totals {
     pub expiries: u64,
     pub schedule_hash: u64,
     pub threads: u32,
+    /// Connections and bytes that went through the virtual network, and
+    /// connections that left it for the kernel's
+    pub net_connections: u64,
+    pub net_bytes: u64,
+    pub net_passthrough: u64,
 }
 
 /// What a guest's death meant for the run
@@ -82,6 +87,19 @@ impl Coordinator {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Fill the host table, in declaration order. Returns `name=address`
+    /// pairs for `REWRITE_HOSTS`.
+    pub fn add_hosts(&self, names: &[String]) -> String {
+        let mut s = self.shared.lock();
+        let mut out = Vec::new();
+        for name in names {
+            let i = s.net.add_host(name.as_bytes());
+            let addr = std::net::Ipv4Addr::from(s.net.hosts[i as usize].addr);
+            out.push(format!("{name}={addr}"));
+        }
+        out.join(",")
     }
 
     /// Register a process and its main thread before it is spawned, so
@@ -161,6 +179,9 @@ impl Coordinator {
             expiries: s.expiries,
             schedule_hash: s.trace_hash,
             threads: s.nthreads,
+            net_connections: s.net.connections,
+            net_bytes: s.net.bytes,
+            net_passthrough: s.net.passthrough,
         }
     }
 }

@@ -223,3 +223,78 @@ fn pipeline_is_correct_with_a_stable_schedule() {
     hashes.dedup();
     assert!(hashes.len() > 1, "every seed produced the same schedule");
 }
+
+fn expected_echo(connections: usize) -> String {
+    use std::fmt::Write;
+    // The blob's checksum is masked: it is whatever the run says, and only
+    // has to be the same every time.
+    let mut out = String::new();
+    for c in 0..connections {
+        for m in 0..3 {
+            writeln!(out, "conn {c} #{m}: hello {m} from connection {c}").unwrap();
+        }
+        writeln!(out, "conn {c} blob sum=BLOB").unwrap();
+    }
+    out
+}
+
+fn mask_blob(text: &str) -> String {
+    text.lines()
+        .map(|l| match l.split_once("blob sum=") {
+            Some((head, _)) => format!("{head}blob sum=BLOB\n"),
+            None => format!("{l}\n"),
+        })
+        .collect()
+}
+
+fn check_echo(name: &str, manifest_text: &str) {
+    let dir = common::scratch_dir(name);
+    common::build_c("tcp_echo", &dir, &[]);
+    let manifest = dir.join("echo.manifest");
+    std::fs::write(&manifest, manifest_text).unwrap();
+    let scratch = dir.join("scratch");
+    let mut hashes = Vec::new();
+    let mut blob_sums = Vec::new();
+    for seed in 1..=3u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 2);
+        assert_eq!(
+            r.stdout[0], "server done after 4 connections\n",
+            "seed {seed}"
+        );
+        assert_eq!(mask_blob(&r.stdout[1]), expected_echo(4), "seed {seed}");
+        blob_sums.push(r.stdout[1].lines().nth(3).unwrap().to_string());
+        // Everything went through the virtual network
+        assert_eq!(r.u64("run.net_connections"), 4, "{:?}", r.fields);
+        assert_eq!(r.u64("run.net_passthrough"), 0);
+        assert!(r.u64("run.net_bytes") > 4 * 200 * 1024);
+        // 200 KB into a 64 KB ring: the client had to wait for the server
+        assert!(r.u64("p1.io_waits") > 0, "{:?}", r.fields);
+        let again = run_manifest(&manifest, &scratch, seed, 2);
+        assert_eq!(again.stdout, r.stdout);
+        assert_eq!(
+            r.fields["run.schedule_hash"], again.fields["run.schedule_hash"],
+            "seed {seed} not repeatable"
+        );
+        hashes.push(r.fields["run.schedule_hash"].clone());
+    }
+    blob_sums.dedup();
+    assert_eq!(blob_sums.len(), 1);
+    hashes.dedup();
+    assert!(hashes.len() > 1, "every seed produced the same schedule");
+}
+
+#[test]
+fn tcp_echo_between_two_hosts() {
+    check_echo(
+        "multiproc_tcp",
+        "host alpha\n    tcp_echo server 7000 4\nhost beta\n    tcp_echo client alpha 7000 4\n",
+    );
+}
+
+#[test]
+fn unix_domain_echo_on_one_host() {
+    check_echo(
+        "multiproc_unix",
+        "host alpha\n    tcp_echo server --unix /virtual/echo.sock 4\n    tcp_echo client --unix /virtual/echo.sock 4\n",
+    );
+}

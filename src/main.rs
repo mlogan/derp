@@ -204,6 +204,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
     let scratch = std::fs::canonicalize(scratch)?;
     let run = Run {
         guests,
+        hosts: m.hosts.clone(),
         dylib: dylib_for(cli)?,
         env: vec![("TMPDIR".into(), scratch.to_string_lossy().into_owned())],
         disable_aslr: cli.disable_aslr,
@@ -230,6 +231,9 @@ fn print_run_report(o: &RunOutcome) {
     eprintln!("run.switches={}", o.totals.switches);
     eprintln!("run.expiries={}", o.totals.expiries);
     eprintln!("run.schedule_hash={:016x}", o.totals.schedule_hash);
+    eprintln!("run.net_connections={}", o.totals.net_connections);
+    eprintln!("run.net_bytes={}", o.totals.net_bytes);
+    eprintln!("run.net_passthrough={}", o.totals.net_passthrough);
     for (i, g) in o.guests.iter().enumerate() {
         eprintln!("p{i}.status={}", describe_status(g));
         for (k, v) in &g.report.fields {

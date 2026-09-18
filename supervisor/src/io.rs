@@ -154,27 +154,79 @@ fn write_managed(fd: c_int, buf: *const c_void, n: usize, real: impl Fn() -> isi
     r
 }
 
+/// Scatter read from a virtual socket: fill the buffers in order and
+/// stop at the first one that comes up short.
+unsafe fn readv_virtual(fd: c_int, sock: u32, iov: *const libc::iovec, n: c_int) -> isize {
+    let mut total = 0isize;
+    for v in std::slice::from_raw_parts(iov, n.max(0) as usize) {
+        // Only the first buffer may wait for data
+        let flags = if total > 0 { libc::MSG_DONTWAIT } else { 0 };
+        let got = crate::net::recv_fd(fd, sock, v.iov_base.cast(), v.iov_len, flags);
+        if got < 0 {
+            return if total > 0 { total } else { got };
+        }
+        total += got;
+        if (got as usize) < v.iov_len {
+            break;
+        }
+    }
+    total
+}
+
+unsafe fn writev_virtual(fd: c_int, sock: u32, iov: *const libc::iovec, n: c_int) -> isize {
+    let mut total = 0isize;
+    for v in std::slice::from_raw_parts(iov, n.max(0) as usize) {
+        let sent = crate::net::send_fd(fd, sock, v.iov_base.cast(), v.iov_len, 0);
+        if sent < 0 {
+            return if total > 0 { total } else { sent };
+        }
+        total += sent;
+        if (sent as usize) < v.iov_len {
+            break;
+        }
+    }
+    total
+}
+
 pub unsafe extern "C" fn my_read(fd: c_int, buf: *mut c_void, n: usize) -> isize {
+    if let Some(sock) = crate::net::lookup(fd) {
+        return crate::net::recv_fd(fd, sock, buf.cast(), n, 0);
+    }
     when_readable(fd, || unsafe { libc::read(fd, buf, n) })
 }
 
 pub unsafe extern "C" fn my_read_nocancel(fd: c_int, buf: *mut c_void, n: usize) -> isize {
+    if let Some(sock) = crate::net::lookup(fd) {
+        return crate::net::recv_fd(fd, sock, buf.cast(), n, 0);
+    }
     when_readable(fd, || unsafe { read_nocancel(fd, buf, n) })
 }
 
 pub unsafe extern "C" fn my_readv(fd: c_int, iov: *const libc::iovec, n: c_int) -> isize {
+    if let Some(sock) = crate::net::lookup(fd) {
+        return readv_virtual(fd, sock, iov, n);
+    }
     when_readable(fd, || unsafe { libc::readv(fd, iov, n) })
 }
 
 pub unsafe extern "C" fn my_readv_nocancel(fd: c_int, iov: *const libc::iovec, n: c_int) -> isize {
+    if let Some(sock) = crate::net::lookup(fd) {
+        return readv_virtual(fd, sock, iov, n);
+    }
     when_readable(fd, || unsafe { readv_nocancel(fd, iov, n) })
 }
 
 pub unsafe extern "C" fn my_write(fd: c_int, buf: *const c_void, n: usize) -> isize {
+    if let Some(sock) = crate::net::lookup(fd) {
+        return crate::net::send_fd(fd, sock, buf.cast(), n, 0);
+    }
     write_managed(fd, buf, n, || unsafe { libc::write(fd, buf, n) })
 }
 
 pub unsafe extern "C" fn my_write_nocancel(fd: c_int, buf: *const c_void, n: usize) -> isize {
+    if let Some(sock) = crate::net::lookup(fd) {
+        return crate::net::send_fd(fd, sock, buf.cast(), n, 0);
+    }
     write_managed(fd, buf, n, || unsafe { write_nocancel(fd, buf, n) })
 }
 
@@ -186,6 +238,9 @@ unsafe fn writev_managed(
     n: c_int,
     real: impl Fn() -> isize,
 ) -> isize {
+    if let Some(sock) = crate::net::lookup(fd) {
+        return writev_virtual(fd, sock, iov, n);
+    }
     if !managed(fd) {
         let r = real();
         if r > 0 && my_id().is_some() && shared_object(fd) {
@@ -216,6 +271,13 @@ pub unsafe extern "C" fn my_writev_nocancel(fd: c_int, iov: *const libc::iovec, 
 }
 
 fn close_managed(fd: c_int, real: impl Fn() -> c_int) -> c_int {
+    if let Some(sock) = crate::net::lookup(fd) {
+        let rc = real();
+        if rc == 0 {
+            crate::net::closed(sock);
+        }
+        return rc;
+    }
     let wake = my_id().is_some() && shared_object(fd);
     let rc = real();
     // The last writer closing is a reader's EOF

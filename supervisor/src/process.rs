@@ -139,6 +139,33 @@ fn register_child() -> u32 {
     .expect("scheduler not initialized")
 }
 
+/// Wait, in real time, until the new process has attached (or died
+/// trying). It counts the sockets it inherited before it goes live; until
+/// then a close of ours could make a shared socket look unused. The
+/// outcome does not depend on how long this takes.
+fn await_attach(child: u32, real: libc::pid_t) {
+    loop {
+        let starting =
+            sched::with(|s, _| s.procs[child as usize].state == shared::P_STARTING) == Some(true);
+        if !starting {
+            return;
+        }
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                real as libc::id_t,
+                &raw mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 || info.si_pid == real {
+            return;
+        }
+        unsafe { libc::usleep(100) };
+    }
+}
+
 /// The child never came to be: nobody will run or reap it.
 fn unregister_child(child: u32) {
     sched::with(|s, _| {
@@ -201,6 +228,7 @@ unsafe fn spawn_rewritten(
         return rc;
     }
     crate::coord::spawned(child, real);
+    await_attach(child, real);
     if !pid_out.is_null() {
         *pid_out = vpid_of(child);
     }
@@ -256,6 +284,7 @@ pub unsafe extern "C" fn my_fork() -> libc::pid_t {
         return set_errno(e);
     }
     crate::coord::spawned(child, real);
+    await_attach(child, real);
     vpid_of(child)
 }
 

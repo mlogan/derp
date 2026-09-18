@@ -232,6 +232,11 @@ fn join_run(path: &str) -> (&'static Shared, usize) {
         fatal("launcher did not register this process");
     };
     s.threads[me].pthread = unsafe { libc::pthread_self() } as u64;
+    drop(s);
+    // Whoever started us waits for `P_LIVE`, so inherited sockets are
+    // counted before it can close its own copies.
+    crate::net::adopt_inherited(sh, pid);
+    let mut s = sh.lock();
     let p = &mut s.procs[pid as usize];
     p.real_pid = unsafe { libc::getpid() };
     p.mapped_at = mem as u64;
@@ -302,12 +307,16 @@ pub fn become_forked_child(child: u32) {
             .position(|t| t.pid == child)
             .expect("forked child has no thread record");
         s.threads[me].pthread = unsafe { libc::pthread_self() } as u64;
+        me
+    };
+    crate::net::adopt_inherited(sh, child);
+    {
+        let mut s = sh.lock();
         let p = &mut s.procs[child as usize];
         p.real_pid = unsafe { libc::getpid() };
         p.mapped_at = shared::MAP_ADDR as u64;
         p.state = shared::P_LIVE;
-        me
-    };
+    }
     PID.store(child, Ordering::Relaxed);
     HOOKS.store(0, Ordering::Relaxed);
     crate::io::IO_WAITS.store(0, Ordering::Relaxed);

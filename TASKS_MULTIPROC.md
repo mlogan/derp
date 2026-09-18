@@ -262,8 +262,9 @@ Overhead on `loops 3` today (release build):
 - No core pinning: the counter stays in the baton holder's L1 for the whole
   quantum, and a switch costs 8-14 us against about 0.1 us for the line to
   move. Spin-before-park is a day 10 experiment.
+- Dropping `LC_FUNCTION_STARTS` from the smallest binaries is acceptable;
+  documented in `README.md` and on `MachO::droppable`.
 
 ### Still open
-- `LC_FUNCTION_STARTS` is dropped from tight binaries as the last resort.
 - `~/dev/worklog` does not exist, so no work log entry was made.
 - Branch `mlogan-multiproc` is not pushed.

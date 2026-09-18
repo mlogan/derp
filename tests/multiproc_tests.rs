@@ -25,6 +25,16 @@ impl RunReport {
 /// One `rewrite repeat` run for the guests' captured stdout, then one
 /// `rewrite run` for the aggregated report.
 fn run_manifest(manifest: &Path, scratch: &Path, seed: u64, guests: usize) -> RunReport {
+    run_manifest_with(manifest, scratch, seed, guests, &[])
+}
+
+fn run_manifest_with(
+    manifest: &Path,
+    scratch: &Path,
+    seed: u64,
+    guests: usize,
+    extra: &[&str],
+) -> RunReport {
     common::supervisor_dylib();
     let out = Command::new(common::rewrite_bin())
         .args([
@@ -50,7 +60,9 @@ fn run_manifest(manifest: &Path, scratch: &Path, seed: u64, guests: usize) -> Ru
         .map(|i| std::fs::read_to_string(scratch.join(format!("stdout.{i}"))).unwrap())
         .collect();
     let report = Command::new(common::rewrite_bin())
-        .args(["run", "--seed", &seed.to_string(), "--scratch"])
+        .args(["run", "--seed", &seed.to_string()])
+        .args(extra)
+        .arg("--scratch")
         .arg(scratch)
         .arg("--manifest")
         .arg(manifest)
@@ -405,4 +417,56 @@ fn timed_waits_follow_the_virtual_clock() {
     }
     // Virtual time: the waits add up to seconds of timeouts that nobody sat through
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}
+
+#[test]
+fn a_fixed_latency_between_hosts_changes_the_schedule_not_the_results() {
+    let dir = common::scratch_dir("multiproc_latency");
+    common::build_c("tcp_echo", &dir, &[]);
+    common::build_c("udp_ping", &dir, &[]);
+    let scratch = dir.join("scratch");
+    let echo = dir.join("echo.manifest");
+    std::fs::write(
+        &echo,
+        "host alpha\n    tcp_echo server 7000 4\nhost beta\n    tcp_echo client alpha 7000 4\n",
+    )
+    .unwrap();
+    let udp = dir.join("udp.manifest");
+    std::fs::write(
+        &udp,
+        "host alpha\n    udp_ping server 5353\nhost beta\n    udp_ping client alpha 5353 20\n",
+    )
+    .unwrap();
+    let latency = ["--net-latency", "5ms"];
+    for seed in 1..=3u64 {
+        let plain = run_manifest(&echo, &scratch, seed, 2);
+        let slow = run_manifest_with(&echo, &scratch, seed, 2, &latency);
+        assert_eq!(slow.stdout[0], "server done after 4 connections\n");
+        assert_eq!(mask_blob(&slow.stdout[1]), expected_echo(4), "seed {seed}");
+        assert_eq!(slow.stdout[1], plain.stdout[1], "seed {seed}");
+        assert_ne!(
+            slow.fields["run.schedule_hash"], plain.fields["run.schedule_hash"],
+            "seed {seed}: latency did not change the schedule"
+        );
+        let again = run_manifest_with(&echo, &scratch, seed, 2, &latency);
+        assert_eq!(again.stdout, slow.stdout);
+        assert_eq!(
+            again.fields["run.schedule_hash"],
+            slow.fields["run.schedule_hash"]
+        );
+
+        let pings = run_manifest_with(&udp, &scratch, seed, 2, &latency);
+        let pongs: Vec<String> = (0..20).map(|i| format!("pong {i}")).collect();
+        assert_eq!(
+            pings.stdout[1].lines().collect::<Vec<_>>(),
+            pongs,
+            "seed {seed}"
+        );
+        let again = run_manifest_with(&udp, &scratch, seed, 2, &latency);
+        assert_eq!(again.stdout, pings.stdout);
+        assert_eq!(
+            again.fields["run.schedule_hash"],
+            pings.fields["run.schedule_hash"]
+        );
+    }
 }

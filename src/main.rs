@@ -29,6 +29,8 @@ options:
   --manifest FILE                      processes to start, by virtual host
   --scratch DIR                        working directory and TMPDIR of a manifest run
                                        (default: a directory under the system temp dir)
+  --net-latency T                      virtual-time delay between different hosts, such as
+                                       5ms, 250us or 1s (default 0)
 manifest:
   host NAME                            opens a host
       prog arg \"two words\"           one process; the tokens are its argv verbatim
@@ -46,10 +48,24 @@ struct Cli {
     supervisor: bool,
     manifest: Option<PathBuf>,
     scratch: Option<PathBuf>,
+    net_latency_ns: u64,
     disable_aslr: bool,
     native: bool,
     runs: u32,
     rest: Vec<OsString>,
+}
+
+/// `5ms`, `250us`, `10ns`, `1s`; a bare number is milliseconds.
+fn parse_duration_ns(s: &str) -> Option<u64> {
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let scale = match &s[digits.len()..] {
+        "ns" => 1,
+        "us" => 1_000,
+        "" | "ms" => 1_000_000,
+        "s" => 1_000_000_000,
+        _ => return None,
+    };
+    digits.parse::<u64>().ok()?.checked_mul(scale)
 }
 
 fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
@@ -59,6 +75,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         supervisor: true,
         manifest: None,
         scratch: None,
+        net_latency_ns: 0,
         disable_aslr: true,
         native: false,
         runs: 100,
@@ -90,6 +107,10 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             }
             "--manifest" => cli.manifest = Some(take_value(&mut args)?.into()),
             "--scratch" => cli.scratch = Some(take_value(&mut args)?.into()),
+            "--net-latency" => {
+                let v = take_value(&mut args)?;
+                cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
+            }
             "--no-supervisor" => cli.supervisor = false,
             "--aslr" => cli.disable_aslr = false,
             "--native" => cli.native = true,
@@ -213,6 +234,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         cwd: Some(scratch),
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
+        net_latency_ns: cli.net_latency_ns,
     };
     let outcome = launch::launch_run(&run)?;
     if outcome.deadlock {

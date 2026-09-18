@@ -92,6 +92,11 @@ impl Coordinator {
         &self.path
     }
 
+    /// Delay for traffic between different hosts, in virtual time.
+    pub fn set_net_latency(&self, ns: u64) {
+        self.shared.lock().net.latency_ns = ns;
+    }
+
     /// Fill the host table, in declaration order. Returns `name=address`
     /// pairs for `REWRITE_HOSTS`.
     pub fn add_hosts(&self, names: &[String]) -> String {

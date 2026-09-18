@@ -121,6 +121,8 @@ pub struct Run {
     /// How to rewrite programs the guests spawn; without it they are
     /// expected to be rewritten already.
     pub rewrite: Option<crate::rewrite::Options>,
+    /// Virtual-time delay for traffic between different hosts
+    pub net_latency_ns: u64,
 }
 
 #[derive(Debug)]
@@ -554,7 +556,10 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
         channel = Some(c);
         guest_sock = Some(g);
     }
-    let host_table = coord.map(|c| c.add_hosts(&run.hosts));
+    let host_table = coord.map(|c| {
+        c.set_net_latency(run.net_latency_ns);
+        c.add_hosts(&run.hosts)
+    });
     for guest in &run.guests {
         let mut env = vec![
             ("REWRITE_SEED".to_string(), run.seed.to_string()),
@@ -705,6 +710,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         cwd: None,
         passive: cfg.passive,
         rewrite: cfg.rewrite.clone(),
+        net_latency_ns: 0,
     };
     let mut out = launch_run(&run)?;
     Ok(out.guests.remove(0))

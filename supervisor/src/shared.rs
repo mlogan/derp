@@ -418,7 +418,15 @@ impl State {
     /// the clock make progress.
     pub fn clock_read(&mut self) -> u64 {
         self.clock_ns += PER_READ_NS;
+        self.clock_moved();
         self.clock_ns
+    }
+
+    /// Network traffic that has become due arrives.
+    fn clock_moved(&mut self) {
+        if self.net.advance(self.clock_ns) {
+            self.wake_io();
+        }
     }
 
     /// Release every blocked thread whose deadline has passed.
@@ -445,11 +453,18 @@ impl State {
     /// Deadlines that have passed are handled before the choice; when
     /// nothing is runnable the clock jumps to the earliest deadline.
     fn pick(&mut self) -> Option<usize> {
+        self.clock_moved();
         self.expire_deadlines();
         let mut runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         while runnable == 0 {
-            let next = self.earliest_deadline()?;
+            // A timed waiter's deadline or a payload in flight, whichever
+            // comes first
+            let next = match (self.earliest_deadline(), self.net.next_due()) {
+                (Some(a), Some(b)) => a.min(b),
+                (a, b) => a.or(b)?,
+            };
             self.clock_ns = self.clock_ns.max(next);
+            self.clock_moved();
             self.expire_deadlines();
             runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         }

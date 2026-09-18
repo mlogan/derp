@@ -148,7 +148,13 @@ pub struct Sock {
     pub bytes_in: u64,
     /// Datagrams lost because the ring was full or nobody was bound
     pub dropped: u64,
+    fl_head: u32,
+    fl_len: u32,
+    /// Stream bytes in flight to this socket; they hold part of its window
+    fl_stream: u32,
     rx: [u8; RING],
+    /// Payloads on their way here, oldest first
+    flight: [u8; RING],
 }
 
 #[repr(C)]
@@ -169,6 +175,12 @@ pub struct Net {
     pub socks: [Sock; MAX_SOCKETS],
     fdrefs: [FdRef; MAX_FDREFS],
     /// Totals for the report
+    /// The run's virtual clock, mirrored here by `State` whenever it moves
+    pub now: u64,
+    /// Delay between different hosts; traffic within a host is immediate
+    pub latency_ns: u64,
+    in_flight: u32,
+    next_due: u64,
     pub connections: u64,
     pub datagrams: u64,
     pub dropped: u64,
@@ -182,6 +194,22 @@ pub const MAX_DGRAM: usize = 60 * 1024;
 /// In the ring a datagram is `len: u32, ip: u32, port: u16, family: u8,
 /// path_len: u8`, the source path, then the payload.
 const DGRAM_HEADER: usize = 12;
+
+/// A record in a socket's flight ring: due time, kind, payload length
+const FLIGHT_HEADER: usize = 13;
+const K_BYTES: u8 = 1;
+const K_DGRAM: u8 = 2;
+const K_FIN: u8 = 3;
+
+fn dgram_header(from: &Addr, data_len: usize) -> [u8; DGRAM_HEADER] {
+    let mut header = [0u8; DGRAM_HEADER];
+    header[..4].copy_from_slice(&(data_len as u32).to_le_bytes());
+    header[4..8].copy_from_slice(&from.ip.to_le_bytes());
+    header[8..10].copy_from_slice(&from.port.to_le_bytes());
+    header[10] = from.family;
+    header[11] = from.path_len;
+    header
+}
 
 /// What travels between two sockets
 enum Payload<'a> {
@@ -266,6 +294,9 @@ impl Net {
         s.rx_head = 0;
         s.rx_len = 0;
         s.bytes_in = 0;
+        s.fl_head = 0;
+        s.fl_len = 0;
+        s.fl_stream = 0;
         Ok(i as u32)
     }
 
@@ -452,7 +483,19 @@ impl Net {
             return true;
         }
         let p = &self.socks[s.far_end as usize];
-        p.state != S_CONNECTED || p.shut_rd || (p.rx_len as usize) < RING
+        p.state != S_CONNECTED || p.shut_rd || self.window(s.far_end) > 0
+    }
+
+    /// Stream bytes `dst` can take now: what its receive ring has left
+    /// after the bytes already in flight to it, and what the flight ring
+    /// can hold while keeping room for a FIN's header.
+    fn window(&self, dst: u32) -> usize {
+        let d = &self.socks[dst as usize];
+        let window = RING - d.rx_len as usize - d.fl_stream as usize;
+        if d.fl_len == 0 {
+            return window;
+        }
+        window.min((RING - d.fl_len as usize).saturating_sub(2 * FLIGHT_HEADER))
     }
 
     fn ring_push(&mut self, sock: u32, bytes: &[u8]) {
@@ -482,11 +525,29 @@ impl Net {
     }
 
     /// The single entry point for traffic between guests. Returns how many
-    /// payload bytes `dst` took: a stream takes what fits, a datagram is
-    /// all or nothing. Delivery here is immediate and in order. A
-    /// simulator would decide from the two hosts and the virtual clock
-    /// when, and whether, the payload arrives.
-    fn deliver(&mut self, _src_host: u32, dst: u32, payload: Payload) -> usize {
+    /// payload bytes were taken: a stream takes what fits in the receiver's
+    /// window, a datagram is all or nothing.
+    ///
+    /// This is the seam for a network simulator. The policy here is a
+    /// fixed latency between different hosts and none within one; a
+    /// simulator would choose `deliver_at` from the two hosts and the
+    /// clock, or not launch the payload at all.
+    fn deliver(&mut self, src_host: u32, dst: u32, payload: Payload) -> usize {
+        let d = &self.socks[dst as usize];
+        let delay = if d.host == src_host {
+            0
+        } else {
+            self.latency_ns
+        };
+        // Nothing may overtake what is already in flight to this socket
+        if delay == 0 && d.fl_len == 0 {
+            return self.arrive(dst, payload);
+        }
+        self.launch(dst, self.now + delay, payload)
+    }
+
+    /// The payload reaches `dst` now.
+    fn arrive(&mut self, dst: u32, payload: Payload) -> usize {
         let free = RING - self.socks[dst as usize].rx_len as usize;
         let taken = match payload {
             Payload::Fin => {
@@ -503,13 +564,7 @@ impl Net {
                 if DGRAM_HEADER + path.len() + data.len() > free {
                     return 0;
                 }
-                let mut header = [0u8; DGRAM_HEADER];
-                header[..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                header[4..8].copy_from_slice(&from.ip.to_le_bytes());
-                header[8..10].copy_from_slice(&from.port.to_le_bytes());
-                header[10] = from.family;
-                header[11] = from.path_len;
-                self.ring_push(dst, &header);
+                self.ring_push(dst, &dgram_header(from, data.len()));
                 self.ring_push(dst, path);
                 self.ring_push(dst, data);
                 data.len()
@@ -518,6 +573,150 @@ impl Net {
         self.socks[dst as usize].bytes_in += taken as u64;
         self.bytes += taken as u64;
         taken
+    }
+
+    fn flight_push(&mut self, sock: u32, bytes: &[u8]) {
+        let d = &mut self.socks[sock as usize];
+        let mut at = (d.fl_head as usize + d.fl_len as usize) % RING;
+        for &b in bytes {
+            d.flight[at] = b;
+            at = (at + 1) % RING;
+        }
+        d.fl_len += bytes.len() as u32;
+    }
+
+    fn flight_peek(&self, sock: u32, offset: usize, out: &mut [u8]) {
+        let d = &self.socks[sock as usize];
+        let mut at = (d.fl_head as usize + offset) % RING;
+        for b in out {
+            *b = d.flight[at];
+            at = (at + 1) % RING;
+        }
+    }
+
+    fn flight_skip(&mut self, sock: u32, n: usize) {
+        let d = &mut self.socks[sock as usize];
+        d.fl_head = ((d.fl_head as usize + n) % RING) as u32;
+        d.fl_len -= n as u32;
+    }
+
+    /// Put the payload in flight to `dst`, to arrive at `deliver_at`. In
+    /// flight a record is `deliver_at: u64, kind: u8, len: u32` and the
+    /// payload as it will sit in the receive ring. Stream bytes in flight
+    /// count against the receiver's window, so what is launched always
+    /// fits on arrival; room for one more header is kept so a FIN can
+    /// always follow.
+    fn launch(&mut self, dst: u32, deliver_at: u64, payload: Payload) -> usize {
+        let room =
+            (RING - self.socks[dst as usize].fl_len as usize).saturating_sub(2 * FLIGHT_HEADER);
+        let (kind, len, taken) = match &payload {
+            Payload::Fin => (K_FIN, 0, 0),
+            Payload::Bytes(bytes) => {
+                let n = bytes.len().min(self.window(dst)).min(room);
+                if n == 0 {
+                    return 0;
+                }
+                (K_BYTES, n, n)
+            }
+            Payload::Datagram { from, data } => {
+                let len = DGRAM_HEADER + from.path().len() + data.len();
+                if len > room {
+                    return 0;
+                }
+                (K_DGRAM, len, data.len())
+            }
+        };
+        let mut header = [0u8; FLIGHT_HEADER];
+        header[..8].copy_from_slice(&deliver_at.to_le_bytes());
+        header[8] = kind;
+        header[9..].copy_from_slice(&(len as u32).to_le_bytes());
+        self.flight_push(dst, &header);
+        match payload {
+            Payload::Fin => {}
+            Payload::Bytes(bytes) => {
+                self.flight_push(dst, &bytes[..len]);
+                self.socks[dst as usize].fl_stream += len as u32;
+            }
+            Payload::Datagram { from, data } => {
+                self.flight_push(dst, &dgram_header(from, data.len()));
+                self.flight_push(dst, from.path());
+                self.flight_push(dst, data);
+            }
+        }
+        self.in_flight += 1;
+        self.next_due = if self.in_flight == 1 {
+            deliver_at
+        } else {
+            self.next_due.min(deliver_at)
+        };
+        taken
+    }
+
+    /// When the next payload in flight is due, if any is
+    pub fn next_due(&self) -> Option<u64> {
+        (self.in_flight > 0).then_some(self.next_due)
+    }
+
+    /// Move `n` bytes from the head of `sock`'s flight ring to its receive
+    /// ring, without allocating.
+    fn land(&mut self, sock: u32, mut n: usize) {
+        let mut chunk = [0u8; 256];
+        while n > 0 {
+            let step = n.min(chunk.len());
+            self.flight_peek(sock, 0, &mut chunk[..step]);
+            self.flight_skip(sock, step);
+            self.ring_push(sock, &chunk[..step]);
+            n -= step;
+        }
+    }
+
+    /// The clock is now `now`: everything due arrives. Returns whether
+    /// anything did, in which case I/O waiters should look again.
+    pub fn advance(&mut self, now: u64) -> bool {
+        self.now = now;
+        if self.in_flight == 0 || self.next_due > now {
+            return false;
+        }
+        let mut next = u64::MAX;
+        for sock in 0..MAX_SOCKETS as u32 {
+            while self.socks[sock as usize].fl_len > 0 {
+                let mut header = [0u8; FLIGHT_HEADER];
+                self.flight_peek(sock, 0, &mut header);
+                let due = u64::from_le_bytes(header[..8].try_into().unwrap());
+                if due > now {
+                    next = next.min(due);
+                    break;
+                }
+                let len = u32::from_le_bytes(header[9..].try_into().unwrap()) as usize;
+                self.flight_skip(sock, FLIGHT_HEADER);
+                self.in_flight -= 1;
+                match header[8] {
+                    K_FIN => self.socks[sock as usize].fin = true,
+                    K_BYTES => {
+                        self.land(sock, len);
+                        let d = &mut self.socks[sock as usize];
+                        d.fl_stream -= len as u32;
+                        d.bytes_in += len as u64;
+                        self.bytes += len as u64;
+                    }
+                    _ => {
+                        let mut data_len = [0u8; 4];
+                        self.flight_peek(sock, 0, &mut data_len);
+                        let data_len = u64::from(u32::from_le_bytes(data_len));
+                        if len <= RING - self.socks[sock as usize].rx_len as usize {
+                            self.land(sock, len);
+                            self.socks[sock as usize].bytes_in += data_len;
+                            self.bytes += data_len;
+                        } else {
+                            self.flight_skip(sock, len);
+                            self.dropped += 1;
+                        }
+                    }
+                }
+            }
+        }
+        self.next_due = next;
+        true
     }
 
     /// Send on a stream. Returns how many bytes were taken; `WouldBlock`
@@ -1056,6 +1255,73 @@ mod tests {
         assert_eq!(n.recv_dgram(client, &mut buf, false), Err(WouldBlock));
         assert_eq!(n.send_dgram(server, Some((1, from)), b"yes"), Ok(3));
         assert_eq!(n.recv_dgram(client, &mut buf, false).unwrap().0, 3);
+    }
+
+    #[test]
+    fn traffic_between_hosts_arrives_after_the_latency_and_in_order() {
+        let mut n = net();
+        n.latency_ns = 5_000_000;
+        n.advance(1_000_000);
+        let l = listener(&mut n, 0, 80);
+        let c = client(&mut n, 1);
+        n.connect(c, 0, &Addr::inet(n.hosts[0].addr, 80)).unwrap();
+        let far = n.accept(l).unwrap();
+        n.add_ref(0, far);
+        let mut buf = [0u8; 16];
+
+        assert_eq!(n.send(c, b"one"), Ok(3));
+        n.advance(2_000_000);
+        assert_eq!(n.send(c, b"two"), Ok(3));
+        assert_eq!(n.next_due(), Some(6_000_000));
+        assert_eq!(n.recv(far, &mut buf, false), Err(WouldBlock));
+        assert!(!n.advance(5_999_999));
+        assert!(n.advance(6_000_000));
+        assert_eq!(n.recv(far, &mut buf, false), Ok(3));
+        assert_eq!(n.next_due(), Some(7_000_000));
+
+        // The close travels behind the data
+        n.drop_ref(1, c);
+        n.advance(7_000_000);
+        assert_eq!(n.recv(far, &mut buf, false), Ok(3));
+        assert_eq!(n.recv(far, &mut buf, false), Err(WouldBlock));
+        n.advance(12_000_000);
+        assert_eq!(n.recv(far, &mut buf, false), Ok(0));
+        assert_eq!(n.next_due(), None);
+        assert_eq!(n.bytes, 6);
+    }
+
+    #[test]
+    fn bytes_in_flight_hold_the_window_and_loopback_is_never_delayed() {
+        let mut n = net();
+        n.latency_ns = 5_000_000;
+        let l = listener(&mut n, 0, 80);
+        let c = client(&mut n, 1);
+        n.connect(c, 0, &Addr::inet(n.hosts[0].addr, 80)).unwrap();
+        let far = n.accept(l).unwrap();
+        n.add_ref(0, far);
+        let big = vec![3u8; 2 * RING];
+        let first = n.send(c, &big).unwrap();
+        assert!(first > RING - 64 && first <= RING, "{first}");
+        assert!(!n.writable(c));
+        assert_eq!(n.send(c, &big), Err(WouldBlock));
+        n.advance(5_000_000);
+        assert_eq!(n.pending_bytes(far), first);
+
+        let home = client(&mut n, 0);
+        n.connect(home, 0, &Addr::inet(LOOPBACK, 80)).unwrap();
+        let far_home = n.accept(l).unwrap();
+        n.add_ref(0, far_home);
+        assert_eq!(n.send(home, b"now"), Ok(3));
+        let mut buf = [0u8; 8];
+        assert_eq!(n.recv(far_home, &mut buf, false), Ok(3));
+
+        let server = dgram(&mut n, 0, Some(9000));
+        let sender = dgram(&mut n, 1, None);
+        let to = (0, Addr::inet(n.hosts[0].addr, 9000));
+        assert_eq!(n.send_dgram(sender, Some(to), b"late"), Ok(4));
+        assert_eq!(n.recv_dgram(server, &mut buf, false), Err(WouldBlock));
+        n.advance(10_000_000);
+        assert_eq!(n.recv_dgram(server, &mut buf, false).unwrap().0, 4);
     }
 
     #[test]

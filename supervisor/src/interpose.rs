@@ -23,6 +23,7 @@ use crate::io::{
     my_readv_nocancel, my_write, my_write_nocancel, my_writev, my_writev_nocancel, read_nocancel,
     readv_nocancel, write_nocancel, writev_nocancel,
 };
+use crate::kq::my_kevent;
 use crate::names::{
     my_freeaddrinfo, my_freeifaddrs, my_getaddrinfo, my_gethostname, my_getifaddrs,
 };
@@ -604,6 +605,7 @@ interposers! {
     my_freeaddrinfo => libc::freeaddrinfo,
     my_getifaddrs => libc::getifaddrs,
     my_freeifaddrs => libc::freeifaddrs,
+    my_kevent => libc::kevent,
     my_poll => libc::poll,
     my_select => libc::select,
     my_sendmsg => libc::sendmsg,

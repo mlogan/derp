@@ -283,6 +283,9 @@ pub unsafe extern "C" fn my_writev_nocancel(fd: c_int, iov: *const libc::iovec, 
 }
 
 fn close_managed(fd: c_int, real: impl Fn() -> c_int) -> c_int {
+    if my_id().is_some() {
+        crate::kq::closed(fd);
+    }
     if let Some(sock) = crate::net::lookup(fd) {
         let rc = real();
         if rc == 0 {

@@ -146,6 +146,11 @@ pub struct Sock {
     rx_head: u32,
     rx_len: u32,
     pub bytes_in: u64,
+    /// Bumped whenever something arrives (data, FIN, a queued connection)
+    /// and whenever the send window opens: what an edge-triggered waiter
+    /// compares against, since it cannot see what happened between looks.
+    pub rd_events: u64,
+    pub wr_events: u64,
     /// Datagrams lost because the ring was full or nobody was bound
     pub dropped: u64,
     fl_head: u32,
@@ -294,6 +299,8 @@ impl Net {
         s.rx_head = 0;
         s.rx_len = 0;
         s.bytes_in = 0;
+        s.rd_events = 0;
+        s.wr_events = 0;
         s.fl_head = 0;
         s.fl_len = 0;
         s.fl_stream = 0;
@@ -447,6 +454,7 @@ impl Net {
         let l = &mut self.socks[listener];
         l.backlog[l.backlog_len as usize] = far;
         l.backlog_len += 1;
+        l.rd_events += 1;
         self.connections += 1;
         Ok(())
     }
@@ -548,6 +556,7 @@ impl Net {
 
     /// The payload reaches `dst` now.
     fn arrive(&mut self, dst: u32, payload: Payload) -> usize {
+        self.socks[dst as usize].rd_events += 1;
         let free = RING - self.socks[dst as usize].rx_len as usize;
         let taken = match payload {
             Payload::Fin => {
@@ -690,6 +699,7 @@ impl Net {
                 let len = u32::from_le_bytes(header[9..].try_into().unwrap()) as usize;
                 self.flight_skip(sock, FLIGHT_HEADER);
                 self.in_flight -= 1;
+                self.socks[sock as usize].rd_events += 1;
                 match header[8] {
                     K_FIN => self.socks[sock as usize].fin = true,
                     K_BYTES => {
@@ -757,9 +767,11 @@ impl Net {
             };
         }
         let n = out.len().min(s.rx_len as usize);
+        let sender = s.far_end;
         self.ring_peek(sock, 0, &mut out[..n]);
         if !peek {
             self.ring_skip(sock, n);
+            self.socks[sender as usize].wr_events += 1;
         }
         Ok(n)
     }
@@ -937,6 +949,7 @@ impl Net {
                 } else {
                     let host = self.socks[sock as usize].host;
                     self.deliver(host, peer, Payload::Fin);
+                    self.socks[peer as usize].wr_events += 1;
                     self.socks[sock as usize].state = S_CLOSED;
                 }
             }

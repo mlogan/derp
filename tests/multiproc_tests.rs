@@ -470,3 +470,62 @@ fn a_fixed_latency_between_hosts_changes_the_schedule_not_the_results() {
         );
     }
 }
+
+fn check_poll_server(mode: &str) {
+    let dir = common::scratch_dir(&format!("multiproc_{mode}"));
+    common::build_c("poll_server", &dir, &[]);
+    let manifest = dir.join("server.manifest");
+    std::fs::write(
+        &manifest,
+        format!(
+            "host hub\n    poll_server server {mode} 6000 4\n\
+             host spoke\n    poll_server client hub 6000 0 5\n    poll_server client hub 6000 1 5\n\
+             \x20   poll_server client hub 6000 2 5\n    poll_server client hub 6000 3 5 stall\n"
+        ),
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let mut hashes = Vec::new();
+    for seed in 1..=4u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 5);
+        assert_eq!(
+            r.stdout[0],
+            format!(
+                "client 3 timed out after 1 messages\n{mode} server: 4 clients, 16 messages, 1 timed out\n"
+            ),
+            "seed {seed}"
+        );
+        for id in 0..3 {
+            let expect = (0..5).fold(String::new(), |mut all, m| {
+                use std::fmt::Write;
+                writeln!(all, "C{id} MESSAGE {m}").unwrap();
+                all
+            });
+            assert_eq!(r.stdout[id + 1], expect, "seed {seed} client {id}");
+        }
+        assert_eq!(
+            r.stdout[4], "C3 MESSAGE 0\nclient 3 dropped by the server before message 1\n",
+            "seed {seed}"
+        );
+        assert_eq!(r.u64("run.net_passthrough"), 0);
+        let again = run_manifest(&manifest, &scratch, seed, 5);
+        assert_eq!(again.stdout, r.stdout);
+        assert_eq!(
+            r.fields["run.schedule_hash"], again.fields["run.schedule_hash"],
+            "seed {seed} not repeatable"
+        );
+        hashes.push(r.fields["run.schedule_hash"].clone());
+    }
+    hashes.dedup();
+    assert!(hashes.len() > 1, "every seed produced the same schedule");
+}
+
+#[test]
+fn poll_server_multiplexes_clients_and_times_one_out() {
+    check_poll_server("poll");
+}
+
+#[test]
+fn kevent_server_multiplexes_clients_and_times_one_out() {
+    check_poll_server("kevent");
+}

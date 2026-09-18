@@ -264,7 +264,5 @@ Overhead on `loops 3` today (release build):
   move. Spin-before-park is a day 10 experiment.
 - Dropping `LC_FUNCTION_STARTS` from the smallest binaries is acceptable;
   documented in `README.md` and on `MachO::droppable`.
-
-### Still open
-- `~/dev/worklog` does not exist, so no work log entry was made.
-- Branch `mlogan-multiproc` is not pushed.
+- Branch pushed to `origin/mlogan-multiproc` (2026-09-18); no PR yet.
+- No work log for this project.

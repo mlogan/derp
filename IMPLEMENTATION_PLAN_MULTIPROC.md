@@ -36,7 +36,7 @@ The experiment answers three questions with numbers:
 - **The launcher handles lifecycle only**, over a UNIX socket per guest:
   registering a process and its threads, rewriting a binary on demand for
   a spawned child, reaping, and collecting reports. It starts the initial
-  processes named on the command line; guests may spawn more.
+  processes listed in the run manifest; guests may spawn more.
 - **Wait keys are namespaced by process.** Addresses collide across guests
   (heap layout is identical by construction), so every key is
   (pid, address) or (pid, fd).
@@ -59,9 +59,12 @@ The experiment answers three questions with numbers:
   RNG and the virtual clock, without touching the socket API layer.
 - **Every process lives on a virtual host, and the socket table is keyed on
   it.** A host has a name and an address in a virtual subnet (`10.0.0.0/24`,
-  assigned in declaration order). Each initial process is placed on a host
-  from the command line (`--host NAME`, default one host per initial
-  process: `h0`, `h1`, …); spawned children inherit their parent's host.
+  assigned in declaration order). Placement is the launcher's business and
+  is invisible to the guest: a run manifest lists hosts and the processes
+  on each, and a guest's `argv` is exactly the tokens on its manifest line.
+  Guests find peers the way they already do, through their own arguments or
+  configuration, using virtual addresses or host names. Spawned children
+  inherit their parent's host.
   Port tables and UNIX-domain names are per host, so two hosts can bind the
   same port. `127.0.0.1` means the caller's own host and never crosses
   hosts; `INADDR_ANY` binds the host's address and its loopback.
@@ -127,12 +130,16 @@ thread from any process, bump its `park_word`, wake it with
 - Reaps children with `waitpid`, keeps the (vpid, real pid) map, and prints
   one aggregated report: per-process hooks, switches, and the single
   run-wide schedule hash.
-- `rewrite run --seed S [--mem-hook-rate R] [--host a] prog1 args…
-  [-- [--host b] prog2 args…]` launches several initial processes, each on
-  the named virtual host (or on its own host by default). The host table
-  (names and addresses) is written into the shared state before any guest
-  starts and exported as `REWRITE_HOSTS` so test programs can find peers
-  without arguments; `rewrite repeat` compares the
+- `rewrite run --seed S [--mem-hook-rate R] prog args…` stays as it is: one
+  initial process on host `h0`. Multi-process runs use
+  `rewrite run --seed S --manifest FILE`. The manifest is plain text: a
+  `host NAME` line opens a host, and each indented line under it is one
+  initial process, split into tokens (double quotes group an argument) that
+  become the guest's `argv` verbatim. No launcher option is ever mixed into
+  a guest's arguments, and a guest argument of `--` means nothing to us.
+  Processes start in manifest order. The host table (names and addresses)
+  is written into the shared state before any guest starts; it is also
+  exported as `REWRITE_HOSTS`, which only our own test programs read; `rewrite repeat` compares the
   aggregated report and every process's stdout (each redirected to a file
   in the scratch directory).
 
@@ -254,11 +261,11 @@ empty `LC_DATA_IN_CODE` when space is still short. Keep the
 
 | Day | Deliverable |
 |---|---|
-| 1 | Shared scheduler state and cross-process baton; launcher starts N initial guests; `mutex.c` and `channel.rs` still pass; two `loops` processes alternate with a stable run-wide hash |
+| 1 | Shared scheduler state and cross-process baton; manifest parsing, launcher starts the listed guests in order; `mutex.c` and `channel.rs` still pass; two `loops` processes alternate with a stable run-wide hash |
 | 2 | Counter relocation into shared state; header-room changes in the rewriter; default-linked hello world rewrites without `-headerpad` |
 | 3 | Virtual pids, `posix_spawn`/`fork`/`execve`/`waitpid` interposition, report aggregation; `pipeline.c` spawns its stages (pipes still pass through) |
 | 4 | Readiness waits for pipes; fd table bookkeeping across `dup`/`fork`/`execve`; `pipeline.c` correct with a stable hash |
-| 5 | Host table and `--host` placement; virtual stream sockets: socket table, bind table keyed on host, `connect`/`accept`/`send`/`recv`/`close`, backpressure; `tcp_echo.c` over TCP and `--unix` with server and client on different hosts |
+| 5 | Host table and manifest placement; virtual stream sockets: socket table, bind table keyed on host, `connect`/`accept`/`send`/`recv`/`close`, backpressure; `tcp_echo.c` over TCP and `--unix` with server and client on different hosts |
 | 6 | Socket options, non-blocking mode, `shutdown`, datagram sockets; `gethostname`/`getaddrinfo`/`getifaddrs`; `udp_ping.c` and `two_hosts.c`; `deliver` with the in-flight queue |
 | 7 | Shared virtual clock, deadline-ordered timed waits; `poll`/`select` over mixed real and virtual fds; sleeps become timed waits |
 | 8 | `kevent` emulation for virtual fds; `poll_server.c` in both forms; fixed `--net-latency` through the in-flight queue |

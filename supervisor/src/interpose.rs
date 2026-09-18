@@ -23,10 +23,13 @@ use crate::io::{
     my_readv_nocancel, my_write, my_write_nocancel, my_writev, my_writev_nocancel, read_nocancel,
     readv_nocancel, write_nocancel, writev_nocancel,
 };
+use crate::names::{
+    my_freeaddrinfo, my_freeifaddrs, my_getaddrinfo, my_gethostname, my_getifaddrs,
+};
 use crate::net::{
     my_accept, my_bind, my_connect, my_dup, my_dup2, my_getpeername, my_getsockname, my_getsockopt,
-    my_listen, my_recv, my_recvfrom, my_send, my_sendto, my_setsockopt, my_shutdown, my_socket,
-    rewrite_fcntl_shim,
+    my_listen, my_recv, my_recvfrom, my_recvmsg, my_send, my_sendmsg, my_sendto, my_setsockopt,
+    my_shutdown, my_socket, rewrite_fcntl_shim, rewrite_ioctl_shim,
 };
 use crate::process::{
     my_execve, my_fork, my_getpid, my_getppid, my_kill, my_posix_spawn, my_posix_spawnp, my_wait,
@@ -569,7 +572,15 @@ interposers! {
     my_getsockopt => libc::getsockopt,
     my_dup => libc::dup,
     my_dup2 => libc::dup2,
+    my_gethostname => libc::gethostname,
+    my_getaddrinfo => libc::getaddrinfo,
+    my_freeaddrinfo => libc::freeaddrinfo,
+    my_getifaddrs => libc::getifaddrs,
+    my_freeifaddrs => libc::freeifaddrs,
+    my_sendmsg => libc::sendmsg,
+    my_recvmsg => libc::recvmsg,
     rewrite_fcntl_shim => libc::fcntl,
+    rewrite_ioctl_shim => libc::ioctl,
     my_malloc => libc::malloc,
     my_calloc => libc::calloc,
     my_free => libc::free,

@@ -232,6 +232,8 @@ fn print_run_report(o: &RunOutcome) {
     eprintln!("run.expiries={}", o.totals.expiries);
     eprintln!("run.schedule_hash={:016x}", o.totals.schedule_hash);
     eprintln!("run.net_connections={}", o.totals.net_connections);
+    eprintln!("run.net_datagrams={}", o.totals.net_datagrams);
+    eprintln!("run.net_dropped={}", o.totals.net_dropped);
     eprintln!("run.net_bytes={}", o.totals.net_bytes);
     eprintln!("run.net_passthrough={}", o.totals.net_passthrough);
     for (i, g) in o.guests.iter().enumerate() {

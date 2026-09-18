@@ -32,6 +32,7 @@ pub const FAMILY_INET: u8 = 1;
 pub const FAMILY_UNIX: u8 = 2;
 
 pub const KIND_STREAM: u8 = 1;
+pub const KIND_DGRAM: u8 = 2;
 
 pub const S_FREE: u8 = 0;
 pub const S_NEW: u8 = 1;
@@ -57,7 +58,7 @@ impl Host {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Addr {
     pub family: u8,
     pub path_len: u8,
@@ -124,6 +125,11 @@ pub struct Sock {
     pub shut_rd: bool,
     /// Created by a `connect` and not yet returned by `accept`
     pub pending: bool,
+    /// `SO_NOSIGPIPE`: a write to a closed peer is `EPIPE` without the signal
+    pub nosigpipe: bool,
+    /// A datagram socket with a default destination, which also filters
+    /// what it receives
+    pub has_peer: bool,
     pub host: u32,
     /// Open descriptors, over all processes
     pub refs: u32,
@@ -136,6 +142,8 @@ pub struct Sock {
     rx_head: u32,
     rx_len: u32,
     pub bytes_in: u64,
+    /// Datagrams lost because the ring was full or nobody was bound
+    pub dropped: u64,
     rx: [u8; RING],
 }
 
@@ -158,9 +166,28 @@ pub struct Net {
     fdrefs: [FdRef; MAX_FDREFS],
     /// Totals for the report
     pub connections: u64,
+    pub datagrams: u64,
+    pub dropped: u64,
     pub bytes: u64,
     /// Connections that left the virtual network for the kernel's
     pub passthrough: u64,
+}
+
+/// Largest datagram payload; with its header it must fit an empty ring
+pub const MAX_DGRAM: usize = 60 * 1024;
+/// In the ring a datagram is `len: u32, ip: u32, port: u16, family: u8,
+/// path_len: u8`, the source path, then the payload.
+const DGRAM_HEADER: usize = 12;
+
+/// What travels between two sockets
+enum Payload<'a> {
+    Bytes(&'a [u8]),
+    Datagram {
+        from: &'a Addr,
+        data: &'a [u8],
+    },
+    /// The sender closed or shut down its sending side
+    Fin,
 }
 
 /// Why an operation cannot complete now
@@ -220,6 +247,9 @@ impl Net {
         s.shut_wr = false;
         s.shut_rd = false;
         s.pending = false;
+        s.nosigpipe = false;
+        s.has_peer = false;
+        s.dropped = 0;
         s.host = host;
         s.refs = 0;
         s.far_end = NO_SOCK;
@@ -402,9 +432,10 @@ impl Net {
 
     pub fn readable(&self, sock: u32) -> bool {
         let s = &self.socks[sock as usize];
-        match s.state {
-            S_LISTENING => s.backlog_len > 0,
-            S_CONNECTED => s.rx_len > 0 || s.fin || s.shut_rd,
+        match (s.kind, s.state) {
+            (KIND_DGRAM, _) => s.rx_len > 0,
+            (_, S_LISTENING) => s.backlog_len > 0,
+            (_, S_CONNECTED) => s.rx_len > 0 || s.fin || s.shut_rd,
             _ => true,
         }
     }
@@ -418,23 +449,69 @@ impl Net {
         p.state != S_CONNECTED || p.shut_rd || (p.rx_len as usize) < RING
     }
 
-    /// The single entry point for traffic between guests: append `bytes`
-    /// to `dst`'s receive ring, as many as fit, and return that count.
-    /// Delivery here is immediate and in order. A simulator would decide
-    /// from the two hosts and the virtual clock when, and whether, the
-    /// bytes arrive.
-    fn deliver(&mut self, _src_host: u32, dst: u32, bytes: &[u8]) -> usize {
-        let d = &mut self.socks[dst as usize];
-        let n = bytes.len().min(RING - d.rx_len as usize);
+    fn ring_push(&mut self, sock: u32, bytes: &[u8]) {
+        let d = &mut self.socks[sock as usize];
         let mut at = (d.rx_head as usize + d.rx_len as usize) % RING;
-        for &b in &bytes[..n] {
+        for &b in bytes {
             d.rx[at] = b;
             at = (at + 1) % RING;
         }
-        d.rx_len += n as u32;
-        d.bytes_in += n as u64;
-        self.bytes += n as u64;
-        n
+        d.rx_len += bytes.len() as u32;
+    }
+
+    /// Copy from `offset` bytes into the ring's contents without consuming.
+    fn ring_peek(&self, sock: u32, offset: usize, out: &mut [u8]) {
+        let d = &self.socks[sock as usize];
+        let mut at = (d.rx_head as usize + offset) % RING;
+        for b in out {
+            *b = d.rx[at];
+            at = (at + 1) % RING;
+        }
+    }
+
+    fn ring_skip(&mut self, sock: u32, n: usize) {
+        let d = &mut self.socks[sock as usize];
+        d.rx_head = ((d.rx_head as usize + n) % RING) as u32;
+        d.rx_len -= n as u32;
+    }
+
+    /// The single entry point for traffic between guests. Returns how many
+    /// payload bytes `dst` took: a stream takes what fits, a datagram is
+    /// all or nothing. Delivery here is immediate and in order. A
+    /// simulator would decide from the two hosts and the virtual clock
+    /// when, and whether, the payload arrives.
+    fn deliver(&mut self, _src_host: u32, dst: u32, payload: Payload) -> usize {
+        let free = RING - self.socks[dst as usize].rx_len as usize;
+        let taken = match payload {
+            Payload::Fin => {
+                self.socks[dst as usize].fin = true;
+                return 0;
+            }
+            Payload::Bytes(bytes) => {
+                let n = bytes.len().min(free);
+                self.ring_push(dst, &bytes[..n]);
+                n
+            }
+            Payload::Datagram { from, data } => {
+                let path = from.path();
+                if DGRAM_HEADER + path.len() + data.len() > free {
+                    return 0;
+                }
+                let mut header = [0u8; DGRAM_HEADER];
+                header[..4].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                header[4..8].copy_from_slice(&from.ip.to_le_bytes());
+                header[8..10].copy_from_slice(&from.port.to_le_bytes());
+                header[10] = from.family;
+                header[11] = from.path_len;
+                self.ring_push(dst, &header);
+                self.ring_push(dst, path);
+                self.ring_push(dst, data);
+                data.len()
+            }
+        };
+        self.socks[dst as usize].bytes_in += taken as u64;
+        self.bytes += taken as u64;
+        taken
     }
 
     /// Send on a stream. Returns how many bytes were taken; `WouldBlock`
@@ -455,7 +532,7 @@ impl Net {
         if bytes.is_empty() {
             return Ok(0);
         }
-        match self.deliver(host, peer, bytes) {
+        match self.deliver(host, peer, Payload::Bytes(bytes)) {
             0 => Err(WouldBlock),
             n => Ok(n),
         }
@@ -463,7 +540,7 @@ impl Net {
 
     /// Receive from a stream; 0 is end of stream.
     pub fn recv(&mut self, sock: u32, out: &mut [u8], peek: bool) -> Result<usize, NetError> {
-        let s = &mut self.socks[sock as usize];
+        let s = &self.socks[sock as usize];
         if s.state != S_CONNECTED {
             return Err(Errno(libc::ENOTCONN));
         }
@@ -475,20 +552,138 @@ impl Net {
             };
         }
         let n = out.len().min(s.rx_len as usize);
-        let mut at = s.rx_head as usize;
-        for b in &mut out[..n] {
-            *b = s.rx[at];
-            at = (at + 1) % RING;
-        }
+        self.ring_peek(sock, 0, &mut out[..n]);
         if !peek {
-            s.rx_head = at as u32;
-            s.rx_len -= n as u32;
+            self.ring_skip(sock, n);
         }
         Ok(n)
     }
 
+    /// Bytes `FIONREAD` reports: everything buffered on a stream, the
+    /// first datagram's payload on a datagram socket.
     pub fn pending_bytes(&self, sock: u32) -> usize {
-        self.socks[sock as usize].rx_len as usize
+        let s = &self.socks[sock as usize];
+        if s.kind != KIND_DGRAM || s.rx_len == 0 {
+            return s.rx_len as usize;
+        }
+        let mut len = [0u8; 4];
+        self.ring_peek(sock, 0, &mut len);
+        u32::from_le_bytes(len) as usize
+    }
+
+    /// Give a datagram socket a default destination. It then only
+    /// receives from that address.
+    pub fn connect_dgram(&mut self, sock: u32, dest: Addr) -> Result<(), NetError> {
+        self.bind_if_new(sock)?;
+        let s = &mut self.socks[sock as usize];
+        s.peer = dest;
+        s.has_peer = true;
+        Ok(())
+    }
+
+    /// An unbound inet datagram socket gets a port when it first sends, so
+    /// replies can find it. UNIX-domain senders may stay nameless.
+    fn bind_if_new(&mut self, sock: u32) -> Result<(), NetError> {
+        let s = &self.socks[sock as usize];
+        if s.state == S_NEW && s.family == FAMILY_INET {
+            self.bind(sock, Addr::inet(0, 0))?;
+        }
+        Ok(())
+    }
+
+    /// Send one datagram to `dest` on `dest_host` (or to the default
+    /// destination). An inet datagram nobody is bound to receive, or that
+    /// does not fit, is lost, as UDP allows; a UNIX-domain one reports it.
+    pub fn send_dgram(
+        &mut self,
+        sock: u32,
+        dest: Option<(u32, Addr)>,
+        data: &[u8],
+    ) -> Result<usize, NetError> {
+        if data.len() > MAX_DGRAM {
+            return Err(Errno(libc::EMSGSIZE));
+        }
+        self.bind_if_new(sock)?;
+        let s = &self.socks[sock as usize];
+        let (host, family) = (s.host, s.family);
+        let (dest_host, dest) = match dest {
+            Some(d) => d,
+            None if s.has_peer => {
+                let host = match self.host_for_ip(host, s.peer.ip) {
+                    Ok(h) if family == FAMILY_INET => h,
+                    _ => host,
+                };
+                (host, s.peer)
+            }
+            None => return Err(Errno(libc::EDESTADDRREQ)),
+        };
+        // What the receiver sees as the source: our name, with the address
+        // the destination would reply to
+        let mut from = s.local;
+        if family == FAMILY_INET {
+            from.family = FAMILY_INET;
+            from.ip = if dest.ip >> 24 == 127 {
+                LOOPBACK
+            } else {
+                self.hosts[host as usize].addr
+            };
+        }
+        let target = self.socks.iter().position(|t| {
+            t.kind == KIND_DGRAM
+                && t.state == S_BOUND
+                && t.host == dest_host
+                && t.local.same_name(&dest)
+                && (!t.has_peer || t.peer.same_name(&from) && t.peer.ip == from.ip)
+        });
+        let taken = match target {
+            Some(t) => {
+                let payload = Payload::Datagram { from: &from, data };
+                match self.deliver(host, t as u32, payload) {
+                    0 if !data.is_empty() => None,
+                    _ => Some(()),
+                }
+            }
+            None if family == FAMILY_UNIX => return Err(Errno(libc::ECONNREFUSED)),
+            None => None,
+        };
+        if taken.is_none() {
+            if family == FAMILY_UNIX {
+                return Err(WouldBlock);
+            }
+            self.socks[sock as usize].dropped += 1;
+            self.dropped += 1;
+        }
+        self.datagrams += 1;
+        Ok(data.len())
+    }
+
+    /// Receive one datagram and its source. What does not fit in `out` is
+    /// discarded with the datagram.
+    pub fn recv_dgram(
+        &mut self,
+        sock: u32,
+        out: &mut [u8],
+        peek: bool,
+    ) -> Result<(usize, Addr), NetError> {
+        if self.socks[sock as usize].rx_len == 0 {
+            return Err(WouldBlock);
+        }
+        let mut header = [0u8; DGRAM_HEADER];
+        self.ring_peek(sock, 0, &mut header);
+        let len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
+        let mut from = Addr::NONE;
+        from.ip = u32::from_le_bytes(header[4..8].try_into().unwrap());
+        from.port = u16::from_le_bytes(header[8..10].try_into().unwrap());
+        from.family = header[10];
+        from.path_len = header[11];
+        let path_len = from.path_len as usize;
+        self.ring_peek(sock, DGRAM_HEADER, &mut from.path[..path_len]);
+        let n = out.len().min(len);
+        self.ring_peek(sock, DGRAM_HEADER + path_len, &mut out[..n]);
+        if !peek {
+            self.ring_skip(sock, DGRAM_HEADER + path_len + len);
+        }
+        Ok((n, from))
     }
 
     pub fn shutdown(&mut self, sock: u32, read: bool, write: bool) -> Result<(), NetError> {
@@ -502,8 +697,8 @@ impl Net {
         }
         if write && !s.shut_wr {
             s.shut_wr = true;
-            let peer = s.far_end;
-            self.socks[peer as usize].fin = true;
+            let (host, peer) = (s.host, s.far_end);
+            self.deliver(host, peer, Payload::Fin);
         }
         Ok(())
     }
@@ -522,7 +717,8 @@ impl Net {
                         self.socks[near as usize].state = S_FREE;
                         self.socks[far as usize].state = S_FREE;
                     } else {
-                        self.socks[near as usize].fin = true;
+                        let host = self.socks[far as usize].host;
+                        self.deliver(host, near, Payload::Fin);
                         self.socks[far as usize].state = S_CLOSED;
                     }
                 }
@@ -534,7 +730,8 @@ impl Net {
                     self.socks[peer as usize].state = S_FREE;
                     self.socks[sock as usize].state = S_FREE;
                 } else {
-                    self.socks[peer as usize].fin = true;
+                    let host = self.socks[sock as usize].host;
+                    self.deliver(host, peer, Payload::Fin);
                     self.socks[sock as usize].state = S_CLOSED;
                 }
             }
@@ -765,6 +962,94 @@ mod tests {
         assert!(n.socks[c as usize].fin);
         assert_eq!(n.socks[l as usize].state, S_LISTENING);
         assert_eq!(n.by_ident(0), None);
+    }
+
+    fn dgram(n: &mut Net, host: u32, port: Option<u16>) -> u32 {
+        let s = n.socket(host, FAMILY_INET, KIND_DGRAM).unwrap();
+        n.add_ref(host, s);
+        if let Some(port) = port {
+            n.bind(s, Addr::inet(0, port)).unwrap();
+        }
+        s
+    }
+
+    #[test]
+    fn datagrams_keep_their_boundaries_and_sources() {
+        let mut n = net();
+        let server = dgram(&mut n, 0, Some(9000));
+        let client = dgram(&mut n, 1, None);
+        let to = (0, Addr::inet(n.hosts[0].addr, 9000));
+        let mut buf = [0u8; 64];
+        assert_eq!(n.recv_dgram(server, &mut buf, false), Err(WouldBlock));
+        assert!(!n.readable(server));
+        assert_eq!(n.send_dgram(client, Some(to), b"one"), Ok(3));
+        assert_eq!(n.send_dgram(client, Some(to), b""), Ok(0));
+        assert_eq!(n.send_dgram(client, Some(to), b"three!"), Ok(6));
+        assert_eq!(n.pending_bytes(server), 3);
+
+        let (len, from) = n.recv_dgram(server, &mut buf, true).unwrap();
+        assert_eq!((len, &buf[..3]), (3, &b"one"[..]));
+        let (len, from2) = n.recv_dgram(server, &mut buf, false).unwrap();
+        assert_eq!(len, 3);
+        assert_eq!((from.ip, from.port), (from2.ip, from2.port));
+        // The sender was bound on first use, to its own host's address
+        assert_eq!(from.ip, n.hosts[1].addr);
+        assert!(from.port >= FIRST_EPHEMERAL);
+        assert_eq!(n.recv_dgram(server, &mut buf, false).unwrap().0, 0);
+        // A short buffer truncates and the rest of the datagram is gone
+        assert_eq!(n.recv_dgram(server, &mut buf[..2], false).unwrap().0, 2);
+        assert_eq!(n.recv_dgram(server, &mut buf, false), Err(WouldBlock));
+
+        // The reply finds the client by the source address
+        assert_eq!(n.send_dgram(server, Some((1, from)), b"pong"), Ok(4));
+        let (len, back) = n.recv_dgram(client, &mut buf, false).unwrap();
+        assert_eq!((len, back.port, back.ip), (4, 9000, n.hosts[0].addr));
+    }
+
+    #[test]
+    fn lost_datagrams_are_counted_not_reported() {
+        let mut n = net();
+        let client = dgram(&mut n, 1, None);
+        let nowhere = (0, Addr::inet(n.hosts[0].addr, 9));
+        assert_eq!(n.send_dgram(client, Some(nowhere), b"x"), Ok(1));
+        assert_eq!(n.dropped, 1);
+
+        let server = dgram(&mut n, 0, Some(9000));
+        let to = (0, Addr::inet(n.hosts[0].addr, 9000));
+        let big = vec![1u8; MAX_DGRAM];
+        assert_eq!(n.send_dgram(client, Some(to), &big), Ok(MAX_DGRAM));
+        assert_eq!(n.send_dgram(client, Some(to), &big), Ok(MAX_DGRAM));
+        assert_eq!(n.dropped, 2);
+        assert_eq!(
+            n.send_dgram(client, Some(to), &vec![0; MAX_DGRAM + 1]),
+            Err(Errno(libc::EMSGSIZE))
+        );
+        let mut buf = vec![0u8; MAX_DGRAM];
+        assert_eq!(n.recv_dgram(server, &mut buf, false).unwrap().0, MAX_DGRAM);
+        assert_eq!(n.recv_dgram(server, &mut buf, false), Err(WouldBlock));
+    }
+
+    #[test]
+    fn a_connected_datagram_socket_has_a_default_peer_and_a_filter() {
+        let mut n = net();
+        let server = dgram(&mut n, 0, Some(9000));
+        let client = dgram(&mut n, 1, None);
+        let stranger = dgram(&mut n, 1, None);
+        let server_addr = Addr::inet(n.hosts[0].addr, 9000);
+        assert_eq!(
+            n.send_dgram(client, None, b"x"),
+            Err(Errno(libc::EDESTADDRREQ))
+        );
+        n.connect_dgram(client, server_addr).unwrap();
+        assert_eq!(n.send_dgram(client, None, b"hi"), Ok(2));
+        let mut buf = [0u8; 8];
+        let (_, from) = n.recv_dgram(server, &mut buf, false).unwrap();
+
+        n.bind(stranger, Addr::inet(0, 9000)).unwrap();
+        assert_eq!(n.send_dgram(stranger, Some((1, from)), b"no"), Ok(2));
+        assert_eq!(n.recv_dgram(client, &mut buf, false), Err(WouldBlock));
+        assert_eq!(n.send_dgram(server, Some((1, from)), b"yes"), Ok(3));
+        assert_eq!(n.recv_dgram(client, &mut buf, false).unwrap().0, 3);
     }
 
     #[test]

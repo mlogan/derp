@@ -26,6 +26,9 @@ pub struct Totals {
     /// Connections and bytes that went through the virtual network, and
     /// connections that left it for the kernel's
     pub net_connections: u64,
+    pub net_datagrams: u64,
+    /// Datagrams nobody was bound to receive or that found a full ring
+    pub net_dropped: u64,
     pub net_bytes: u64,
     pub net_passthrough: u64,
 }
@@ -180,6 +183,8 @@ impl Coordinator {
             schedule_hash: s.trace_hash,
             threads: s.nthreads,
             net_connections: s.net.connections,
+            net_datagrams: s.net.datagrams,
+            net_dropped: s.net.dropped,
             net_bytes: s.net.bytes,
             net_passthrough: s.net.passthrough,
         }

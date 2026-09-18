@@ -298,3 +298,89 @@ fn unix_domain_echo_on_one_host() {
         "host alpha\n    tcp_echo server --unix /virtual/echo.sock 4\n    tcp_echo client --unix /virtual/echo.sock 4\n",
     );
 }
+
+#[test]
+fn udp_ping_survives_lost_datagrams() {
+    let dir = common::scratch_dir("multiproc_udp");
+    common::build_c("udp_ping", &dir, &[]);
+    let manifest = dir.join("udp.manifest");
+    std::fs::write(
+        &manifest,
+        "host alpha\n    udp_ping server 5353\nhost beta\n    udp_ping client alpha 5353 20\n",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let pongs = (0..20).fold(String::new(), |mut all, i| {
+        use std::fmt::Write;
+        writeln!(all, "pong {i}").unwrap();
+        all
+    });
+    let mut hashes = Vec::new();
+    for seed in 1..=4u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 2);
+        assert_eq!(r.stdout[1], pongs, "seed {seed}");
+        let server: Vec<&str> = r.stdout[0].lines().collect();
+        assert_eq!(server[0], "server socket type dgram");
+        assert_eq!(*server.last().unwrap(), "got \"done\" from 10.0.0.2");
+        for i in 0..20 {
+            let line = format!("got \"ping {i}\" from 10.0.0.2");
+            assert!(
+                server.contains(&line.as_str()),
+                "seed {seed}: {line} missing"
+            );
+        }
+        assert_eq!(r.u64("run.net_passthrough"), 0);
+        assert!(r.u64("run.net_datagrams") >= 41, "{:?}", r.fields);
+        let again = run_manifest(&manifest, &scratch, seed, 2);
+        assert_eq!(again.stdout, r.stdout, "seed {seed} not repeatable");
+        assert_eq!(
+            r.fields["run.schedule_hash"],
+            again.fields["run.schedule_hash"]
+        );
+        hashes.push(r.fields["run.schedule_hash"].clone());
+    }
+    hashes.dedup();
+    assert!(hashes.len() > 1, "every seed produced the same schedule");
+}
+
+#[test]
+fn two_hosts_share_a_port_and_loopback_stays_home() {
+    let dir = common::scratch_dir("multiproc_hosts");
+    common::build_c("two_hosts", &dir, &[]);
+    let manifest = dir.join("hosts.manifest");
+    std::fs::write(
+        &manifest,
+        "host red\n    two_hosts server 8080\nhost blue\n    two_hosts server 8080\n\
+         host green\n    two_hosts client 8080 red blue\n",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    for seed in 1..=3u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 3);
+        assert_eq!(r.stdout[0], "child of 1000 runs on red\n", "seed {seed}");
+        assert_eq!(r.stdout[1], "child of 1001 runs on blue\n", "seed {seed}");
+        assert_eq!(
+            r.stdout[2],
+            "client on green\n\
+             interface lo0 127.0.0.1 loopback\n\
+             interface en0 10.0.0.3\n\
+             by name red: red at 10.0.0.1:8080 greets 10.0.0.3\n\
+             by address 10.0.0.1: red at 10.0.0.1:8080 greets 10.0.0.3\n\
+             bind to 10.0.0.1: not available\n\
+             by name blue: blue at 10.0.0.2:8080 greets 10.0.0.3\n\
+             by address 10.0.0.2: blue at 10.0.0.2:8080 greets 10.0.0.3\n\
+             bind to 10.0.0.2: not available\n\
+             loopback: refused\n\
+             10.0.0.200: unreachable\n",
+            "seed {seed}"
+        );
+        assert_eq!(r.u64("run.net_connections"), 4);
+        assert_eq!(r.u64("run.net_passthrough"), 0);
+        let again = run_manifest(&manifest, &scratch, seed, 3);
+        assert_eq!(again.stdout, r.stdout);
+        assert_eq!(
+            r.fields["run.schedule_hash"],
+            again.fields["run.schedule_hash"]
+        );
+    }
+}

@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::sched::{self, my_id, State};
 use crate::shared::netstate::{
-    Addr, NetError, FAMILY_INET, FAMILY_UNIX, KIND_STREAM, UNIX_PATH_MAX,
+    Addr, NetError, FAMILY_INET, FAMILY_UNIX, KIND_DGRAM, KIND_STREAM, MAX_DGRAM, RING,
+    UNIX_PATH_MAX,
 };
 use crate::shared::{self};
 
@@ -47,6 +48,10 @@ pub fn lookup(fd: c_int) -> Option<u32> {
     }
     let ident = ident_of(fd)?;
     sched::with(|s, _| s.net.by_ident(ident)).flatten()
+}
+
+fn kind_of(sock: u32) -> u8 {
+    sched::with(|s, _| s.net.socks[sock as usize].kind).unwrap_or(KIND_STREAM)
 }
 
 fn nonblocking(fd: c_int) -> bool {
@@ -148,8 +153,8 @@ unsafe fn store_addr(a: &Addr, out: *mut Sockaddr, len: *mut Socklen) {
 // ---- lifecycle ------------------------------------------------------------
 
 /// A fresh placeholder descriptor and its identity
-fn placeholder() -> Result<(c_int, u64), c_int> {
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+fn placeholder(ty: c_int) -> Result<(c_int, u64), c_int> {
+    let fd = unsafe { libc::socket(libc::AF_UNIX, ty, 0) };
     if fd < 0 {
         return Err(unsafe { *libc::__error() });
     }
@@ -166,16 +171,21 @@ pub unsafe extern "C" fn my_socket(domain: c_int, ty: c_int, protocol: c_int) ->
         libc::AF_UNIX => FAMILY_UNIX,
         _ => 0,
     };
-    if !active() || family == 0 || ty != libc::SOCK_STREAM {
+    let kind = match ty {
+        libc::SOCK_STREAM => KIND_STREAM,
+        libc::SOCK_DGRAM => KIND_DGRAM,
+        _ => 0,
+    };
+    if !active() || family == 0 || kind == 0 {
         return libc::socket(domain, ty, protocol);
     }
-    let (fd, ident) = match placeholder() {
+    let (fd, ident) = match placeholder(ty) {
         Ok(p) => p,
         Err(e) => return set_errno(e),
     };
     let made = sched::with(|s, pid| {
         let host = s.procs[pid as usize].host;
-        let sock = s.net.socket(host, family, KIND_STREAM)?;
+        let sock = s.net.socket(host, family, kind)?;
         s.net.set_ident(sock, ident);
         s.net.add_ref(pid, sock);
         Ok::<(), NetError>(())
@@ -209,8 +219,13 @@ static PASSTHROUGH_LOGGED: AtomicBool = AtomicBool::new(false);
 /// The destination is outside the virtual network: swap the placeholder
 /// for a kernel socket at the same descriptor. What comes back over it is
 /// input to the run.
-unsafe fn leave_virtual_network(fd: c_int, sock: u32) -> bool {
-    let real = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+unsafe fn leave_virtual_network(fd: c_int, sock: u32, domain: c_int) -> bool {
+    let ty = if kind_of(sock) == KIND_DGRAM {
+        libc::SOCK_DGRAM
+    } else {
+        libc::SOCK_STREAM
+    };
+    let real = libc::socket(domain, ty, 0);
     if real < 0 {
         return false;
     }
@@ -235,6 +250,17 @@ unsafe fn leave_virtual_network(fd: c_int, sock: u32) -> bool {
     true
 }
 
+/// A UNIX-domain path that is a socket in the real filesystem belongs to
+/// the system, not to a guest: libSystem's resolver reaches mDNSResponder
+/// this way, on the guest's own thread.
+unsafe fn is_system_socket(addr: &Addr) -> bool {
+    let Ok(path) = std::ffi::CString::new(addr.path()) else {
+        return false;
+    };
+    let mut st: libc::stat = std::mem::zeroed();
+    libc::stat(path.as_ptr(), &raw mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK
+}
+
 pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Socklen) -> c_int {
     let Some(sock) = lookup(fd) else {
         return libc::connect(fd, addr, len);
@@ -242,6 +268,7 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
     let Some(dest) = parse_addr(addr, len) else {
         return set_errno(libc::EAFNOSUPPORT);
     };
+    let dgram = kind_of(sock) == KIND_DGRAM;
     let mut outside = false;
     let r = blocking(fd, true, |s, pid| {
         let here = s.procs[pid as usize].host;
@@ -257,10 +284,22 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
         } else {
             here
         };
-        s.net.connect(sock, host, &dest)
+        if dgram {
+            s.net.connect_dgram(sock, dest)
+        } else {
+            s.net.connect(sock, host, &dest)
+        }
     });
+    if dest.family == FAMILY_UNIX && r == Err(libc::ECONNREFUSED) && is_system_socket(&dest) {
+        outside = true;
+    }
     if outside {
-        if leave_virtual_network(fd, sock) {
+        let domain = if dest.family == FAMILY_UNIX {
+            libc::AF_UNIX
+        } else {
+            libc::AF_INET
+        };
+        if leave_virtual_network(fd, sock, domain) {
             return libc::connect(fd, addr, len);
         }
         return set_errno(libc::ENETUNREACH);
@@ -274,7 +313,7 @@ pub unsafe extern "C" fn my_accept(fd: c_int, addr: *mut Sockaddr, len: *mut Soc
     };
     // The descriptor first: a connection taken off the queue must not be
     // lost to EMFILE.
-    let (new_fd, ident) = match placeholder() {
+    let (new_fd, ident) = match placeholder(libc::SOCK_STREAM) {
         Ok(p) => p,
         Err(e) => return set_errno(e),
     };
@@ -298,28 +337,103 @@ pub unsafe extern "C" fn my_accept(fd: c_int, addr: *mut Sockaddr, len: *mut Soc
 
 // ---- data -----------------------------------------------------------------
 
-/// Blocking stream send: all of it, unless the descriptor is non-blocking.
-pub fn send_fd(fd: c_int, sock: u32, buf: *const u8, len: usize, flags: c_int) -> isize {
+/// Not in the libc crate for Darwin; from `<sys/socket.h>`
+const MSG_NOSIGNAL: c_int = 0x80000;
+
+/// A write to a stream whose peer is gone raises SIGPIPE like the kernel
+/// would, unless the socket or the call opted out.
+fn broken_pipe(sock: u32, flags: c_int) -> isize {
+    let quiet = flags & MSG_NOSIGNAL != 0
+        || sched::with(|s, _| s.net.socks[sock as usize].nosigpipe) == Some(true);
+    if !quiet {
+        unsafe { libc::raise(libc::SIGPIPE) };
+    }
+    set_errno(libc::EPIPE) as isize
+}
+
+/// Where a datagram goes: the host and address `to` names, seen from the
+/// sender's host.
+fn dgram_dest(
+    s: &shared::State,
+    pid: u32,
+    to: Option<Addr>,
+) -> Result<Option<(u32, Addr)>, NetError> {
+    let Some(to) = to else { return Ok(None) };
+    let here = s.procs[pid as usize].host;
+    if to.family != FAMILY_INET {
+        return Ok(Some((here, to)));
+    }
+    match s.net.host_for_ip(here, to.ip) {
+        Ok(h) => Ok(Some((h, to))),
+        Err(true) => Err(NetError::Errno(libc::EHOSTUNREACH)),
+        // An unconnected datagram socket cannot be half virtual
+        Err(false) => Err(NetError::Errno(libc::ENETUNREACH)),
+    }
+}
+
+/// Send on a virtual socket. A stream takes all of it unless the
+/// descriptor is non-blocking; a datagram goes to `to` or to the default
+/// destination.
+pub fn send_to(
+    fd: c_int,
+    sock: u32,
+    buf: *const u8,
+    len: usize,
+    flags: c_int,
+    to: Option<Addr>,
+) -> isize {
     let bytes = unsafe { std::slice::from_raw_parts(buf, len) };
     let dontwait = flags & libc::MSG_DONTWAIT != 0;
+    if kind_of(sock) == KIND_DGRAM {
+        let sent = blocking(fd, dontwait, |s, pid| {
+            let dest = dgram_dest(s, pid, to)?;
+            s.net.send_dgram(sock, dest, bytes)
+        });
+        return match sent {
+            Ok(n) => n as isize,
+            Err(e) => set_errno(e) as isize,
+        };
+    }
     let mut done = 0usize;
-    while done < len || len == 0 {
+    loop {
         match blocking(fd, dontwait, |s, _| s.net.send(sock, &bytes[done..])) {
             Ok(n) => done += n,
             Err(_) if done > 0 => break,
+            Err(libc::EPIPE) => return broken_pipe(sock, flags),
             Err(e) => return set_errno(e) as isize,
         }
-        if len == 0 {
+        if done >= len {
             break;
         }
     }
     done as isize
 }
 
-pub fn recv_fd(fd: c_int, sock: u32, buf: *mut u8, len: usize, flags: c_int) -> isize {
+pub fn send_fd(fd: c_int, sock: u32, buf: *const u8, len: usize, flags: c_int) -> isize {
+    send_to(fd, sock, buf, len, flags, None)
+}
+
+/// Receive on a virtual socket; `from` gets a datagram's source.
+pub fn recv_from(
+    fd: c_int,
+    sock: u32,
+    buf: *mut u8,
+    len: usize,
+    flags: c_int,
+    from: &mut Option<Addr>,
+) -> isize {
     let out = unsafe { std::slice::from_raw_parts_mut(buf, len) };
     let dontwait = flags & libc::MSG_DONTWAIT != 0;
     let peek = flags & libc::MSG_PEEK != 0;
+    if kind_of(sock) == KIND_DGRAM {
+        return match blocking(fd, dontwait, |s, _| s.net.recv_dgram(sock, out, peek)) {
+            Ok((n, source)) => {
+                *from = Some(source);
+                n as isize
+            }
+            Err(e) => set_errno(e) as isize,
+        };
+    }
     let waitall = flags & libc::MSG_WAITALL != 0 && !peek;
     let mut done = 0usize;
     loop {
@@ -336,6 +450,10 @@ pub fn recv_fd(fd: c_int, sock: u32, buf: *mut u8, len: usize, flags: c_int) -> 
         }
     }
     done as isize
+}
+
+pub fn recv_fd(fd: c_int, sock: u32, buf: *mut u8, len: usize, flags: c_int) -> isize {
+    recv_from(fd, sock, buf, len, flags, &mut None)
 }
 
 pub unsafe extern "C" fn my_send(fd: c_int, buf: *const c_void, n: usize, flags: c_int) -> isize {
@@ -362,7 +480,7 @@ pub unsafe extern "C" fn my_sendto(
 ) -> isize {
     match lookup(fd) {
         // A stream ignores the destination
-        Some(sock) => send_fd(fd, sock, buf.cast(), n, flags),
+        Some(sock) => send_to(fd, sock, buf.cast(), n, flags, parse_addr(addr, len)),
         None => libc::sendto(fd, buf, n, flags, addr, len),
     }
 }
@@ -378,10 +496,66 @@ pub unsafe extern "C" fn my_recvfrom(
     let Some(sock) = lookup(fd) else {
         return libc::recvfrom(fd, buf, n, flags, addr, len);
     };
-    if !len.is_null() {
-        *len = 0;
+    let mut from = None;
+    let got = recv_from(fd, sock, buf.cast(), n, flags, &mut from);
+    match from {
+        Some(a) if got >= 0 => store_addr(&a, addr, len),
+        _ if !len.is_null() => *len = 0,
+        _ => {}
     }
-    recv_fd(fd, sock, buf.cast(), n, flags)
+    got
+}
+
+/// `sendmsg` without ancillary data: the vectors are gathered, since a
+/// datagram must go out whole.
+pub unsafe extern "C" fn my_sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) -> isize {
+    let Some(sock) = lookup(fd) else {
+        return libc::sendmsg(fd, msg, flags);
+    };
+    let m = &*msg;
+    if m.msg_controllen > 0 {
+        crate::report::log("sendmsg: ancillary data is not carried over virtual sockets");
+    }
+    let iov = std::slice::from_raw_parts(m.msg_iov, m.msg_iovlen.max(0) as usize);
+    let mut data = Vec::new();
+    for v in iov {
+        data.extend_from_slice(std::slice::from_raw_parts(
+            v.iov_base.cast::<u8>(),
+            v.iov_len,
+        ));
+    }
+    let to = parse_addr(m.msg_name.cast(), m.msg_namelen);
+    send_to(fd, sock, data.as_ptr(), data.len(), flags, to)
+}
+
+pub unsafe extern "C" fn my_recvmsg(fd: c_int, msg: *mut libc::msghdr, flags: c_int) -> isize {
+    let Some(sock) = lookup(fd) else {
+        return libc::recvmsg(fd, msg, flags);
+    };
+    let m = &mut *msg;
+    let iov = std::slice::from_raw_parts(m.msg_iov, m.msg_iovlen.max(0) as usize);
+    let room: usize = iov.iter().map(|v| v.iov_len).sum();
+    let mut data = vec![0u8; room.min(MAX_DGRAM.max(RING))];
+    let mut from = None;
+    let got = recv_from(fd, sock, data.as_mut_ptr(), data.len(), flags, &mut from);
+    if got < 0 {
+        return got;
+    }
+    let mut rest = &data[..got as usize];
+    for v in iov {
+        let n = rest.len().min(v.iov_len);
+        std::ptr::copy_nonoverlapping(rest.as_ptr(), v.iov_base.cast::<u8>(), n);
+        rest = &rest[n..];
+    }
+    match from {
+        Some(a) if !m.msg_name.is_null() => {
+            store_addr(&a, m.msg_name.cast(), &raw mut m.msg_namelen);
+        }
+        _ => m.msg_namelen = 0,
+    }
+    m.msg_controllen = 0;
+    m.msg_flags = 0;
+    got
 }
 
 pub unsafe extern "C" fn my_shutdown(fd: c_int, how: c_int) -> c_int {
@@ -436,8 +610,43 @@ pub unsafe extern "C" fn my_getpeername(
     }
 }
 
-/// Options have no effect on the virtual network; they are accepted so
-/// servers that set `SO_REUSEADDR` or `TCP_NODELAY` run unchanged.
+const TCP_NODELAY: c_int = 0x01;
+const TCP_KEEPALIVE: c_int = 0x10;
+/// Private to XNU; libSystem's resolver sets it on the socket it opens to
+/// mDNSResponder, before the connect that takes it out of the virtual
+/// network.
+const SO_DEFUNCTOK: c_int = 0x1100;
+
+/// Options that mean nothing on the virtual network and are accepted so
+/// that ordinary servers run unchanged
+fn harmless(level: c_int, name: c_int) -> bool {
+    match level {
+        libc::SOL_SOCKET => matches!(
+            name,
+            libc::SO_REUSEADDR
+                | libc::SO_REUSEPORT
+                | libc::SO_KEEPALIVE
+                | libc::SO_BROADCAST
+                | libc::SO_LINGER
+                | libc::SO_RCVBUF
+                | libc::SO_SNDBUF
+                | libc::SO_OOBINLINE
+                | SO_DEFUNCTOK
+        ),
+        libc::IPPROTO_TCP => matches!(name, TCP_NODELAY | TCP_KEEPALIVE),
+        _ => false,
+    }
+}
+
+fn log_unknown_option(what: &str, level: c_int, name: c_int) {
+    let mut line = String::new();
+    let _ = std::fmt::Write::write_fmt(
+        &mut line,
+        format_args!("{what}: option {name:#x} at level {level:#x} is not modelled; ignored"),
+    );
+    crate::report::log(&line);
+}
+
 pub unsafe extern "C" fn my_setsockopt(
     fd: c_int,
     level: c_int,
@@ -445,8 +654,16 @@ pub unsafe extern "C" fn my_setsockopt(
     value: *const c_void,
     len: Socklen,
 ) -> c_int {
-    if lookup(fd).is_none() {
+    let Some(sock) = lookup(fd) else {
         return libc::setsockopt(fd, level, name, value, len);
+    };
+    if level == libc::SOL_SOCKET && name == libc::SO_NOSIGPIPE {
+        let on = !value.is_null()
+            && len as usize >= std::mem::size_of::<c_int>()
+            && value.cast::<c_int>().read_unaligned() != 0;
+        sched::with(|s, _| s.net.socks[sock as usize].nosigpipe = on);
+    } else if !harmless(level, name) {
+        log_unknown_option("setsockopt", level, name);
     }
     0
 }
@@ -458,18 +675,38 @@ pub unsafe extern "C" fn my_getsockopt(
     value: *mut c_void,
     len: *mut Socklen,
 ) -> c_int {
-    if lookup(fd).is_none() {
+    let Some(sock) = lookup(fd) else {
         return libc::getsockopt(fd, level, name, value, len);
+    };
+    if value.is_null() || len.is_null() || (*len as usize) < std::mem::size_of::<c_int>() {
+        return set_errno(libc::EINVAL);
     }
-    if !value.is_null() && !len.is_null() && *len as usize >= std::mem::size_of::<c_int>() {
-        let v: c_int = if level == libc::SOL_SOCKET && name == libc::SO_TYPE {
-            libc::SOCK_STREAM
-        } else {
+    let (kind, listening, nosigpipe) = sched::with(|s, _| {
+        let k = &s.net.socks[sock as usize];
+        (
+            k.kind,
+            k.state == shared::netstate::S_LISTENING,
+            k.nosigpipe,
+        )
+    })
+    .unwrap_or((KIND_STREAM, false, false));
+    let v: c_int = match (level, name) {
+        (libc::SOL_SOCKET, libc::SO_TYPE) if kind == KIND_DGRAM => libc::SOCK_DGRAM,
+        (libc::SOL_SOCKET, libc::SO_TYPE) => libc::SOCK_STREAM,
+        // Errors are reported where they happen; nothing is ever pending
+        (libc::SOL_SOCKET, libc::SO_ERROR) => 0,
+        (libc::SOL_SOCKET, libc::SO_ACCEPTCONN) => c_int::from(listening),
+        (libc::SOL_SOCKET, libc::SO_NOSIGPIPE) => c_int::from(nosigpipe),
+        (libc::SOL_SOCKET, libc::SO_RCVBUF | libc::SO_SNDBUF) => RING as c_int,
+        _ => {
+            if !harmless(level, name) {
+                log_unknown_option("getsockopt", level, name);
+            }
             0
-        };
-        value.cast::<c_int>().write(v);
-        *len = std::mem::size_of::<c_int>() as Socklen;
-    }
+        }
+    };
+    value.cast::<c_int>().write_unaligned(v);
+    *len = std::mem::size_of::<c_int>() as Socklen;
     0
 }
 
@@ -529,8 +766,29 @@ pub unsafe extern "C" fn rewrite_fcntl_impl(fd: c_int, cmd: c_int, arg: usize) -
     rc
 }
 
+const FIONREAD: libc::c_ulong = 0x4004_667F;
+
+/// `ioctl` is variadic like `fcntl`. Everything but `FIONREAD` works on
+/// the placeholder as it is (`FIONBIO` sets its `O_NONBLOCK`).
+#[no_mangle]
+pub unsafe extern "C" fn rewrite_ioctl_impl(
+    fd: c_int,
+    request: libc::c_ulong,
+    arg: usize,
+) -> c_int {
+    if request == FIONREAD {
+        if let Some(sock) = lookup(fd) {
+            let pending = sched::with(|s, _| s.net.pending_bytes(sock)).unwrap_or(0);
+            (arg as *mut c_int).write_unaligned(pending as c_int);
+            return 0;
+        }
+    }
+    libc::ioctl(fd, request, arg)
+}
+
 extern "C" {
     pub fn rewrite_fcntl_shim();
+    pub fn rewrite_ioctl_shim();
 }
 
 std::arch::global_asm!(
@@ -539,6 +797,11 @@ std::arch::global_asm!(
     "_rewrite_fcntl_shim:",
     "ldr x2, [sp]",
     "b _rewrite_fcntl_impl",
+    ".globl _rewrite_ioctl_shim",
+    ".p2align 2",
+    "_rewrite_ioctl_shim:",
+    "ldr x2, [sp]",
+    "b _rewrite_ioctl_impl",
 );
 
 /// Count the virtual sockets among the descriptors this process was born

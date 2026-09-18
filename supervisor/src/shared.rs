@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::rng::Rng;
 
+#[path = "netstate.rs"]
+pub mod netstate;
+
 pub const MAGIC: u64 = 0x0031_4448_5357_5252;
 pub const MAX_THREADS: usize = 1024;
 pub const MAX_PROCS: usize = 256;
@@ -143,6 +146,7 @@ pub struct State {
     next_cond_seq: u64,
     pub threads: [ThreadRec; MAX_THREADS],
     pub procs: [ProcRec; MAX_PROCS],
+    pub net: netstate::Net,
 }
 
 #[repr(C)]
@@ -461,6 +465,7 @@ impl State {
         self.procs[pid as usize].state = P_EXITED;
         self.procs[pid as usize].exit_status = status;
         // Its descriptors are closed: peers may see EOF or EPIPE now
+        self.net.process_died(pid);
         self.wake_io();
         let parent = self.procs[pid as usize].parent;
         if parent != NO_PROC {

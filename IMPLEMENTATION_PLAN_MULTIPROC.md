@@ -1,4 +1,4 @@
-# Multi-Process Deterministic Runs: Two-Week Experiment
+# Multi-Process Deterministic Runs: Twelve-Day Experiment
 
 ## Overview
 
@@ -14,8 +14,9 @@ what the rewriter already needs.
 The experiment answers three questions with numbers:
 
 1. Is the schedule of a multi-process run a function of the seed when the
-   processes communicate through the kernel (pipes, loopback TCP, UNIX
-   sockets, shared files)?
+   processes communicate through pipes, shared files, and sockets that the
+   supervisor implements itself (the seam a network simulator will later
+   plug into)?
 2. Does the cross-process baton cost enough per switch to change the quantum
    defaults?
 3. Does a seed reproduce a cross-process race (lost update on a shared file
@@ -45,17 +46,24 @@ The experiment answers three questions with numbers:
   only when a guest acts, so waking every I/O waiter after any write,
   close, connect, shutdown, accept or unlink and letting them re-check is
   exact, not a heuristic. The one exception is below.
-- **Loopback TCP settles asynchronously in the kernel.** Delivery over
-  `lo0` happens on a kernel input thread, so a `send` can return before the
-  peer's receive buffer has the data, and a peer's non-blocking `recv` a
-  moment later could see EAGAIN or data depending on kernel timing. The
-  sender therefore does not release the baton until the kernel reports the
-  change delivered: `FIONWRITE` reaching zero after a send, `POLLOUT` after
-  a connect. `close` and `shutdown` cannot be observed from the closing
-  side and use a bounded wait. UNIX-domain sockets and pipes deliver
-  synchronously and need none of this. If the settling rule proves leaky in
-  the 100-run check, the experiment falls back to UNIX-domain sockets and
-  records the TCP result as a finding.
+- **Sockets between guests are virtual.** The supervisor implements
+  `AF_INET` and `AF_UNIX` stream and datagram sockets in the shared state:
+  ring buffers per direction, listen queues, a port table. No packet touches
+  the kernel's network stack, so there is nothing asynchronous to settle
+  (loopback TCP in the kernel is delivered on an input thread, which would
+  have made a peer's non-blocking `recv` timing-dependent). This is also
+  the seam for the network simulator that will follow: every byte between
+  guests already passes through one `deliver` function, which in this
+  experiment delivers instantly and in order. The simulator replaces that
+  policy with latency, loss, partitions and reordering driven by the seeded
+  RNG and the virtual clock, without touching the socket API layer.
+- **A virtual socket still has a real fd.** `socket()` returns a real
+  placeholder descriptor so fd numbers, `dup`, `close`, `fork` inheritance
+  and `select` bitmaps stay coherent; the shared state maps (process, fd) to
+  the virtual socket and refcounts it.
+- **Sockets to addresses no guest has bound** are real: a loopback address
+  with no listener gets ECONNREFUSED; any other address passes through to
+  the kernel, is logged once, and is treated as input.
 - **I/O syscalls count as hook events.** Each interposed I/O call decrements
   the shared quantum counter like a stub does, so a quantum can expire at an
   I/O boundary. A read-modify-write on a file (read, compute, write) then
@@ -130,30 +138,63 @@ dylib) point the slot at a local word in `__STUBD` at rewrite time so the
 binary still works with the dylib absent. Measured cost: one dependent load
 per hook; recorded in the overhead table.
 
-### 5. I/O interposition (`supervisor/src/io.rs`)
+### 5. I/O interposition for kernel objects (`supervisor/src/io.rs`)
+
+Pipes, files and pass-through sockets. Each call first asks the fd table
+whether the descriptor is virtual (component 6); if so it is routed there.
 
 | Call | Handling |
 |---|---|
-| `read`, `recv`, `recvfrom`, `recvmsg`, `readv` | if the fd is a regular file: pass through. Otherwise try with `MSG_DONTWAIT` / `O_NONBLOCK`; on EAGAIN park as an I/O waiter for (fd, readable), retry when woken |
-| `write`, `send`, `sendto`, `sendmsg`, `writev` | non-blocking try; on EAGAIN park for (fd, writable). After success on a socket: settling rule (`FIONWRITE` → 0). Then wake all I/O waiters |
-| `accept` | non-blocking try; park for readable. After success: wake all |
-| `connect` | non-blocking connect; park for writable until `SO_ERROR` is known; settle on `POLLOUT`; wake all |
-| `close`, `shutdown`, `unlink`, `rename`, `flock`/`fcntl(F_SETLK)` release | pass through, then bounded settle for sockets, then wake all |
-| `poll`, `select`, `kevent` | call with zero timeout; if nothing is ready and the timeout is nonzero, park as an I/O waiter with a virtual-time deadline; on wake re-issue with zero timeout |
+| `read`, `readv` | regular file: pass through. Pipe or real socket: non-blocking try; on EAGAIN park as an I/O waiter for (fd, readable), retry when woken |
+| `write`, `writev` | non-blocking try; on EAGAIN park for (fd, writable); after success wake all I/O waiters |
+| `close`, `unlink`, `rename`, lock release | pass through, then wake all I/O waiters |
+| `poll`, `select`, `kevent` | readiness of virtual fds comes from shared state, of real fds from the same call with zero timeout; if nothing is ready and the timeout is nonzero, park with a virtual-time deadline and re-evaluate when woken |
 | `flock`, `fcntl(F_SETLKW)` | try the non-blocking form; on EWOULDBLOCK park for (fd, lock) and retry when woken |
+| `dup`, `dup2`, `fcntl(F_DUPFD)`, `fork`, `execve` | keep the (process, fd) → virtual socket map and refcounts in step with the kernel's fd table |
 | `fsync`, `open`, `stat`, `lseek`, `mmap` of files | pass through; `open` logs paths outside the scratch directory once |
 
-Every call in this table also decrements the shared quantum counter and
-yields if it expires.
+Every call in this table and the next also decrements the shared quantum
+counter and yields if it expires.
 
-### 6. Virtual clock and timers (`supervisor/src/clock.rs`)
+### 6. Virtual network (`supervisor/src/net.rs`)
+
+State in the shared file: a socket table (`{ kind, state, local, peer,
+rx: ring, backlog, options, refs }`), a port table per address family, and
+an in-flight queue of `{ deliver_at, dst_socket, bytes | fin | datagram }`.
+
+| Call | Handling |
+|---|---|
+| `socket` | allocate a virtual socket and a real placeholder fd |
+| `bind`, `listen` | port table entry (ephemeral ports handed out in order); UNIX-domain paths are names in the table, no filesystem node |
+| `connect` | find the listener in the port table: queue a connection on its backlog, wake accept waiters, park until accepted (or return EINPROGRESS when non-blocking). No listener: ECONNREFUSED for loopback, otherwise fall back to a real socket |
+| `accept` | pop the backlog or park for readable |
+| `send`, `sendto`, `sendmsg`, `write`, `writev` | hand the bytes to `deliver(src, dst, payload)`; stream sockets block (or EAGAIN) when the peer's ring is full, which gives real backpressure |
+| `recv`, `recvfrom`, `recvmsg`, `read`, `readv` | copy from the ring, or park for readable; zero-length read after the peer's FIN |
+| `shutdown`, `close` | FIN through `deliver`; last reference frees the socket; writes to a closed peer return EPIPE |
+| `getsockname`, `getpeername`, `getsockopt`, `setsockopt`, `ioctl(FIONREAD)`, `fcntl(O_NONBLOCK)` | answered from socket state; `SO_RCVTIMEO`/`SO_SNDTIMEO` become virtual-time deadlines; options with no meaning here (`TCP_NODELAY`, `SO_REUSEADDR`, keepalive) are accepted and recorded |
+
+`deliver` is the single entry point for traffic. In this experiment it
+appends to the destination immediately. Its signature already carries
+source, destination and the virtual clock, and the scheduler already drains
+the in-flight queue when it advances the clock, so a simulator only has to
+choose `deliver_at` (latency), whether to enqueue at all (loss, partition)
+and queue order for datagrams (reordering). A fixed `--net-latency` option
+exercises that path in the tests.
+
+`kevent` needs an emulation layer for virtual fds: registrations on a kqueue
+are recorded per (process, kq fd), and readiness is synthesized from socket
+state. Level-triggered, `EV_CLEAR` and `EV_ONESHOT` are in scope; anything
+else is logged.
+
+### 7. Virtual clock and timers (`supervisor/src/clock.rs`)
 
 Moves from per-process atomics to the shared state. `pick()` gains a
 deadline check: when nothing is runnable, advance the clock to the earliest
-timed waiter's deadline and release it; when something is runnable, timed
-waiters whose deadline has passed are made runnable before the choice.
+deadline (a timed waiter's or an in-flight network item's) and act on it;
+when something is runnable, deadlines that have passed are handled before
+the choice.
 
-### 7. Header room in the rewriter (`src/macho.rs`)
+### 8. Header room in the rewriter (`src/macho.rs`)
 
 So default-linked binaries from the user's toolchain need no relinking: emit
 the `__STUB` segment without a section header (72 bytes), put the counter
@@ -162,7 +203,7 @@ least 32 bytes are free, and drop `LC_UUID`, `LC_SOURCE_VERSION` and an
 empty `LC_DATA_IN_CODE` when space is still short. Keep the
 `-Wl,-headerpad` error message for the rare binary that still does not fit.
 
-### 8. Test programs (`tests/programs/`)
+### 9. Test programs (`tests/programs/`)
 
 1. `pipeline.c`: three processes connected by pipes (`producer | filter |
    consumer`), spawned by a parent with `posix_spawn`; the consumer prints a
@@ -178,6 +219,10 @@ empty `LC_DATA_IN_CODE` when space is still short. Keep the
    `race.c`).
 5. `net.rs`: Rust `std::net` `TcpListener`/`TcpStream` echo with
    `std::process::Command` spawning the client.
+6. `udp_ping.c`: two processes exchange numbered datagrams and print what
+   arrived, in order of arrival.
+7. `poll_server.c`: a single-threaded server multiplexing several clients
+   with `poll`, and the same with `kevent`, using read timeouts.
 
 ## Implementation Order
 
@@ -186,18 +231,27 @@ empty `LC_DATA_IN_CODE` when space is still short. Keep the
 | 1 | Shared scheduler state and cross-process baton; launcher starts N initial guests; `mutex.c` and `channel.rs` still pass; two `loops` processes alternate with a stable run-wide hash |
 | 2 | Counter relocation into shared state; header-room changes in the rewriter; default-linked hello world rewrites without `-headerpad` |
 | 3 | Virtual pids, `posix_spawn`/`fork`/`execve`/`waitpid` interposition, report aggregation; `pipeline.c` spawns its stages (pipes still pass through) |
-| 4 | Readiness waits for pipes and UNIX sockets; `pipeline.c` and `tcp_echo --unix` correct with a stable hash |
-| 5 | Loopback TCP settling rules; `tcp_echo.c` over TCP; 100-run check |
-| 6 | Shared virtual clock, deadline-ordered timed waits, `poll`/`kevent` timeouts; sleeps become timed waits |
-| 7 | `counter_file.c` and `shared_map.c`: races reproduce from a seed; I/O calls as hook events; 100-run checks |
-| 8 | `net.rs`; switch-cost and overhead measurements; quantum defaults revisited |
-| 9-10 | Slack: settling-rule tuning, whatever the Rust program turned up, write-up in `docs/MULTIPROC_RESULTS.md` |
+| 4 | Readiness waits for pipes; fd table bookkeeping across `dup`/`fork`/`execve`; `pipeline.c` correct with a stable hash |
+| 5 | Virtual stream sockets: socket table, port table, `connect`/`accept`/`send`/`recv`/`close`, backpressure; `tcp_echo.c` over TCP and `--unix` |
+| 6 | Socket options, non-blocking mode, `shutdown`, datagram sockets; `udp_ping.c`; `deliver` with the in-flight queue |
+| 7 | Shared virtual clock, deadline-ordered timed waits; `poll`/`select` over mixed real and virtual fds; sleeps become timed waits |
+| 8 | `kevent` emulation for virtual fds; `poll_server.c` in both forms; fixed `--net-latency` through the in-flight queue |
+| 9 | `counter_file.c` and `shared_map.c`: races reproduce from a seed; I/O calls as hook events; 100-run checks |
+| 10 | `net.rs`; switch-cost and overhead measurements; quantum defaults revisited |
+| 11-12 | Slack: whatever the Rust program turned up, socket API gaps found by the tests, write-up in `docs/MULTIPROC_RESULTS.md` |
 
 ## Acceptance Criteria
 
-- `pipeline.c` and `tcp_echo.c` (TCP and UNIX) produce correct output on
-  every seed, with a run-wide schedule hash identical on 100 consecutive
-  runs per seed and different across seeds.
+- `pipeline.c`, `tcp_echo.c` (TCP and UNIX), `udp_ping.c` and
+  `poll_server.c` (both forms) produce correct output on every seed, with a
+  run-wide schedule hash identical on 100 consecutive runs per seed and
+  different across seeds.
+- No traffic between guests reaches the kernel: the report shows every
+  connection and byte count through the virtual network, and no guest holds
+  a bound or connected kernel socket during the tests.
+- With `--net-latency` set to a fixed value, outputs stay correct, the
+  schedule changes, and the 100-run check still passes: the simulator seam
+  works end to end.
 - `counter_file.c --flock` always prints N·K. Without `--flock`, at least
   one seed in twenty prints less with branch hooks only (I/O calls are hook
   events), and that seed prints the same value and hash on 100 runs.
@@ -206,13 +260,20 @@ empty `LC_DATA_IN_CODE` when space is still short. Keep the
 - `net.rs` runs correctly with a stable hash.
 - A default-linked (no `-headerpad`) hello world rewrites and runs.
 - Numbers reported: switch cost in-process vs cross-process; overhead on
-  `loops.c` with the relocated counter; TCP settling wait per send.
+  `loops.c` with the relocated counter; virtual socket throughput against
+  kernel loopback for `tcp_echo.c`.
 
 ## Non-Goals
 
 - System utilities and platform binaries.
 - Signals other than SIGTERM/SIGKILL to parked processes.
-- Sockets to hosts outside the run; DNS.
+- The network simulator itself: latency distributions, loss, partitions,
+  bandwidth limits, datagram reordering, per-process virtual hosts and
+  addresses. This experiment builds the seam (`deliver`, the in-flight
+  queue, the clock hookup) and proves it with a fixed latency only.
+- Sockets to hosts outside the run (they pass through as input); DNS.
+- Descriptor passing (`SCM_RIGHTS`), raw sockets, `AF_INET6`, multicast,
+  out-of-band data, `sendfile`.
 - Filesystem virtualization or sandboxing beyond the scratch cwd.
 - Virtual machines or containers.
 - Deterministic `readdir` order beyond what APFS gives for a fixed set of
@@ -220,10 +281,19 @@ empty `LC_DATA_IN_CODE` when space is still short. Keep the
 
 ## Risks
 
-- **TCP settling.** The `FIONWRITE` rule covers data; FIN and RST delivery
-  after `close`/`shutdown` are unobservable from the closer and use a
-  bounded wait, which is a timing assumption. The 100-run check is the
-  judge; UNIX-domain sockets are the fallback.
+- **Socket API surface.** Real programs probe options and corner cases
+  (`SO_ERROR` after a non-blocking connect, `MSG_PEEK`, `MSG_WAITALL`,
+  half-close, `EPIPE` versus `ECONNRESET`). Each gap shows up as a test
+  program misbehaving; unknown options and flags are logged by name so the
+  list of what to add is explicit.
+- **fd bookkeeping.** A virtual socket's identity lives outside the kernel,
+  so every path that copies or drops descriptors (`dup2` over a virtual fd,
+  `fork`, close-on-exec, process death without `close`) must update the
+  refcounts, or peers never see EOF. Process exit sweeps the table.
+- **`kevent` semantics.** Emulating edge-triggered delivery and the
+  interaction of virtual and real registrations on one kqueue is the most
+  intricate part; runtimes like tokio depend on it. It is scheduled late
+  and is the first thing to cut to `poll`-only if time runs short.
 - **Kernel-woken waits inside libSystem** (the `pthread_join` lesson) will
   recur for I/O paths we have not seen; pass-through mode is the tool, and
   each case gets logged.

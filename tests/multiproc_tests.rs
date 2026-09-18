@@ -607,3 +607,37 @@ fn a_shared_mapping_races_only_with_memory_hooks() {
         );
     }
 }
+
+#[test]
+fn rust_std_net_echo_with_a_spawned_client() {
+    let dir = common::scratch_dir("multiproc_rustnet");
+    common::build_rust("net", &dir);
+    let manifest = dir.join("net.manifest");
+    std::fs::write(&manifest, "host a\n    net\n").unwrap();
+    let scratch = dir.join("scratch");
+    let mut hashes = Vec::new();
+    for seed in 1..=3u64 {
+        let r = run_manifest_with(&manifest, &scratch, seed, 1, &["--mem-hook-rate", "1/16"]);
+        let mut lines: Vec<&str> = r.stdout[0].lines().collect();
+        lines.sort_unstable();
+        let mut expect = vec![
+            "client got: goodbye after 5 lines".to_string(),
+            "server accepted a connection from 127.0.0.1".to_string(),
+            "server saw 5 lines; client exited with exit status: 0".to_string(),
+        ];
+        expect.extend((0..5).map(|i| format!("client got: MESSAGE {i} FROM THE CLIENT")));
+        expect.sort_unstable();
+        assert_eq!(lines, expect, "seed {seed}");
+        assert_eq!(r.u64("run.net_connections"), 1);
+        assert_eq!(r.u64("run.net_passthrough"), 0);
+        let again = run_manifest_with(&manifest, &scratch, seed, 1, &["--mem-hook-rate", "1/16"]);
+        assert_eq!(again.stdout, r.stdout, "seed {seed} not repeatable");
+        assert_eq!(
+            r.fields["run.schedule_hash"],
+            again.fields["run.schedule_hash"]
+        );
+        hashes.push(r.fields["run.schedule_hash"].clone());
+    }
+    hashes.dedup();
+    assert!(hashes.len() > 1, "every seed produced the same schedule");
+}

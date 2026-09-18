@@ -80,7 +80,14 @@ pub fn build_rust(name: &str, out_dir: &Path) -> PathBuf {
     let src = programs_dir().join(format!("{name}.rs"));
     let out = out_dir.join(name);
     let status = Command::new("rustc")
-        .args(["-O", "-C", "link-args=-Wl,-headerpad,0x1000", "-o"])
+        .args([
+            "--edition",
+            "2021",
+            "-O",
+            "-C",
+            "link-args=-Wl,-headerpad,0x1000",
+            "-o",
+        ])
         .arg(&out)
         .arg(&src)
         .status()

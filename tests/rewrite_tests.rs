@@ -82,3 +82,66 @@ fn stubs_are_slide_proof() {
     assert_eq!(o.exit_code(), Some(0));
     assert!(o.report.get_u64("hooks").unwrap() > 0);
 }
+
+/// A debugger finds a dSYM by the executable's file name, so the rewritten
+/// file gets a link to the original's bundle; with it, a source-line
+/// breakpoint resolves to the same address as in the original.
+#[test]
+fn a_rewritten_binary_keeps_its_debug_symbols_reachable() {
+    use std::process::Command;
+    let dir = common::scratch_dir("debug_symbols");
+    let src = common::programs_dir().join("loops.c");
+    let exe = dir.join("loops_g");
+    let built = Command::new("clang")
+        .args(["-g", "-O0", "-o"])
+        .arg(&exe)
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(built.success());
+    assert!(dir.join("loops_g.dSYM").is_dir(), "clang -g made no dSYM");
+
+    let out = dir.join("loops_g.rw");
+    rewrite::cache::rewrite_file(&exe, &out, &Options::default()).unwrap();
+    let link = dir.join("loops_g.rw.dSYM");
+    assert!(std::fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::canonicalize(&link).unwrap(),
+        std::fs::canonicalize(dir.join("loops_g.dSYM")).unwrap()
+    );
+    // Again, and through the cache: idempotent, and the cached copy gets one
+    rewrite::cache::rewrite_file(&exe, &out, &Options::default()).unwrap();
+    let cached = rewrite::cache::cached_rewrite(&exe, &Options::default()).unwrap();
+    let cached_link = std::path::PathBuf::from(format!("{}.dSYM", cached.display()));
+    assert!(cached_link.join("Contents").is_dir());
+    assert!(!dir.read_dir().unwrap().any(|e| e
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .contains("rw-tmp")));
+
+    let resolve = |binary: &std::path::Path| {
+        let lldb = Command::new("lldb")
+            .args(["-b", "-o", "breakpoint set --file loops.c --line 9"])
+            .arg(binary)
+            .output();
+        let Ok(lldb) = lldb else { return None };
+        let text = String::from_utf8_lossy(&lldb.stdout).into_owned();
+        let address = text
+            .split("address = ")
+            .nth(1)?
+            .split_whitespace()
+            .next()?
+            .to_string();
+        Some(address)
+    };
+    let Some(original) = resolve(&exe) else {
+        eprintln!("skipped the debugger half: lldb did not resolve the original");
+        return;
+    };
+    assert_eq!(resolve(&out), Some(original.clone()), "rewritten");
+    assert_eq!(resolve(&cached), Some(original), "cached");
+}

@@ -222,20 +222,16 @@ unsafe fn check(call: &str, path: *const c_char, ancestors: bool) -> bool {
 fn refuse(call: &str, given: &[u8]) {
     let guard = POLICY.lock();
     let Some(policy) = guard.as_ref() else { return };
-    {
-        if REFUSED.fetch_add(1, Ordering::Relaxed) < MAX_LOGGED {
-            let mut line = String::new();
-            let _ = std::fmt::Write::write_fmt(
-                &mut line,
-                format_args!(
-                    "host {}: {call} {} refused: outside the host's directory",
-                    policy.host,
-                    String::from_utf8_lossy(given)
-                ),
-            );
-            crate::report::log(&line);
-        }
+    if REFUSED.fetch_add(1, Ordering::Relaxed) >= MAX_LOGGED {
+        return;
     }
+    let line = format!(
+        "host {}: {call} {} refused: outside the host's directory",
+        policy.host,
+        String::from_utf8_lossy(given)
+    );
+    drop(guard);
+    crate::report::log(&line);
 }
 
 pub fn refused() -> u32 {

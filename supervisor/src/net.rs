@@ -1,7 +1,7 @@
 //! Socket API over the virtual network in the shared state
-//! (`shared::netstate`). `AF_INET` and `AF_UNIX` stream sockets made by a
-//! scheduled thread never reach the kernel's network stack; blocking calls
-//! become readiness waits like pipe I/O.
+//! (`shared::netstate`). `AF_INET` and `AF_UNIX` stream and datagram sockets
+//! made by a scheduled thread never reach the kernel's network stack;
+//! blocking calls become readiness waits like pipe I/O.
 //!
 //! The descriptor a guest holds is a real `AF_UNIX` socket that is never
 //! connected. It keeps descriptor numbers, `dup`, `fork`, close-on-exec
@@ -20,11 +20,6 @@ use crate::shared::{self};
 
 type Sockaddr = libc::sockaddr;
 type Socklen = libc::socklen_t;
-
-fn set_errno(e: c_int) -> c_int {
-    unsafe { *libc::__error() = e };
-    -1
-}
 
 /// Sockets are virtual only for scheduled threads of a launcher's run.
 fn active() -> bool {
@@ -103,8 +98,7 @@ fn blocking<T>(
             Err(NetError::Errno(e)) => return Err(e),
             Err(NetError::WouldBlock) if dontwait || nonblocking(fd) => return Err(libc::EAGAIN),
             Err(NetError::WouldBlock) => {
-                crate::io::IO_WAITS.fetch_add(1, Ordering::Relaxed);
-                if sched::block_until(shared::IO_KEY, deadline) {
+                if crate::io::park_for_io(deadline) {
                     return Err(libc::EAGAIN);
                 }
             }
@@ -115,7 +109,7 @@ fn blocking<T>(
 fn status(r: Result<(), c_int>) -> c_int {
     match r {
         Ok(()) => 0,
-        Err(e) => set_errno(e),
+        Err(e) => crate::errno::fail(e),
     }
 }
 
@@ -204,7 +198,7 @@ pub unsafe extern "C" fn my_socket(domain: c_int, ty: c_int, protocol: c_int) ->
     }
     let (fd, ident) = match placeholder(ty) {
         Ok(p) => p,
-        Err(e) => return set_errno(e),
+        Err(e) => return crate::errno::fail(e),
     };
     let made = sched::with(|s, pid| {
         let host = s.procs[pid as usize].host;
@@ -215,7 +209,7 @@ pub unsafe extern "C" fn my_socket(domain: c_int, ty: c_int, protocol: c_int) ->
     });
     if !matches!(made, Some(Ok(()))) {
         libc::close(fd);
-        return set_errno(libc::ENFILE);
+        return crate::errno::fail(libc::ENFILE);
     }
     fd
 }
@@ -226,7 +220,7 @@ pub unsafe extern "C" fn my_bind(fd: c_int, addr: *const Sockaddr, len: Socklen)
         return libc::bind(fd, addr, len);
     };
     let Some(a) = parse_addr(addr, len) else {
-        return set_errno(libc::EAFNOSUPPORT);
+        return crate::errno::fail(libc::EAFNOSUPPORT);
     };
     status(blocking(fd, Wait::Never, |s, _| s.net.bind(sock, a)))
 }
@@ -294,7 +288,7 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
         return libc::connect(fd, addr, len);
     };
     let Some(dest) = parse_addr(addr, len) else {
-        return set_errno(libc::EAFNOSUPPORT);
+        return crate::errno::fail(libc::EAFNOSUPPORT);
     };
     let dgram = kind_of(sock) == KIND_DGRAM;
     let mut outside = false;
@@ -336,7 +330,7 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
         if leave_virtual_network(fd, sock, domain) {
             return libc::connect(fd, addr, len);
         }
-        return set_errno(libc::ENETUNREACH);
+        return crate::errno::fail(libc::ENETUNREACH);
     }
     status(r)
 }
@@ -350,7 +344,7 @@ pub unsafe extern "C" fn my_accept(fd: c_int, addr: *mut Sockaddr, len: *mut Soc
     // lost to EMFILE.
     let (new_fd, ident) = match placeholder(libc::SOCK_STREAM) {
         Ok(p) => p,
-        Err(e) => return set_errno(e),
+        Err(e) => return crate::errno::fail(e),
     };
     let accepted = blocking(fd, Wait::Receive(listener), |s, pid| {
         let far = s.net.accept(listener)?;
@@ -369,7 +363,7 @@ pub unsafe extern "C" fn my_accept(fd: c_int, addr: *mut Sockaddr, len: *mut Soc
         }
         Err(e) => {
             libc::close(new_fd);
-            set_errno(e)
+            crate::errno::fail(e)
         }
     }
 }
@@ -387,7 +381,7 @@ fn broken_pipe(sock: u32, flags: c_int) -> isize {
     if !quiet {
         unsafe { libc::raise(libc::SIGPIPE) };
     }
-    set_errno(libc::EPIPE) as isize
+    crate::errno::fail(libc::EPIPE) as isize
 }
 
 /// Where a datagram goes: the host and address `to` names, seen from the
@@ -434,7 +428,7 @@ pub fn send_to(
         });
         return match sent {
             Ok(n) => n as isize,
-            Err(e) => set_errno(e) as isize,
+            Err(e) => crate::errno::fail(e) as isize,
         };
     }
     let mut done = 0usize;
@@ -443,7 +437,7 @@ pub fn send_to(
             Ok(n) => done += n,
             Err(_) if done > 0 => break,
             Err(libc::EPIPE) => return broken_pipe(sock, flags),
-            Err(e) => return set_errno(e) as isize,
+            Err(e) => return crate::errno::fail(e) as isize,
         }
         if done >= len {
             break;
@@ -478,7 +472,7 @@ pub fn recv_from(
                 *from = Some(source);
                 n as isize
             }
-            Err(e) => set_errno(e) as isize,
+            Err(e) => crate::errno::fail(e) as isize,
         };
     }
     let waitall = flags & libc::MSG_WAITALL != 0 && !peek;
@@ -488,7 +482,7 @@ pub fn recv_from(
             Ok(0) => break,
             Ok(n) => done += n,
             Err(_) if done > 0 => break,
-            Err(e) => return set_errno(e) as isize,
+            Err(e) => return crate::errno::fail(e) as isize,
         }
         if !waitall || done == len {
             break;
@@ -637,7 +631,7 @@ pub unsafe extern "C" fn my_getsockname(
         a.family = k.family;
         a
     }) else {
-        return set_errno(libc::EBADF);
+        return crate::errno::fail(libc::EBADF);
     };
     store_addr(&local, addr, len);
     0
@@ -662,7 +656,7 @@ pub unsafe extern "C" fn my_getpeername(
             store_addr(&p, addr, len);
             0
         }
-        None => set_errno(libc::ENOTCONN),
+        None => crate::errno::fail(libc::ENOTCONN),
     }
 }
 
@@ -730,7 +724,7 @@ pub unsafe extern "C" fn my_setsockopt(
     } else if level == libc::SOL_SOCKET && (name == libc::SO_RCVTIMEO || name == libc::SO_SNDTIMEO)
     {
         if value.is_null() || (len as usize) < std::mem::size_of::<libc::timeval>() {
-            return set_errno(libc::EINVAL);
+            return crate::errno::fail(libc::EINVAL);
         }
         let tv = value.cast::<libc::timeval>().read_unaligned();
         let ns = tv.tv_sec as u64 * 1_000_000_000 + tv.tv_usec as u64 * 1000;
@@ -760,7 +754,7 @@ pub unsafe extern "C" fn my_getsockopt(
         return libc::getsockopt(fd, level, name, value, len);
     };
     if value.is_null() || len.is_null() || (*len as usize) < std::mem::size_of::<c_int>() {
-        return set_errno(libc::EINVAL);
+        return crate::errno::fail(libc::EINVAL);
     }
     let (kind, listening, nosigpipe) = sched::with(|s, _| {
         let k = &s.net.socks[sock as usize];

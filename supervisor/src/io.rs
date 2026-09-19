@@ -9,7 +9,7 @@
 
 use std::ffi::{c_int, c_void};
 
-use crate::sched::{self, my_id, State};
+use crate::sched::{self, my_id};
 use crate::shared;
 use crate::spin::SpinLock;
 
@@ -83,12 +83,15 @@ pub fn forked() {
 /// Times a thread of this process parked for readiness, for the report
 pub static IO_WAITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-fn park_for_io() {
+/// Park until some guest's act may have made a descriptor ready, or until
+/// `deadline`. Returns true when the deadline ended the wait. May also
+/// return early with nothing changed: callers look again.
+pub fn park_for_io(deadline: Option<u64>) -> bool {
     IO_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    sched::yield_baton(State::Blocked(shared::IO_KEY as usize), shared::IO_KEY);
+    sched::block_until(shared::IO_KEY, deadline)
 }
 
-fn wake_io() {
+pub fn wake_io() {
     let outside = !sched::on_scheduled_thread();
     sched::with(|s, pid| {
         if outside {
@@ -108,15 +111,11 @@ fn ready(fd: c_int, events: libc::c_short) -> bool {
     unsafe { libc::poll(&raw mut p, 1, 0) != 0 }
 }
 
-fn errno() -> c_int {
-    unsafe { *libc::__error() }
-}
-
 /// Run `f` once `fd` is readable.
 fn when_readable(fd: c_int, f: impl Fn() -> isize) -> isize {
     if managed(fd) {
         while !ready(fd, libc::POLLIN) {
-            park_for_io();
+            park_for_io(None);
         }
     }
     let n = f();
@@ -137,7 +136,7 @@ fn write_all(fd: c_int, buf: *const u8, len: usize) -> isize {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
             let n = libc::write(fd, buf.add(done).cast(), len - done);
-            let e = errno();
+            let e = crate::errno::get();
             libc::fcntl(fd, libc::F_SETFL, flags);
             *libc::__error() = e;
             n
@@ -145,9 +144,9 @@ fn write_all(fd: c_int, buf: *const u8, len: usize) -> isize {
         if n > 0 {
             done += n as usize;
             wake_io();
-        } else if n < 0 && errno() == libc::EAGAIN {
-            park_for_io();
-        } else if n < 0 && errno() == libc::EINTR {
+        } else if n < 0 && crate::errno::get() == libc::EAGAIN {
+            park_for_io(None);
+        } else if n < 0 && crate::errno::get() == libc::EINTR {
         } else {
             return if done > 0 { done as isize } else { n };
         }

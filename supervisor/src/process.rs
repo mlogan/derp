@@ -63,11 +63,6 @@ extern "C" {
     static environ: *const *mut c_char;
 }
 
-fn set_errno(e: c_int) -> c_int {
-    unsafe { *libc::__error() = e };
-    -1
-}
-
 /// The guest's environment without our variables.
 fn guest_env(envp: *const *mut c_char) -> Vec<CString> {
     let mut out = Vec::new();
@@ -344,7 +339,7 @@ pub unsafe extern "C" fn my_fork() -> libc::pid_t {
     if real < 0 {
         let e = *libc::__error();
         unregister_child(child);
-        return set_errno(e);
+        return crate::errno::fail(e);
     }
     sched::with(|s, _| s.procs[child as usize].real_pid = real);
     crate::coord::spawned(child, real);
@@ -393,7 +388,7 @@ pub unsafe extern "C" fn my_execve(
     }
     let exe = match rewritten(path) {
         Ok(p) => p,
-        Err(e) => return set_errno(e),
+        Err(e) => return crate::errno::fail(e),
     };
     // Same process of the run, new image: the new supervisor picks up this
     // thread's record, still holding the baton. The other threads die with
@@ -404,7 +399,7 @@ pub unsafe extern "C" fn my_execve(
     libc::execve(exe.as_ptr(), argv.cast(), env_ptrs.as_ptr().cast());
     let e = *libc::__error();
     restore_threads(&retired);
-    set_errno(e)
+    crate::errno::fail(e)
 }
 
 enum Waited {
@@ -428,7 +423,7 @@ unsafe fn wait_for_child(
     let which = if vpid > 0 {
         match proc_of(vpid) {
             Some(p) => Some(p),
-            None => return set_errno(libc::ECHILD),
+            None => return crate::errno::fail(libc::ECHILD),
         }
     } else {
         None
@@ -451,7 +446,7 @@ unsafe fn wait_for_child(
                 let rc = libc::wait4(real, status, options & !libc::WNOHANG, rusage);
                 return if rc < 0 { rc } else { vpid_of(child) };
             }
-            Waited::NoChild => return set_errno(libc::ECHILD),
+            Waited::NoChild => return crate::errno::fail(libc::ECHILD),
             Waited::NotYet if options & libc::WNOHANG != 0 => return 0,
             Waited::NotYet => {
                 sched::yield_baton(State::Blocked(shared::WAIT_KEY as usize), shared::WAIT_KEY);
@@ -566,7 +561,7 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
         return libc::kill(vpid, sig);
     }
     let Some(target) = proc_of(vpid) else {
-        return set_errno(libc::ESRCH);
+        return crate::errno::fail(libc::ESRCH);
     };
     let known = sched::with(|s, _| {
         let p = &s.procs[target as usize];
@@ -574,7 +569,7 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
     })
     .flatten();
     let Some(real) = known else {
-        return set_errno(libc::ESRCH);
+        return crate::errno::fail(libc::ESRCH);
     };
     if target == sched::pid() || sig == 0 {
         return libc::kill(real, sig);

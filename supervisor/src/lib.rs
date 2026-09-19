@@ -8,6 +8,7 @@
 mod alloc;
 mod coord;
 mod determinism;
+mod errno;
 mod files;
 mod gcd;
 mod hostfs;

@@ -1,5 +1,7 @@
-//! Spawn a (rewritten) guest with ASLR disabled and the supervisor dylib
-//! injected, and collect the supervisor's end-of-run report.
+//! Run guests under one scheduler: spawn each with ASLR disabled and the
+//! supervisor dylib injected, serve their requests over the run's socket
+//! (rewriting spawned programs, watching their children), pass the baton on
+//! when a process that held it dies, and collect the reports.
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
@@ -7,7 +9,7 @@ use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
-use crate::coord::{Coordinator, Death, Totals};
+use crate::coord::{Coordinator, Totals};
 use crate::shared;
 
 /// Not in the libc crate; from `<spawn.h>` on Darwin.
@@ -17,8 +19,6 @@ pub struct Launch {
     pub exe: PathBuf,
     pub args: Vec<OsString>,
     pub dylib: Option<PathBuf>,
-    /// Extra `KEY=VALUE` pairs for the child's environment
-    pub env: Vec<(String, String)>,
     pub disable_aslr: bool,
     /// Redirect the guest's stdout to this file (created or truncated)
     pub stdout: Option<PathBuf>,
@@ -30,10 +30,6 @@ pub struct Launch {
     /// See `Run::rewrite`
     pub rewrite: Option<crate::rewrite::Options>,
 }
-
-/// `name=address` pairs of the run's virtual hosts, for test programs;
-/// real programs learn about peers from their own arguments.
-pub const HOSTS_VAR: &str = "REWRITE_HOSTS";
 
 /// Tells the supervisor to set up the stubs' region and nothing else
 pub const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
@@ -61,8 +57,7 @@ impl Report {
     }
 
     pub fn get_u64(&self, key: &str) -> Option<u64> {
-        self.get(key)
-            .and_then(|v| v.trim_start_matches("0x").parse().ok())
+        self.get(key).and_then(|v| v.parse().ok())
     }
 }
 
@@ -113,8 +108,6 @@ pub struct Run {
     /// the address `10.0.0.(i + 1)`.
     pub hosts: Vec<String>,
     pub dylib: Option<PathBuf>,
-    /// Extra `KEY=VALUE` pairs for every guest's environment
-    pub env: Vec<(String, String)>,
     /// Whether guests inherit the launcher's environment underneath what
     /// the run sets. Run-file runs do not: the shell's variables would be
     /// an unrecorded input, and their total length moves the guest's stack.
@@ -180,13 +173,7 @@ fn spawn(
     ];
     // What the run sets replaces what we inherited: `getenv` returns the
     // first match, so a second `HOME` further down would never be seen.
-    let set: Vec<&String> = run
-        .env
-        .iter()
-        .chain(&guest.env)
-        .chain(extra_env)
-        .map(|(k, _)| k)
-        .collect();
+    let set: Vec<&String> = guest.env.iter().chain(extra_env).map(|(k, _)| k).collect();
     let mut env: Vec<CString> = std::env::vars_os()
         .filter(|_| run.inherit_env)
         .filter(|(k, _)| !ours.iter().any(|o| k == o))
@@ -212,7 +199,7 @@ fn spawn(
             }
         }
     }
-    for (k, v) in run.env.iter().chain(&guest.env).chain(extra_env) {
+    for (k, v) in guest.env.iter().chain(extra_env) {
         env.push(CString::new(format!("{k}={v}")).unwrap());
     }
 
@@ -631,25 +618,16 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
         channel = Some(c);
         guest_sock = Some(g);
     }
-    let host_table = coord.map(|c| {
+    if let Some(c) = coord {
         c.set_net_latency(run.net_latency_ns);
-        c.add_hosts(&run.hosts)
-    });
+        c.add_hosts(&run.hosts);
+    }
     for guest in &run.guests {
-        let mut env = vec![
-            ("REWRITE_SEED".to_string(), run.seed.to_string()),
-            (
-                "REWRITE_QUANTUM".to_string(),
-                format!("{}..{}", run.quantum.0, run.quantum.1),
-            ),
-        ];
+        let mut env = vec![("REWRITE_SEED".to_string(), run.seed.to_string())];
         if run.passive {
             env.push((PASSIVE_VAR.into(), "1".into()));
         }
         env.push((shared::EXTERNAL_VAR.into(), external_objects()));
-        if let Some(table) = &host_table {
-            env.push((HOSTS_VAR.into(), table.clone()));
-        }
         if let Some(coord) = coord {
             let pid = coord.register(guest.host);
             debug_assert_eq!(pid as usize, procs.len());
@@ -672,12 +650,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     }
 
     if let Some(coord) = coord {
-        let pids: Vec<u32> = (0..procs.len() as u32).collect();
-        coord.wait_attached(
-            &pids,
-            |pid| procs[pid as usize].reap(false),
-            std::time::Duration::from_secs(30),
-        )?;
+        coord.wait_attached(procs.len() as u32, |pid| procs[pid as usize].reap(false))?;
     }
     // Guests that died before attaching were reaped above; the rest are
     // watched. A failed watch means the process went in between.
@@ -727,7 +700,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
             }
             let Some(coord) = coord else { continue };
             let status = procs[index].status.unwrap_or(0);
-            if coord.process_died(index as u32, status) == Death::Deadlock {
+            if coord.process_died(index as u32, status) {
                 deadlock = true;
                 end_run(procs);
             }
@@ -789,7 +762,6 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         }],
         hosts: vec!["h0".into()],
         dylib: cfg.dylib.clone(),
-        env: cfg.env.clone(),
         inherit_env: true,
         disable_aslr: cfg.disable_aslr,
         seed: cfg.seed,

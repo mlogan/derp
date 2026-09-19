@@ -317,7 +317,6 @@ fn join_run(path: &str) -> (&'static Shared, usize) {
     let mut s = sh.lock();
     let p = &mut s.procs[pid as usize];
     p.real_pid = unsafe { libc::getpid() };
-    p.mapped_at = mem as u64;
     p.state = shared::P_LIVE;
     drop(s);
     PID.store(pid, Ordering::Relaxed);
@@ -400,7 +399,6 @@ pub fn become_forked_child(child: u32) {
         let mut s = sh.lock();
         let p = &mut s.procs[child as usize];
         p.real_pid = unsafe { libc::getpid() };
-        p.mapped_at = shared::MAP_ADDR as u64;
         p.state = shared::P_LIVE;
     }
     PID.store(child, Ordering::Relaxed);

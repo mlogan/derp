@@ -39,13 +39,19 @@ seed: 7                  # optional; the command line overrides these four
 quantum: 1000..10000
 mem-hook-rate: 1/16
 net-latency: 5ms
+env: { LOG_LEVEL: debug }   # for every process (guests start from a fixed environment)
+pass-env: [SSL_CERT_FILE]   # inherited from yours on purpose; nothing else is
+allow: [/opt/site-content]  # extra paths every host may touch
 hosts:                   # in order: 10.0.0.1, 10.0.0.2, ...
   - name: alpha
+    files: [site]        # copied into the host's fresh directory
     processes:
       - [server, --port, 8080]          # argv verbatim
       - client alpha 8080               # or a line, split on whitespace
       - argv: [worker, "two words"]     # or a map, with an environment
         env: { MODE: fast }
+      - argv: [httpd, --port, 80]       # a server that never exits: killed
+        daemon: true                    # when every other process is done
 ```
 
 Guests of a run file do not inherit your shell's environment. They start

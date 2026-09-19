@@ -33,17 +33,6 @@ pub struct Totals {
     pub net_passthrough: u64,
 }
 
-/// What a guest's death meant for the run
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Death {
-    /// Someone else holds the baton, or the run is over
-    Quiet,
-    /// The dead process held the baton and it was passed on
-    HandedOn,
-    /// The dead process held the baton and every surviving thread is blocked
-    Deadlock,
-}
-
 static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
 
 impl Coordinator {
@@ -102,17 +91,12 @@ impl Coordinator {
         self.shared.lock().net.latency_ns = ns;
     }
 
-    /// Fill the host table, in declaration order. Returns `name=address`
-    /// pairs for `REWRITE_HOSTS`.
-    pub fn add_hosts(&self, names: &[String]) -> String {
+    /// Fill the host table, in declaration order: host `i` is `10.0.0.(i + 1)`.
+    pub fn add_hosts(&self, names: &[String]) {
         let mut s = self.shared.lock();
-        let mut out = Vec::new();
         for name in names {
-            let i = s.net.add_host(name.as_bytes());
-            let addr = std::net::Ipv4Addr::from(s.net.hosts[i as usize].addr);
-            out.push(format!("{name}={addr}"));
+            s.net.add_host(name.as_bytes());
         }
-        out.join(",")
     }
 
     /// Register a process and its main thread before it is spawned, so
@@ -124,36 +108,21 @@ impl Coordinator {
         pid
     }
 
-    /// Wait until every process in `pids` has attached or `gone(pid)` says
-    /// it died first. Fails if a guest mapped the state somewhere else.
-    pub fn wait_attached(
-        &self,
-        pids: &[u32],
-        mut gone: impl FnMut(u32) -> bool,
-        timeout: Duration,
-    ) -> io::Result<()> {
+    /// Wait until each of the first `n` processes has attached, or
+    /// `gone(index)` says it died first. A guest that cannot place the
+    /// state at its fixed address dies saying so.
+    pub fn wait_attached(&self, n: u32, mut gone: impl FnMut(u32) -> bool) -> io::Result<()> {
         let start = Instant::now();
         loop {
             let mut waiting = false;
-            for &pid in pids {
-                let (state, at) = {
-                    let s = self.shared.lock();
-                    let p = &s.procs[pid as usize];
-                    (p.state, p.mapped_at)
-                };
-                if state == shared::P_STARTING {
-                    waiting |= !gone(pid);
-                } else if state == shared::P_LIVE && at != shared::MAP_ADDR as u64 {
-                    return Err(io::Error::other(format!(
-                        "guest {pid} mapped the scheduler state at {at:#x}, not {:#x}",
-                        shared::MAP_ADDR
-                    )));
-                }
+            for pid in 0..n {
+                let starting = self.shared.lock().procs[pid as usize].state == shared::P_STARTING;
+                waiting |= starting && !gone(pid);
             }
             if !waiting {
                 return Ok(());
             }
-            if start.elapsed() > timeout {
+            if start.elapsed() > Duration::from_secs(30) {
                 return Err(io::Error::other(
                     "a guest never attached to the scheduler (is the supervisor dylib injected?)",
                 ));
@@ -170,18 +139,18 @@ impl Coordinator {
         }
     }
 
-    /// Call after reaping `pid`.
-    pub fn process_died(&self, pid: u32, status: i32) -> Death {
+    /// Call after reaping `pid`. Returns true when the process held the
+    /// baton and every surviving thread is blocked: a deadlock.
+    pub fn process_died(&self, pid: u32, status: i32) -> bool {
         let mut s = self.shared.lock();
         match s.process_died(pid, status) {
-            Handoff::Stay => Death::Quiet,
-            Handoff::Switch { to, .. } => {
+            Some(Handoff::Switch { to, .. }) => {
                 drop(s);
                 self.shared.unpark(to);
-                Death::HandedOn
+                false
             }
-            Handoff::Idle if s.any_alive() => Death::Deadlock,
-            Handoff::Idle => Death::Quiet,
+            Some(Handoff::Idle) => s.any_alive(),
+            Some(Handoff::Stay) | None => false,
         }
     }
 

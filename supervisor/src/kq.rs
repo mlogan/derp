@@ -12,7 +12,6 @@
 use std::ffi::{c_int, c_void};
 
 use crate::sched::{self, my_id};
-use crate::shared;
 use crate::shared::netstate::{KIND_DGRAM, S_CONNECTED, S_LISTENING};
 use crate::spin::SpinLock;
 
@@ -253,7 +252,7 @@ pub unsafe extern "C" fn my_kevent(
         }
         // A change (a user event triggered, say) may be what a waiter on
         // this kqueue in another thread is waiting for
-        sched::with(|s, _| s.wake_io());
+        crate::io::wake_io();
     }
     if events.is_null() || nevents <= 0 {
         return 0;
@@ -286,8 +285,7 @@ pub unsafe extern "C" fn my_kevent(
         if n > 0 || timeout_ns == Some(0) {
             return n as c_int;
         }
-        crate::io::IO_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if sched::block_until(shared::IO_KEY, deadline) {
+        if crate::io::park_for_io(deadline) {
             return 0;
         }
     }

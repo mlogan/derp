@@ -177,10 +177,87 @@ Found while re-running the curl/Python test next to the others (1 run in
   stack address, byte-identical trace. The test fails if inheritance is
   switched back on (checked).
 
+## 6. Review (2026-09-19)
+
+Five read-only reviewers (scheduler core, virtual network, interposers,
+launcher and rewriter, simplifications). Findings were checked against the
+code, and two by experiment, before anything was changed.
+
+Fixed, with regression tests where marked (T):
+- Scheduler: no baton holder after a process died over a deadlock (T); a
+  wake from an outside thread lost between the block check and the block;
+  `kill` then `waitpid` a false deadlock (T); SIGTERM handlers would run
+  off the baton (delivered as SIGKILL now); exiting threads and processes
+  without outside threads aborted instead of waiting for an outside wake;
+  signals to `exec`-retired thread records; leaked thread port rights;
+  timeout overflow; 1,024-thread and 256-process caps raised to 16,384 and
+  1,024 (a thread-per-request server reached the old one quickly).
+- Virtual network: payloads in flight to a reused slot stayed counted and
+  the idle clock jumped to `u64::MAX` (T); `shutdown` then `close`
+  overflowed the flight ring with a second FIN (T); datagrams ignored the
+  bound address (T); `readv`/`writev` split datagrams; missed `EV_CLEAR`
+  write edges; kqueue registry after `fork` and `dup2`; UNIX datagram
+  connects to system sockets; `select` on a bad descriptor; accepted
+  sockets and `O_NONBLOCK`; references after an `execve` that closed all.
+- Interposers: **the path guard did nothing under the default scratch
+  directory** (it is below `/var/folders`, a system location) (T); paths
+  relative to a directory descriptor; eight more guarded calls; a child's
+  real pid of 0 made `wait4` and `kill` group-wide; `vfork`; spawns from
+  outside threads inherited `REWRITE_PROC`; outside threads drew from the
+  seeded entropy stream, and fork children shared their parent's; private
+  spinlocks held across `fork`; fd 240 closed by close-everything loops;
+  kernel sockets and the fixed-width external list; `flock` unlock with
+  `LOCK_NB`; allocator size overflow.
+- `dispatch_semaphore_wait` deadlines (T): libdispatch reads the clock
+  through our interposers, so a 2 s timeout expired after 1 ms of virtual
+  time. Found by running a guest, as the reviewer suggested.
+- Launcher: daemons never ended a `--native` run (T); a failed `waitpid`
+  hung it; early deaths reported to the scheduler twice; busy loop at
+  socket EOF; cache temporary name and key; shared-state file under `/tmp`.
+- Run file: unknown keys in a process map (T), reserved variable names (T),
+  host names that collide with `stdout.<n>` or differ only in case (T).
+
+Refuted by experiment: that `malloc_type_*` entry points bypass the
+interposed allocator. `getline` grows a guest buffer inside the
+deterministic heap, and C++ `new` lands there too.
+
+Simplified: the GCD shims (387 lines to 84, one macro), one descriptor
+classifier in `io.rs`, one `errno` helper, one I/O wait and wake, dead
+fields and the launcher's placement check, `REWRITE_HOSTS` and the
+always-empty `env` fields, `Death` and the overloaded `Handoff::Stay`.
+
+Recorded, not fixed:
+- A `poll` or `kevent` that mixes virtual sockets with descriptors whose
+  peer is outside the run is not woken by the outside ones.
+- A process that dies holding the shared spinlock (an outside thread
+  killed mid-wake) wedges the run. Low probability, no recovery.
+- Per-process hook counts are wrong when an outside thread expires the
+  quantum, and across `execve` (report only).
+- Wake keys are per process: process-shared mutexes and condition variables
+  across `fork` never wake. `pthread_rwlock`, `sem_wait` and
+  `pthread_cond_timedwait_relative_np` are not interposed.
+- An outside thread freeing a block of the deterministic heap perturbs its
+  free lists at a real-time moment.
+- Unguarded path calls that remain: `getattrlist`, `getxattr`/`setxattr`,
+  `chflags`, `renamex_np`, `fclonefileat`, `shm_open`/`sem_open` names.
+- A reply left in the launcher socket by a guest killed mid-request would
+  desynchronize later requests.
+- The rewritten executable's cache path (under `$TMPDIR`) is on the guest's
+  stack; a different `TMPDIR` moves stack addresses.
+
+Simplifications left for later (each is mechanical but touches many lines):
+one vocabulary (`proc`/`vpid`/`real_pid`; "run file" instead of "manifest"
+in code; "scheduled" and "outside" threads) and one guard idiom; `Launch`
+folded into `Run`; a `Ring` type for the two rings in `netstate.rs`; the
+test boilerplate in `multiproc_tests.rs`; moving the pthread emulation out
+of `interpose.rs`, the descriptor calls out of `net.rs`, and the run-file
+policy out of `main.rs`; splitting `supervise`, `my_kevent` and
+`yield_baton_as`.
+
 ## Test summary
 
-`cargo test -p rewrite -p rewrite-supervisor`: all pass (25 + 4 + 21 + 3 + 4
-in `rewrite`, 20 unit tests in the supervisor); clippy clean.
+`cargo test -p rewrite -p rewrite-supervisor`: all pass (28 + 4 + 24 + 3 + 4
+in `rewrite`, 23 unit tests in the supervisor); clippy clean.
 
 ## Follow-ups
 

@@ -6,9 +6,10 @@
 //   tcp_echo server <port>|--unix <path> <connections>
 //   tcp_echo client <host>|--unix <path> <port> <connections>
 //
-// <host> is a dotted address or a name from REWRITE_HOSTS.
+// <host> is a dotted address or a virtual host's name.
 #include <arpa/inet.h>
 #include <errno.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,20 +26,13 @@ static void die(const char *what) {
 }
 
 static int resolve(const char *host, struct in_addr *out) {
-    if (inet_pton(AF_INET, host, out) == 1) return 0;
-    const char *table = getenv("REWRITE_HOSTS");
-    size_t n = strlen(host);
-    while (table && *table) {
-        if (strncmp(table, host, n) == 0 && table[n] == '=') {
-            char addr[32] = {0};
-            size_t len = strcspn(table + n + 1, ",");
-            memcpy(addr, table + n + 1, len < 31 ? len : 31);
-            return inet_pton(AF_INET, addr, out) == 1 ? 0 : -1;
-        }
-        table = strchr(table, ',');
-        if (table) table++;
-    }
-    return -1;
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0) return -1;
+    *out = ((struct sockaddr_in *)res->ai_addr)->sin_addr;
+    freeaddrinfo(res);
+    return 0;
 }
 
 static socklen_t make_addr(const char *host, const char *port, const char *path,

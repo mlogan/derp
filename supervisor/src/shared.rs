@@ -97,13 +97,11 @@ pub const PER_YIELD_NS: u64 = 1_000_000;
 /// Key of sleeping threads: nothing wakes it but the deadline
 pub const SLEEP_KEY: u64 = 0x7FFF_FFFF_0002;
 
-pub const T_FREE: u32 = 0;
 pub const T_RUNNABLE: u32 = 1;
 pub const T_RUNNING: u32 = 2;
 pub const T_BLOCKED: u32 = 3;
 pub const T_EXITED: u32 = 4;
 
-pub const P_FREE: u32 = 0;
 /// Registered by its creator; the process has not attached yet
 pub const P_STARTING: u32 = 1;
 pub const P_LIVE: u32 = 2;
@@ -158,9 +156,6 @@ pub struct ProcRec {
     pub outside_wakes: u64,
     /// Some thread of this process runs outside the scheduler (GCD workers)
     pub has_outside_threads: bool,
-    /// Address the process mapped the shared file at, for the launcher's
-    /// placement check
-    pub mapped_at: u64,
 }
 
 #[repr(C)]
@@ -563,7 +558,8 @@ impl State {
     /// A process is gone (exit, `_exit`, crash): retire its threads, and if
     /// one of them held the baton pass it on. Only the launcher calls this,
     /// after reaping, so nothing of the process can still be running.
-    pub fn process_died(&mut self, pid: u32, status: i32) -> Handoff {
+    /// None when the process did not hold the baton.
+    pub fn process_died(&mut self, pid: u32, status: i32) -> Option<Handoff> {
         self.procs[pid as usize].state = P_EXITED;
         self.procs[pid as usize].exit_status = status;
         // Its descriptors are closed: peers may see EOF or EPIPE now
@@ -586,10 +582,7 @@ impl State {
                 t.deadline = 0;
             }
         }
-        match held {
-            Some(id) => self.hand_off(Some((id, T_EXITED, 0)), SITE_PROCESS_DIED),
-            None => Handoff::Stay,
-        }
+        held.map(|id| self.hand_off(Some((id, T_EXITED, 0)), SITE_PROCESS_DIED))
     }
 
     /// An exited, unreaped child of `parent`: the one named, or the lowest.
@@ -623,7 +616,7 @@ impl State {
     pub fn any_alive(&self) -> bool {
         self.threads[..self.nthreads as usize]
             .iter()
-            .any(|t| t.state != T_EXITED && t.state != T_FREE)
+            .any(|t| t.state != T_EXITED)
     }
 }
 

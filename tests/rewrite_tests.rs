@@ -70,7 +70,6 @@ fn stubs_are_slide_proof() {
         exe: rw_path.clone(),
         args: vec!["1".into()],
         dylib: Some(common::supervisor_dylib()),
-        env: vec![],
         disable_aslr: false,
         stdout: None,
         seed: 0,

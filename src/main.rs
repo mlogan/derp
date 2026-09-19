@@ -27,7 +27,7 @@ options:
   --aslr                               leave ASLR on
   --native                             run the original binary without the dylib
   --manifest FILE                      run file (YAML): hosts and their processes
-  --scratch DIR                        working directory and TMPDIR of a manifest run
+  --scratch DIR                        where a run file's host directories are made, fresh
                                        (default: a directory under the system temp dir)
   --capture                            manifest run: each guest's stdout goes to stdout.<index>
                                        in the scratch directory instead of ours
@@ -197,7 +197,6 @@ fn run_guest(
         exe,
         args,
         dylib: dylib_for(cli)?,
-        env: Vec::new(),
         disable_aslr: cli.disable_aslr,
         stdout,
         seed: cli.opts.seed,
@@ -338,7 +337,6 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         guests,
         hosts: m.hosts.iter().map(|h| h.name.clone()).collect(),
         dylib: dylib_for(cli)?,
-        env: Vec::new(),
         inherit_env: false,
         disable_aslr: cli.disable_aslr,
         seed: cli.opts.seed,

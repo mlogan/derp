@@ -66,8 +66,7 @@ unsafe fn wait(fds: &mut [libc::pollfd], timeout_ns: Option<u64>) -> c_int {
         if ready != 0 || timeout_ns == Some(0) {
             return ready;
         }
-        crate::io::IO_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if sched::block_until(shared::IO_KEY, deadline) {
+        if crate::io::park_for_io(deadline) {
             return scan(fds, &socks);
         }
     }

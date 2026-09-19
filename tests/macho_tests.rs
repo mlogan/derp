@@ -14,7 +14,6 @@ fn run_capture(
         exe: exe.to_path_buf(),
         args: Vec::new(),
         dylib,
-        env: Vec::new(),
         disable_aslr: true,
         stdout: Some(out_path.clone()),
         seed: 0,

@@ -117,14 +117,11 @@ pub struct Sock {
     pub state: u8,
     pub kind: u8,
     pub family: u8,
-    pub nonblocking: bool,
     /// The peer sent FIN (closed or shut down its sending side)
     pub fin: bool,
     /// We shut down our sending side
     pub shut_wr: bool,
     pub shut_rd: bool,
-    /// Created by a `connect` and not yet returned by `accept`
-    pub pending: bool,
     /// `SO_NOSIGPIPE`: a write to a closed peer is `EPIPE` without the signal
     pub nosigpipe: bool,
     /// A datagram socket with a default destination, which also filters
@@ -145,14 +142,11 @@ pub struct Sock {
     backlog_max: u32,
     rx_head: u32,
     rx_len: u32,
-    pub bytes_in: u64,
     /// Bumped whenever something arrives (data, FIN, a queued connection)
     /// and whenever the send window opens: what an edge-triggered waiter
     /// compares against, since it cannot see what happened between looks.
     pub rd_events: u64,
     pub wr_events: u64,
-    /// Datagrams lost because the ring was full or nobody was bound
-    pub dropped: u64,
     fl_head: u32,
     fl_len: u32,
     /// Stream bytes in flight to this socket; they hold part of its window
@@ -179,13 +173,13 @@ pub struct Net {
     idents: [u64; MAX_SOCKETS],
     pub socks: [Sock; MAX_SOCKETS],
     fdrefs: [FdRef; MAX_FDREFS],
-    /// Totals for the report
     /// The run's virtual clock, mirrored here by `State` whenever it moves
     pub now: u64,
     /// Delay between different hosts; traffic within a host is immediate
     pub latency_ns: u64,
     in_flight: u32,
     next_due: u64,
+    // Totals for the report
     pub connections: u64,
     pub datagrams: u64,
     pub dropped: u64,
@@ -282,16 +276,13 @@ impl Net {
         s.state = S_NEW;
         s.kind = kind;
         s.family = family;
-        s.nonblocking = false;
         s.fin = false;
         s.shut_wr = false;
         s.shut_rd = false;
-        s.pending = false;
         s.nosigpipe = false;
         s.has_peer = false;
         s.rcv_timeout_ns = 0;
         s.snd_timeout_ns = 0;
-        s.dropped = 0;
         s.host = host;
         s.refs = 0;
         s.far_end = NO_SOCK;
@@ -301,7 +292,6 @@ impl Net {
         s.backlog_max = 0;
         s.rx_head = 0;
         s.rx_len = 0;
-        s.bytes_in = 0;
         s.rd_events = 0;
         s.wr_events = 0;
         s.fl_head = 0;
@@ -446,7 +436,6 @@ impl Net {
         {
             let f = &mut self.socks[far as usize];
             f.state = S_CONNECTED;
-            f.pending = true;
             f.local = far_local;
             f.peer = near_local;
             f.far_end = sock;
@@ -477,7 +466,6 @@ impl Net {
         let far = l.backlog[0];
         l.backlog.copy_within(1..l.backlog_len as usize, 0);
         l.backlog_len -= 1;
-        self.socks[far as usize].pending = false;
         Ok(far)
     }
 
@@ -585,7 +573,6 @@ impl Net {
                 data.len()
             }
         };
-        self.socks[dst as usize].bytes_in += taken as u64;
         self.bytes += taken as u64;
         taken
     }
@@ -728,7 +715,6 @@ impl Net {
                         self.land(sock, len);
                         let d = &mut self.socks[sock as usize];
                         d.fl_stream -= len as u32;
-                        d.bytes_in += len as u64;
                         self.bytes += len as u64;
                         // Landing frees flight-ring room: the sender's
                         // window may have opened
@@ -743,7 +729,6 @@ impl Net {
                         let data_len = u64::from(u32::from_le_bytes(data_len));
                         if len <= RING - self.socks[sock as usize].rx_len as usize {
                             self.land(sock, len);
-                            self.socks[sock as usize].bytes_in += data_len;
                             self.bytes += data_len;
                         } else {
                             self.flight_skip(sock, len);
@@ -906,7 +891,6 @@ impl Net {
             if family == FAMILY_UNIX {
                 return Err(WouldBlock);
             }
-            self.socks[sock as usize].dropped += 1;
             self.dropped += 1;
         }
         self.datagrams += 1;

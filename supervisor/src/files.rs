@@ -3,24 +3,13 @@
 //! must not hold the baton. Which paths a guest may name is `hostfs`'s.
 
 use std::ffi::{c_char, c_int, c_void};
-use std::sync::atomic::Ordering;
 
 use crate::sched::{self, my_id};
-use crate::shared;
 
 extern "C" {
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
     #[link_name = "open$NOCANCEL"]
     pub fn open_nocancel(path: *const c_char, flags: c_int, ...) -> c_int;
-}
-
-fn park_for_lock() {
-    crate::io::IO_WAITS.fetch_add(1, Ordering::Relaxed);
-    sched::block_until(shared::IO_KEY, None);
-}
-
-fn errno() -> c_int {
-    unsafe { *libc::__error() }
 }
 
 /// Locks are released by an unlock, a close or a process death, and each
@@ -33,7 +22,7 @@ pub unsafe extern "C" fn my_flock(fd: c_int, op: c_int) -> c_int {
     }
     if op & libc::LOCK_UN != 0 {
         let rc = libc::flock(fd, op);
-        sched::with(|s, _| s.wake_io());
+        crate::io::wake_io();
         return rc;
     }
     if op & libc::LOCK_NB != 0 {
@@ -41,10 +30,10 @@ pub unsafe extern "C" fn my_flock(fd: c_int, op: c_int) -> c_int {
     }
     loop {
         let rc = libc::flock(fd, op | libc::LOCK_NB);
-        if rc == 0 || errno() != libc::EWOULDBLOCK {
+        if rc == 0 || crate::errno::get() != libc::EWOULDBLOCK {
             return rc;
         }
-        park_for_lock();
+        crate::io::park_for_io(None);
     }
 }
 
@@ -54,13 +43,14 @@ pub unsafe fn record_lock(fd: c_int, wait: bool, lock: *mut libc::flock) -> c_in
     loop {
         let rc = libc::fcntl(fd, libc::F_SETLK, lock);
         if rc == 0 && unlocking {
-            sched::with(|s, _| s.wake_io());
+            crate::io::wake_io();
         }
-        let busy = rc != 0 && (errno() == libc::EAGAIN || errno() == libc::EACCES);
+        let busy =
+            rc != 0 && (crate::errno::get() == libc::EAGAIN || crate::errno::get() == libc::EACCES);
         if !wait || !busy {
             return rc;
         }
-        park_for_lock();
+        crate::io::park_for_io(None);
     }
 }
 

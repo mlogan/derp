@@ -140,7 +140,6 @@ fn run_mode(
         exe: exe.to_path_buf(),
         args: args.iter().map(std::convert::Into::into).collect(),
         dylib,
-        env: Vec::new(),
         disable_aslr: true,
         stdout: Some(out_path.clone()),
         seed,

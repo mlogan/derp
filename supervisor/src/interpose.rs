@@ -357,11 +357,6 @@ fn unfair_owner_is_outside(value: u64) -> bool {
     owner != 0 && !sched::is_scheduled_thread(owner) && !sched::is_scheduled_thread(owner | 3)
 }
 
-fn timed_out_errno() -> c_int {
-    unsafe { *libc::__error() = libc::ETIMEDOUT };
-    -1
-}
-
 extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int {
     if my_id().is_none() {
         return unsafe { __ulock_wait(op, addr, value, timeout_us) };
@@ -380,7 +375,7 @@ extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: 
     if futex_block(addr, u64::from(timeout_us) * 1000) {
         0
     } else {
-        timed_out_errno()
+        crate::errno::fail(libc::ETIMEDOUT)
     }
 }
 
@@ -408,7 +403,7 @@ extern "C" fn my_ulock_wait2(
     if futex_block(addr, timeout_ns) {
         0
     } else {
-        timed_out_errno()
+        crate::errno::fail(libc::ETIMEDOUT)
     }
 }
 
@@ -460,7 +455,7 @@ extern "C" fn my_os_sync_wait_on_address_with_timeout(
     if futex_block(addr, timeout_ns.max(1)) {
         0
     } else {
-        timed_out_errno()
+        crate::errno::fail(libc::ETIMEDOUT)
     }
 }
 

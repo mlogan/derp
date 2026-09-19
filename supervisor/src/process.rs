@@ -16,6 +16,7 @@ use crate::spin::SpinLock;
 
 /// Not in the libc crate; from `<spawn.h>` on Darwin
 const POSIX_SPAWN_DISABLE_ASLR: libc::c_short = 0x0100;
+const POSIX_SPAWN_SETEXEC: libc::c_short = 0x0040;
 
 /// What a child needs in its environment to join the run, captured at
 /// startup because the guest may rewrite or clear its own environment.
@@ -204,6 +205,27 @@ unsafe fn spawn_rewritten(
         Ok(p) => p,
         Err(e) => return e,
     };
+    // With POSIX_SPAWN_SETEXEC this is an exec: the new image replaces this
+    // process (Python's launcher stub becomes the real interpreter so).
+    let mut flags: libc::c_short = 0;
+    if !attr.is_null() {
+        libc::posix_spawnattr_getflags(attr, &raw mut flags);
+    }
+    if flags & POSIX_SPAWN_SETEXEC != 0 {
+        let env = child_env(envp, sched::pid());
+        let env_ptrs = pointers(&env);
+        let retired = retire_other_threads();
+        let rc = libc::posix_spawn(
+            pid_out,
+            exe.as_ptr(),
+            actions,
+            attr,
+            argv,
+            env_ptrs.as_ptr(),
+        );
+        restore_threads(&retired);
+        return rc;
+    }
     let child = register_child();
     let env = child_env(envp, child);
     let env_ptrs = pointers(&env);
@@ -299,6 +321,32 @@ pub unsafe extern "C" fn my_fork() -> libc::pid_t {
     vpid_of(child)
 }
 
+/// Before an exec: the other threads of this process die with the old
+/// image. Returns what to put back if the exec fails.
+fn retire_other_threads() -> Vec<(usize, u32)> {
+    let me = my_id().unwrap();
+    sched::with(|s, pid| {
+        let n = s.nthreads as usize;
+        let mut retired = Vec::new();
+        for (i, t) in s.threads[..n].iter_mut().enumerate() {
+            if t.pid == pid && i != me && t.state != shared::T_EXITED {
+                retired.push((i, t.state));
+                t.state = shared::T_EXITED;
+            }
+        }
+        retired
+    })
+    .unwrap_or_default()
+}
+
+fn restore_threads(retired: &[(usize, u32)]) {
+    sched::with(|s, _| {
+        for &(i, state) in retired {
+            s.threads[i].state = state;
+        }
+    });
+}
+
 pub unsafe extern "C" fn my_execve(
     path: *const c_char,
     argv: *const *mut c_char,
@@ -314,28 +362,12 @@ pub unsafe extern "C" fn my_execve(
     // Same process of the run, new image: the new supervisor picks up this
     // thread's record, still holding the baton. The other threads die with
     // the old image.
-    let me = my_id().unwrap();
     let env = child_env(envp, sched::pid());
     let env_ptrs = pointers(&env);
-    let retired = sched::with(|s, pid| {
-        let n = s.nthreads as usize;
-        let mut retired = Vec::new();
-        for (i, t) in s.threads[..n].iter_mut().enumerate() {
-            if t.pid == pid && i != me && t.state != shared::T_EXITED {
-                retired.push((i, t.state));
-                t.state = shared::T_EXITED;
-            }
-        }
-        retired
-    })
-    .unwrap_or_default();
+    let retired = retire_other_threads();
     libc::execve(exe.as_ptr(), argv.cast(), env_ptrs.as_ptr().cast());
     let e = *libc::__error();
-    sched::with(|s, _| {
-        for &(i, state) in &retired {
-            s.threads[i].state = state;
-        }
-    });
+    restore_threads(&retired);
     set_errno(e)
 }
 
@@ -422,15 +454,38 @@ fn in_run() -> bool {
     crate::coord::connected()
 }
 
-pub extern "C" fn my_getpid() -> libc::pid_t {
-    if !in_run() {
+extern "C" {
+    fn _dyld_get_shared_cache_range(length: *mut usize) -> *const std::ffi::c_void;
+}
+
+/// Whether `address` is code of a system library. Virtual pids are for the
+/// guest's own code and the libraries it brought. libSystem's internals
+/// hand `getpid()` to the kernel (unified logging asks `proc_pidinfo` about
+/// it while CoreFoundation initializes, and crashes on an error), so they
+/// must see the real one.
+fn in_system_library(address: usize) -> bool {
+    static RANGE: SpinLock<Option<(usize, usize)>> = SpinLock::new(None);
+    let mut range = RANGE.lock();
+    let (start, len) = *range.get_or_insert_with(|| {
+        let mut len = 0usize;
+        let start = unsafe { _dyld_get_shared_cache_range(&raw mut len) };
+        (start as usize, len)
+    });
+    address >= start && address - start < len
+}
+
+/// `caller` is the return address of the `getpid` call, from the shim.
+#[no_mangle]
+pub extern "C" fn rewrite_getpid_impl(caller: usize) -> libc::pid_t {
+    if !in_run() || in_system_library(caller) {
         return unsafe { libc::getpid() };
     }
     vpid_of(sched::pid())
 }
 
-pub extern "C" fn my_getppid() -> libc::pid_t {
-    if !in_run() {
+#[no_mangle]
+pub extern "C" fn rewrite_getppid_impl(caller: usize) -> libc::pid_t {
+    if !in_run() || in_system_library(caller) {
         return unsafe { libc::getppid() };
     }
     match sched::with(|s, me| s.procs[me as usize].parent) {
@@ -438,6 +493,25 @@ pub extern "C" fn my_getppid() -> libc::pid_t {
         _ => 1,
     }
 }
+
+extern "C" {
+    pub fn rewrite_getpid_shim();
+    pub fn rewrite_getppid_shim();
+}
+
+// The link register is the caller's return address; the tail call keeps it.
+std::arch::global_asm!(
+    ".globl _rewrite_getpid_shim",
+    ".p2align 2",
+    "_rewrite_getpid_shim:",
+    "mov x0, x30",
+    "b _rewrite_getpid_impl",
+    ".globl _rewrite_getppid_shim",
+    ".p2align 2",
+    "_rewrite_getppid_shim:",
+    "mov x0, x30",
+    "b _rewrite_getppid_impl",
+);
 
 pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
     let target = if in_run() { proc_of(vpid) } else { None };

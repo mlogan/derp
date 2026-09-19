@@ -144,15 +144,17 @@ pub fn exempt<T>(f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// Whether `path` is this host's to touch. Refusals set `EACCES` and are
-/// logged with the call, so a misconfiguration is visible, not silent.
+/// Whether `path` is this host's to touch. Refusals set `EACCES` (`ENOENT`
+/// for calls that only ask) and are logged with the call, so a
+/// misconfiguration is visible, not silent.
 pub unsafe fn permits(call: &str, path: *const c_char) -> bool {
     check(call, path, false)
 }
 
 /// For calls that only ask about a path (`stat`, `access`, `readlink`):
-/// the directories above the host's own are fine too. Programs walk them
-/// (`realpath`, `mkdir -p`), and they say nothing about another host.
+/// the directories above anything permitted are fine too. Programs walk
+/// them (`realpath` on `/var/...` reads the `/var` symlink; `mkdir -p`),
+/// and they say nothing about another host.
 pub unsafe fn permits_metadata(call: &str, path: *const c_char) -> bool {
     check(call, path, true)
 }
@@ -179,13 +181,40 @@ unsafe fn check(call: &str, path: *const c_char, ancestors: bool) -> bool {
     let seen = unprivate(&absolute);
     // CoreFoundation reads this from the real home directory (from the
     // password database, not `HOME`) in every program that links it.
-    let ambient = seen.ends_with(b"/.CFUserTextEncoding");
+    let ambient = seen.ends_with(b"/.CFUserTextEncoding") || ancestors && seen == b"/private";
     let ok = ambient
         || under(seen, &policy.root)
-        || ancestors && under(&policy.root, seen)
+        || ancestors
+            && (under(&policy.root, seen)
+                || SYSTEM.iter().any(|sys| under(sys, seen))
+                || policy.allow.iter().any(|a| under(a, seen)))
         || SYSTEM.iter().any(|s| under(seen, s))
         || policy.allow.iter().any(|a| under(seen, a));
+    if !ok && ancestors {
+        // Only asking. On this host the path does not exist; that is worth
+        // a log line only if it exists for real (a probe for a file that is
+        // nowhere is not a misconfiguration).
+        drop(guard);
+        let mut st: libc::stat = std::mem::zeroed();
+        let exists = exempt(|| libc::lstat(path, &raw mut st)) == 0;
+        if exists {
+            refuse(call, given);
+        }
+        *libc::__error() = libc::ENOENT;
+        return false;
+    }
     if !ok {
+        drop(guard);
+        refuse(call, given);
+        *libc::__error() = libc::EACCES;
+    }
+    ok
+}
+
+fn refuse(call: &str, given: &[u8]) {
+    let guard = POLICY.lock();
+    let Some(policy) = guard.as_ref() else { return };
+    {
         if REFUSED.fetch_add(1, Ordering::Relaxed) < MAX_LOGGED {
             let mut line = String::new();
             let _ = std::fmt::Write::write_fmt(
@@ -198,9 +227,7 @@ unsafe fn check(call: &str, path: *const c_char, ancestors: bool) -> bool {
             );
             crate::report::log(&line);
         }
-        *libc::__error() = libc::EACCES;
     }
-    ok
 }
 
 pub fn refused() -> u32 {

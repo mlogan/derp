@@ -53,4 +53,71 @@ Tracks `IMPLEMENTATION_PLAN_RUNFILE.md`. Branch `mlogan-multiproc`.
 - Test: `hostfs.c` on two hosts, 23 lines of allowed and refused operations
   each, the same relative name being a different file per host, `files:`
   copied to one host only, a stale file from an earlier run gone.
-## 3. Real programs (not started)
+## 3. Real programs ✅
+
+Homebrew's `curl` 8.18 fetches a page from each of two
+`python3.13 -m http.server` instances, three virtual hosts, each server
+serving its own `site/` copied into its own host directory. The client
+appears as `10.0.0.3` in the servers' access logs, dated on the virtual
+clock; 2 connections and 590 bytes through the virtual network, none
+through the kernel; 7 threads. `repeat`: 20 identical runs at seed 1, 10
+each at seeds 2-4, a different schedule hash per seed. Test:
+`curl_fetches_pages_from_python_web_servers_on_two_hosts` (skips itself if
+Homebrew's curl or python@3.13 are missing).
+
+What these programs needed that the test programs never did:
+
+- **`daemon: true`** in the run file. A server never exits; when every
+  other initial process has, the launcher kills what is left. The process
+  that just exited held the baton, so everything else is parked: the point
+  is deterministic. Daemons do not count toward the run's exit status.
+- **A cache directory for installed programs.** Rewritten copies of
+  programs under `/opt`, `/usr`, `/Applications`, ... go to
+  `$TMPDIR/rewrite-cache/<hash of path>/`; we do not write into the Cellar.
+- **Threads the scheduler does not run.** GCD workers are made by the
+  kernel, not `pthread_create`. curl's startup reads proxy settings through
+  CoreFoundation and `dispatch_apply`, and hung. Three changes:
+  wakes go to the scheduler *and* the kernel, from any thread; an
+  unfair-lock or `dispatch_once` wait whose owner (its Mach port is in the
+  lock word) is such a thread is a real wait, not yield-and-retry, which
+  also burned virtual time at a real-time rate; and an idle scheduler looks
+  again in real time, without moving the clock, for up to 30 s before it
+  calls a deadlock when such threads exist. What those threads do is input.
+- **`POSIX_SPAWN_SETEXEC` is an exec.** Python's launcher stub becomes the
+  real interpreter in `Python.app` that way; treated as a child spawn, the
+  old process record kept the baton forever.
+- **Virtual pids are for guest code only.** libSystem's unified logging
+  hands `getpid()` to `proc_pidinfo` while CoreFoundation initializes and
+  crashes (SIGTRAP) on an error. Virtual pids 1000 and 1001 happened to be
+  real processes on this machine, so only the third guest died. `getpid`
+  and `getppid` now look at their return address: callers inside the dyld
+  shared cache get the real pid.
+- **Host directories, refined.** Metadata calls may name the directories
+  above any permitted location (`realpath` reads the `/var` symlink), and
+  outside they answer `ENOENT`, logged only when the path really exists:
+  Python probes for many paths that are nowhere, which is not a
+  misconfiguration. `~/.CFUserTextEncoding` is let through silently.
+  curl's attempt to read `~/.curlrc` from the real home is refused and
+  logged, which is the guard working.
+- Socket options `TCP_KEEPINTVL`, `TCP_KEEPCNT`, `IPV6_V6ONLY` accepted.
+
+Not needed, as it turned out: `EINPROGRESS` for non-blocking `connect`
+(curl copes with immediate success), and IPv6 (Python was told
+`--bind 0.0.0.0`; without it `http.server` asks the real resolver for a
+wildcard address and may bind a kernel IPv6 socket).
+
+## Test summary
+
+`cargo test -p rewrite -p rewrite-supervisor`: all pass (25 + 4 + 19 + 3 + 4
+in `rewrite`, 20 unit tests in the supervisor); clippy clean.
+
+## Follow-ups
+
+- Work done by GCD worker threads is outside the schedule. For curl that is
+  one preferences lookup at startup; a program that does real work on
+  dispatch queues would not be deterministic. Interposing
+  `dispatch_async` and friends to run blocks on scheduled threads is the
+  way in.
+- `kill`, `waitpid` and other pid-taking calls from system libraries still
+  see virtual pids; only `getpid`/`getppid` look at their caller.
+- `allow:` is for the whole run; a per-host list would be easy.

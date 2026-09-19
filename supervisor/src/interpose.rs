@@ -43,9 +43,9 @@ use crate::net::{
 };
 use crate::poll::{my_poll, my_select};
 use crate::process::{
-    my_execve, my_fork, my_getpid, my_getppid, my_kill, my_posix_spawn, my_posix_spawnp, my_wait,
-    my_wait4, my_waitpid,
+    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_wait, my_wait4, my_waitpid,
 };
+use crate::process::{rewrite_getpid_shim, rewrite_getppid_shim};
 use crate::sched::{self, my_id, State};
 use crate::shared;
 
@@ -598,8 +598,8 @@ interposers! {
     my_waitpid => libc::waitpid,
     my_wait4 => libc::wait4,
     my_wait => libc::wait,
-    my_getpid => libc::getpid,
-    my_getppid => libc::getppid,
+    rewrite_getpid_shim => libc::getpid,
+    rewrite_getppid_shim => libc::getppid,
     my_kill => libc::kill,
     my_read => libc::read,
     my_read_nocancel => read_nocancel,

@@ -886,7 +886,7 @@ fn each_host_is_held_to_its_own_directory() {
              but not open it: refused\n\
              other host by relative path: refused\n\
              other host by absolute path: refused\n\
-             stat the other host's file: refused\n\
+             stat the other host's file: No such file or directory\n\
              rename into the other host: refused\n\
              chdir to the other host: refused\n\
              a file in the real /tmp: refused\n\
@@ -907,4 +907,77 @@ fn each_host_is_held_to_its_own_directory() {
     assert!(!Path::new("/tmp/rewrite-hostfs-escape").exists());
     assert_eq!(r.u64("p0.paths_refused"), 7);
     assert_eq!(r.u64("p2.paths_refused"), 1);
+}
+
+/// Homebrew's curl and python3.13, if installed. Apple's own copies ignore
+/// `DYLD_INSERT_LIBRARIES`, so they cannot be guests.
+fn homebrew_programs() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+    let curl = Path::new("/opt/homebrew/opt/curl/bin/curl");
+    let python = std::fs::canonicalize("/opt/homebrew/opt/python@3.13/bin/python3.13").ok()?;
+    curl.exists().then(|| (curl.to_path_buf(), python))
+}
+
+#[test]
+fn curl_fetches_pages_from_python_web_servers_on_two_hosts() {
+    let Some((curl, python)) = homebrew_programs() else {
+        eprintln!("skipped: needs Homebrew's curl and python@3.13");
+        return;
+    };
+    let dir = common::scratch_dir("multiproc_web");
+    for host in ["alpha", "beta"] {
+        let site = dir.join(host).join("site");
+        std::fs::create_dir_all(&site).unwrap();
+        std::fs::write(
+            site.join("index.html"),
+            format!("<h1>hello from {host}</h1>\n"),
+        )
+        .unwrap();
+    }
+    let server = format!(
+        "argv: [{}, -u, -m, http.server, 8000, --bind, 0.0.0.0, --directory, site]\n        daemon: true",
+        python.display()
+    );
+    let manifest = dir.join("web.yaml");
+    std::fs::write(
+        &manifest,
+        format!(
+            "hosts:\n  - name: alpha\n    files: [alpha/site]\n    processes:\n      - {server}\n\
+             \x20 - name: beta\n    files: [beta/site]\n    processes:\n      - {server}\n\
+             \x20 - name: client\n    processes:\n\
+             \x20     - [{}, -sS, --retry, 50, --retry-connrefused, --retry-delay, 1,\n\
+             \x20        \"http://alpha:8000/index.html\", \"http://beta:8000/index.html\"]\n",
+            curl.display()
+        ),
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let mut hashes = Vec::new();
+    for seed in 1..=2u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 3);
+        assert_eq!(
+            r.stdout[2], "<h1>hello from alpha</h1>\n<h1>hello from beta</h1>\n",
+            "seed {seed}"
+        );
+        assert!(
+            r.stdout[0].starts_with("Serving HTTP on 0.0.0.0 port 8000"),
+            "{}",
+            r.stdout[0]
+        );
+        // Daemons are killed when curl is done; nothing left the virtual network
+        assert_eq!(r.fields["p0.status"], "signal 9");
+        assert_eq!(r.fields["p2.status"], "exit 0");
+        assert_eq!(r.u64("run.net_connections"), 2);
+        assert_eq!(r.u64("run.net_passthrough"), 0);
+        for _ in 0..3 {
+            let again = run_manifest(&manifest, &scratch, seed, 3);
+            assert_eq!(again.stdout, r.stdout, "seed {seed} not repeatable");
+            assert_eq!(
+                again.fields["run.schedule_hash"],
+                r.fields["run.schedule_hash"]
+            );
+        }
+        hashes.push(r.fields["run.schedule_hash"].clone());
+    }
+    hashes.dedup();
+    assert!(hashes.len() > 1, "every seed produced the same schedule");
 }

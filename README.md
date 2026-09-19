@@ -45,6 +45,10 @@ hosts:                   # in order: 10.0.0.1, 10.0.0.2, ...
         env: { MODE: fast }
 ```
 
+A process written as a map may also say `daemon: true`: a server that never
+exits. When every other process of the run file has exited, the launcher
+kills what is left and the run is over.
+
 Processes start in file order. `argv[0]` names the program, relative to the
 run file, and reaches the guest exactly as written. Numbers and booleans in
 an argument list are taken as their text; quote one whose spelling matters
@@ -88,8 +92,13 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   runtime or library validation (so `DYLD_INSERT_LIBRARIES` is honoured).
 - Default link flags are fine. No `-headerpad` is needed.
 - Every process in a run must be one of ours: children a guest spawns are
-  rewritten on demand. Platform binaries (`/bin/sh`, coreutils) are out of
-  scope.
+  rewritten on demand. Apple's own binaries (`/bin/sh`, `/usr/bin/curl`,
+  `/usr/bin/python3`) ignore `DYLD_INSERT_LIBRARIES` and cannot be guests.
+  Homebrew's can: its `curl` and `python3.13 -m http.server` run
+  repeatably (see `TASKS_RUNFILE.md`). Rewritten copies of installed
+  programs go to `$TMPDIR/rewrite-cache/`, not next to the program.
+- Threads the guest makes with `pthread_create` are scheduled. GCD worker
+  threads are not: what they do is outside the schedule.
 
 ## Rewritten binaries only run under the supervisor
 

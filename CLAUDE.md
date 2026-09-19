@@ -435,6 +435,12 @@ progress and deviations in `TASKS_MULTIPROC.md`, results in
 `docs/MULTIPROC_RESULTS.md`, usage in `README.md`. Rewritten
 binaries need the supervisor dylib; default-linked guests work.
 
+**Run files, host directories, real programs** (same branch, complete): run
+files are YAML, every host gets a fresh directory per run that its path
+names are held to, and Homebrew's curl fetches from Python's `http.server`
+repeatably. Plan in `IMPLEMENTATION_PLAN_RUNFILE.md`, progress and findings
+in `TASKS_RUNFILE.md`.
+
 **Next Phase**: Not yet planned
 
 ---

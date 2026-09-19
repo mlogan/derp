@@ -654,6 +654,9 @@ pub unsafe extern "C" fn my_getpeername(
 
 const TCP_NODELAY: c_int = 0x01;
 const TCP_KEEPALIVE: c_int = 0x10;
+const TCP_KEEPINTVL: c_int = 0x101;
+const TCP_KEEPCNT: c_int = 0x102;
+const IPV6_V6ONLY: c_int = 27;
 /// Private to XNU; libSystem's resolver sets it on the socket it opens to
 /// mDNSResponder, before the connect that takes it out of the virtual
 /// network.
@@ -675,7 +678,12 @@ fn harmless(level: c_int, name: c_int) -> bool {
                 | libc::SO_OOBINLINE
                 | SO_DEFUNCTOK
         ),
-        libc::IPPROTO_TCP => matches!(name, TCP_NODELAY | TCP_KEEPALIVE),
+        libc::IPPROTO_TCP => matches!(
+            name,
+            TCP_NODELAY | TCP_KEEPALIVE | TCP_KEEPINTVL | TCP_KEEPCNT
+        ),
+        // Python's http.server clears it on whatever socket it gets
+        libc::IPPROTO_IPV6 => name == IPV6_V6ONLY,
         _ => false,
     }
 }

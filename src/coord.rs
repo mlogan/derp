@@ -33,6 +33,7 @@ pub struct Totals {
     pub net_passthrough: u64,
     pub crashes_injected: u64,
     pub restarts: u64,
+    pub restarts_refused: u64,
 }
 
 static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
@@ -111,9 +112,15 @@ impl Coordinator {
         pid
     }
 
-    /// Whether process `pid`, dead with `status`, gets another life.
+    /// Whether process `pid`, dead with `status`, gets another life. Ask
+    /// once per death: a restart the full tables rule out is counted here.
     pub fn will_restart(&self, pid: u32, status: i32) -> bool {
-        self.shared.lock().will_restart(pid, status)
+        let mut s = self.shared.lock();
+        let will = s.will_restart(pid, status);
+        if !will && s.restart_due(pid, status) {
+            s.restarts_refused += 1;
+        }
+        will
     }
 
     /// The process registered to take `pid`'s place, for us to spawn.
@@ -159,14 +166,11 @@ impl Coordinator {
         let mut s = self.shared.lock();
         let handoff = s.process_died(pid, status);
         // Passing the baton on may have crashed someone
-        let (kills, n) = s.take_kills();
+        s.take_kills(|victim| unsafe {
+            libc::kill(victim, libc::SIGKILL);
+        });
         let deadlock = matches!(handoff, Some(Handoff::Idle)) && s.any_alive();
         drop(s);
-        for &victim in &kills[..n] {
-            if victim > 0 {
-                unsafe { libc::kill(victim, libc::SIGKILL) };
-            }
-        }
         if let Some(Handoff::Switch { to, .. }) = handoff {
             self.shared.unpark(to);
         }
@@ -187,6 +191,7 @@ impl Coordinator {
             net_passthrough: s.net.passthrough,
             crashes_injected: s.crashes_injected,
             restarts: s.restarts,
+            restarts_refused: s.restarts_refused,
         }
     }
 }

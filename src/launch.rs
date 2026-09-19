@@ -151,8 +151,6 @@ struct Tracked {
     /// Which of `Run::guests` this is a life of; None for a guest's child
     spec: Option<usize>,
     pid: libc::pid_t,
-    /// Our own child (we reap it) rather than a guest's
-    ours: bool,
     status: Option<i32>,
     report: String,
 }
@@ -170,7 +168,7 @@ fn spawn(
     guest: &Guest,
     extra_env: &[(String, String)],
     guest_sock: Option<libc::c_int>,
-    later_life: bool,
+    keep_stdout: bool,
 ) -> io::Result<libc::pid_t> {
     let ours = [
         "DYLD_INSERT_LIBRARIES",
@@ -247,14 +245,12 @@ fn spawn(
                 &raw mut actions,
                 1,
                 p.as_ptr(),
-                // A restarted process goes on where its earlier lives wrote
+                // Appending, so that lives of one entry (and children that
+                // outlive a crashed one) never write over each other
                 libc::O_WRONLY
                     | libc::O_CREAT
-                    | if later_life {
-                        libc::O_APPEND
-                    } else {
-                        libc::O_TRUNC
-                    },
+                    | libc::O_APPEND
+                    | if keep_stdout { 0 } else { libc::O_TRUNC },
                 0o644,
             );
         }
@@ -284,14 +280,18 @@ fn spawn(
 }
 
 impl Tracked {
-    fn new(pid: libc::pid_t, ours: bool) -> Self {
+    fn new(pid: libc::pid_t, spec: Option<usize>) -> Self {
         Tracked {
-            spec: None,
+            spec,
             pid,
-            ours,
             status: None,
             report: String::new(),
         }
+    }
+
+    /// Our own child (we reap it) rather than a guest's
+    fn ours(&self) -> bool {
+        self.spec.is_some()
     }
 
     /// Reap one of our own children if it has ended; with `block`, wait.
@@ -592,16 +592,14 @@ fn guest_env(run: &Run, coord: Option<(&Coordinator, u32)>) -> Vec<(String, Stri
 fn track(procs: &mut Vec<Tracked>, index: usize, tracked: Tracked) {
     while procs.len() <= index {
         // A process whose spawn failed in the guest, or that we hear of later
-        let mut t = Tracked::new(0, false);
+        let mut t = Tracked::new(0, None);
         t.status = Some(0);
         procs.push(t);
     }
     procs[index] = tracked;
 }
 
-/// If the scheduler registered a next life for `index`, start it. When the
-/// real process comes up is of no consequence: its main thread only becomes
-/// runnable once the restart delay is over, in virtual time.
+/// If the scheduler registered a next life for `index`, start it.
 fn respawn(
     run: &Run,
     coord: &Coordinator,
@@ -620,9 +618,7 @@ fn respawn(
     }
     let env = guest_env(run, Some((coord, new as u32)));
     let pid = spawn(run, &run.guests[spec], &env, guest_sock, true)?;
-    let mut tracked = Tracked::new(pid, true);
-    tracked.spec = Some(spec);
-    track(procs, new, tracked);
+    track(procs, new, Tracked::new(pid, Some(spec)));
     if !events.watch_exit(pid, new) {
         procs[new].reap(true);
         gone.push(new);
@@ -640,7 +636,7 @@ fn end_run(procs: &mut [Tracked]) {
 fn kill_all(procs: &mut [Tracked]) {
     for c in procs.iter_mut() {
         c.kill();
-        if c.ours {
+        if c.ours() {
             c.reap(true);
         }
     }
@@ -710,9 +706,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
                 unsafe { libc::close(g) };
             }
         }
-        let mut tracked = Tracked::new(spawned?, true);
-        tracked.spec = Some(spec);
-        procs.push(tracked);
+        procs.push(Tracked::new(spawned?, Some(spec)));
     }
     // The guests' end of the socket stays open here: a restarted process
     // inherits it from us.
@@ -744,7 +738,8 @@ fn supervise_started(
         }
     }
     if let Some(coord) = coord {
-        for i in std::mem::take(&mut gone) {
+        // A replacement may be gone before it is watched, too
+        while let Some(i) = gone.pop() {
             coord.process_died(i as u32, procs[i].status.unwrap_or(0));
             respawn(run, coord, events, guest_sock, procs, &mut gone, i)?;
         }
@@ -771,7 +766,7 @@ fn supervise_started(
             // `waitpid` fails if SIGCHLD is ignored in our own environment;
             // the event carries the status too
             let p = &mut procs[index];
-            if !(p.ours && p.reap(true)) {
+            if !(p.ours() && p.reap(true)) {
                 p.status = Some(status);
             }
         }
@@ -810,7 +805,7 @@ fn handle_frame(
         shared::MSG_SPAWNED if frame.payload.len() == 8 => {
             let child = u32::from_le_bytes(frame.payload[..4].try_into().unwrap()) as usize;
             let pid = i32::from_le_bytes(frame.payload[4..].try_into().unwrap());
-            track(procs, child, Tracked::new(pid, false));
+            track(procs, child, Tracked::new(pid, None));
             if !events.watch_exit(pid, child) {
                 procs[child].status = Some(0);
                 gone.push(child);

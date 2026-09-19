@@ -83,7 +83,14 @@ then comes back as a new process on the same host, with a new pid and the
 same host directory; what it needs to remember it has to have written
 there. Its captured stdout continues in the same file. `on-failure` means a
 signal or a non-zero exit. The run's exit status is that of each entry's
-last life. The report counts `run.crashes_injected` and `run.restarts`.
+last life. The report counts `run.crashes_injected` and `run.restarts`,
+and `p<i>.entry` says which run-file entry process `i` was a life of.
+
+`restart-delay` may not be zero, and it and `max-restarts` need a restart
+policy. Only run-file entries are restarted, not a guest's own children. A
+guest that `kill`s a restartable process causes a restart like any other
+death. These keys need the supervisor (no `--native`, `--no-supervisor`),
+and a run holds 1024 processes, each life counting as one.
 
 A process written as a map may also say `daemon: true`: a server that never
 exits. When every other process of the run file has exited, the launcher

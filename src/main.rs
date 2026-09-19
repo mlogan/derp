@@ -333,7 +333,21 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
     };
+    let has_faults = run
+        .guests
+        .iter()
+        .any(|g| g.faults.restart != rewrite::shared::RESTART_NEVER || g.faults.crash_hi_ns != 0);
+    if has_faults && (run.passive || run.dylib.is_none()) {
+        return Err("crash and restart settings need the supervisor".into());
+    }
     let outcome = launch::launch_run(&run)?;
+    if outcome.totals.restarts_refused > 0 {
+        return Err(format!(
+            "the run's process table is full: {} restarts were not made",
+            outcome.totals.restarts_refused
+        )
+        .into());
+    }
     if outcome.deadlock {
         return Err("deadlock: every guest thread was blocked; the run was killed".into());
     }

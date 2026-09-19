@@ -299,6 +299,11 @@ fn join_run(path: &str) -> (&'static Shared, usize) {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| fatal("REWRITE_PROC missing"));
     let mut s = sh.lock();
+    if s.procs[pid as usize].killed {
+        s.procs[pid as usize].signalled = true;
+        drop(s);
+        die();
+    }
     let n = s.nthreads as usize;
     // After an `execve` the process has older, retired threads: take the
     // one that is still alive.
@@ -315,6 +320,11 @@ fn join_run(path: &str) -> (&'static Shared, usize) {
     // counted before it can close its own copies.
     crate::net::adopt_inherited(sh, pid);
     let mut s = sh.lock();
+    if s.procs[pid as usize].killed {
+        s.procs[pid as usize].signalled = true;
+        drop(s);
+        die();
+    }
     let p = &mut s.procs[pid as usize];
     p.real_pid = unsafe { libc::getpid() };
     p.state = shared::P_LIVE;
@@ -533,11 +543,9 @@ struct After {
     quantum: i64,
     issued: u64,
     clock: u64,
-    /// Processes the scheduler crashed during this hand-off; the signal is
-    /// ours to send
-    kills: ([i32; shared::MAX_PENDING_KILLS], usize),
-    /// One of them is this process
+    /// The hand-off crashed this process
     crashed_self: bool,
+    unsettled: bool,
 }
 
 impl After {
@@ -547,24 +555,22 @@ impl After {
             quantum: s.pending_quantum,
             issued: s.issued,
             clock: s.clock_ns,
-            kills: s.take_kills(),
             crashed_self: s.procs[pid() as usize].killed,
+            unsettled: signal_crashed(s),
         }
     }
 
     /// Returns false when the run was idle and the caller has to wait.
     fn carry_out(self, sh: &Shared, me: usize, state: State, site: u64) -> bool {
-        let own = unsafe { libc::getpid() };
-        for &victim in &self.kills.0[..self.kills.1] {
-            if victim != own && victim > 0 {
-                unsafe { libc::kill(victim, libc::SIGKILL) };
-            }
-        }
         match self.handoff {
             Handoff::Idle if self.crashed_self => die(),
             Handoff::Idle => false,
             Handoff::Stay => {
-                install_quantum(self.quantum);
+                if self.unsettled {
+                    take_up_baton(sh);
+                } else {
+                    install_quantum(self.quantum);
+                }
                 true
             }
             Handoff::Switch { to, seen } => {
@@ -576,11 +582,58 @@ impl After {
                 }
                 if state != State::Exited {
                     sh.park(me, seen);
-                    install_quantum(sh.lock().pending_quantum);
+                    take_up_baton(sh);
                 }
                 true
             }
         }
+    }
+}
+
+/// Send `SIGKILL` to the processes the scheduler has crashed, other than
+/// this one: its own crash waits until the baton is elsewhere. Returns
+/// whether a crashed process may still be alive.
+pub fn signal_crashed(s: &mut shared::State) -> bool {
+    let own = unsafe { libc::getpid() };
+    s.take_kills(|victim| {
+        if victim != own {
+            unsafe { libc::kill(victim, libc::SIGKILL) };
+        }
+    });
+    s.unsettled > 0
+}
+
+/// The baton is ours: before running, wait in real time until every crashed
+/// process is really dead, so that what its death releases in the kernel is
+/// released at this point of the schedule and not at some later one.
+pub fn take_up_baton(sh: &Shared) {
+    wait_out_deaths(sh, true);
+}
+
+/// `take_up_baton` for a thread that already runs: its quantum stands.
+pub fn settle_deaths() {
+    if let Some(sh) = shared() {
+        wait_out_deaths(sh, false);
+    }
+}
+
+fn wait_out_deaths(sh: &Shared, new_quantum: bool) {
+    // Counted, not timed: this process's clock is the virtual one
+    const GIVE_UP_AFTER: u32 = 200_000;
+    for polls in 0.. {
+        let mut s = sh.lock();
+        if !s.settle_deaths() && polls > GIVE_UP_AFTER {
+            crate::report::log("a crashed process will not die; no longer waiting for it");
+            s.forget_unsettled();
+        }
+        if s.settle_deaths() {
+            if new_quantum {
+                install_quantum(s.pending_quantum);
+            }
+            return;
+        }
+        drop(s);
+        unsafe { libc::usleep(50) };
     }
 }
 
@@ -598,7 +651,7 @@ fn die() -> ! {
 pub fn wait_for_baton(id: usize) {
     let Some(sh) = shared() else { return };
     sh.park(id, 0);
-    install_quantum(sh.lock().pending_quantum);
+    take_up_baton(sh);
 }
 
 /// `REWRITE_TRACE=file`: one line per switch, appended by whoever gives the

@@ -1283,8 +1283,93 @@ fn a_server_that_keeps_crashing_is_restarted_and_the_client_reconnects() {
     outages_by_seed.dedup();
     assert!(
         outages_by_seed.len() > 1,
-        "every seed crashed the server at the same moments"
+        "every seed kept the server down for the same times"
     );
+}
+
+/// A crash wakes threads blocked on I/O. That must happen when the crash
+/// does, and not again whenever the launcher gets to hear of the death: a
+/// server idle in `accept` next to the crashing one would then run at
+/// moments of real time.
+#[test]
+fn a_crash_disturbs_bystanders_at_a_fixed_point() {
+    let dir = common::scratch_dir("faults_bystander");
+    common::build_c("ping_pong", &dir, &[]);
+    common::build_c("sleeper", &dir, &[]);
+    let manifest = dir.join("bystander.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: server\n    processes:\n      - argv: [ping_pong, pong, 7000]\n        daemon: true\n\
+         \x20       restart: on-failure\n        restart-delay: 50ms..150ms\n\
+         \x20       crash: { every: 100ms..300ms, times: 3 }\n\
+         \x20 - name: bystander\n    processes:\n      - argv: [ping_pong, pong, 7001]\n        daemon: true\n\
+         \x20 - name: client\n    processes:\n      - sleeper 1500 1000\n",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let first = run_manifest(&manifest, &scratch, 1, 3);
+    assert_eq!(first.fields["run.crashes_injected"], "3");
+    for _ in 0..7 {
+        let again = run_manifest(&manifest, &scratch, 1, 3);
+        assert_eq!(again.stdout, first.stdout);
+        assert_eq!(
+            again.fields["run.schedule_hash"],
+            first.fields["run.schedule_hash"]
+        );
+    }
+}
+
+/// Any number of crashes may come due at the same moment of an idle run.
+#[test]
+fn many_processes_can_crash_at_once() {
+    use std::fmt::Write;
+    let dir = common::scratch_dir("faults_at_once");
+    common::build_c("sleeper", &dir, &[]);
+    common::supervisor_dylib();
+    let mut text = String::from("hosts:\n  - name: h\n    processes:\n");
+    for _ in 0..12 {
+        write!(
+            text,
+            "      - argv: [sleeper, 3, 1000000]\n        crash: {{ every: 100ms }}\n"
+        )
+        .unwrap();
+    }
+    let manifest = dir.join("at_once.yaml");
+    std::fs::write(&manifest, text).unwrap();
+    let out = Command::new(common::rewrite_bin())
+        .args(["run", "--capture", "--seed", "1", "--scratch"])
+        .arg(dir.join("scratch"))
+        .arg("--manifest")
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("run.crashes_injected=12\n"), "{err}");
+}
+
+#[test]
+fn fault_settings_need_the_supervisor() {
+    let dir = common::scratch_dir("faults_native");
+    common::build_c("sleeper", &dir, &[]);
+    let manifest = dir.join("native.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: h\n    processes:\n      - argv: [sleeper, 1, 1]\n        restart: always\n",
+    )
+    .unwrap();
+    for mode in ["--native", "--no-supervisor"] {
+        let out = Command::new(common::rewrite_bin())
+            .args(["run", mode, "--scratch"])
+            .arg(dir.join("scratch"))
+            .arg("--manifest")
+            .arg(&manifest)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{mode}");
+        assert!(err.contains("need the supervisor"), "{mode}: {err}");
+    }
 }
 
 #[test]

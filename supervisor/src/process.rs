@@ -565,14 +565,17 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
     };
     let known = sched::with(|s, _| {
         let p = &s.procs[target as usize];
-        (target < s.nprocs && p.state != shared::P_EXITED).then_some(p.real_pid)
+        (target < s.nprocs && p.state != shared::P_EXITED && !p.killed).then_some(p.real_pid)
     })
     .flatten();
     let Some(real) = known else {
         return crate::errno::fail(libc::ESRCH);
     };
-    if target == sched::pid() || sig == 0 {
+    if target == sched::pid() {
         return libc::kill(real, sig);
+    }
+    if sig == 0 {
+        return 0;
     }
     if sig != libc::SIGTERM && sig != libc::SIGKILL {
         crate::report::log("kill: only SIGTERM and SIGKILL reach another guest; signal dropped");
@@ -590,6 +593,11 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
     // The target is parked, so it dies where it stands. All that its death
     // means to the run happens now, under the lock: the launcher only hears
     // of it later, and the baton must not go to a thread that is gone.
-    sched::with(|s, _| s.crash(target));
-    libc::kill(real, libc::SIGKILL)
+    // One still down between lives has no real process yet.
+    sched::with(|s, _| {
+        s.crash(target);
+        sched::signal_crashed(s);
+    });
+    sched::settle_deaths();
+    0
 }

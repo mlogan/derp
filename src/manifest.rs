@@ -137,6 +137,9 @@ pub struct Process {
 /// zero: a restart is never instantaneous.
 const DEFAULT_RESTART_DELAY_NS: u64 = 100_000_000;
 
+/// A year
+const MAX_DURATION_NS: u64 = 365 * 24 * 3600 * 1_000_000_000;
+
 /// `5ms`, `250us`, `10ns`, `1s`; a bare number is milliseconds.
 pub fn parse_duration_ns(s: &str) -> Option<u64> {
     let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
@@ -147,7 +150,9 @@ pub fn parse_duration_ns(s: &str) -> Option<u64> {
         "s" => 1_000_000_000,
         _ => return None,
     };
-    digits.parse::<u64>().ok()?.checked_mul(scale)
+    let ns = digits.parse::<u64>().ok()?.checked_mul(scale)?;
+    // Far from overflowing the virtual clock when added to it
+    (ns <= MAX_DURATION_NS).then_some(ns)
 }
 
 /// `50ms..200ms`, or one duration for both ends
@@ -509,6 +514,11 @@ hosts:
         .contains("bad restart-delay"));
         assert!(
             err("hosts: [{name: a, processes: [{argv: [p], crash: {every: 9s..1s}}]}]")
+                .contains("bad crash every")
+        );
+        // Longer than a year: the virtual clock could not hold many of these
+        assert!(
+            err("hosts: [{name: a, processes: [{argv: [p], crash: {every: 99999999999s}}]}]")
                 .contains("bad crash every")
         );
         assert!(

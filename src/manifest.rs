@@ -10,7 +10,7 @@
 //!   - /opt/site-content
 //! hosts:                   # in order: 10.0.0.1, 10.0.0.2, ...
 //!   - name: alpha
-//!     root: sites/alpha    # optional, relative to the run file
+//!     files: [site/index.html, site/img]   # copied into the host's directory
 //!     processes:
 //!       - [server, --port, 8080]        # argv verbatim
 //!       - client alpha 8080             # or a line, split on whitespace
@@ -19,7 +19,8 @@
 //! ```
 //!
 //! Processes start in file order. `argv[0]` names the program, relative to
-//! the run file, and reaches the guest as written.
+//! the run file, and reaches the guest as written. A host's directory is
+//! never named here: the launcher makes a fresh one for every run.
 
 use std::collections::BTreeMap;
 
@@ -64,7 +65,8 @@ enum RawProcess {
 #[serde(deny_unknown_fields)]
 struct RawHost {
     name: String,
-    root: Option<String>,
+    #[serde(default)]
+    files: Vec<String>,
     #[serde(default)]
     processes: Vec<RawProcess>,
 }
@@ -92,9 +94,8 @@ pub struct Process {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Host {
     pub name: String,
-    /// Directory to use as the host's root, relative to the run file;
-    /// without it the launcher makes one in the scratch directory
-    pub root: Option<String>,
+    /// Inputs copied into the host's fresh directory, relative to the run file
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -109,9 +110,11 @@ pub struct Manifest {
     pub allow: Vec<String>,
 }
 
+/// A host's name is also the name of its directory.
 fn valid_host_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 63
+        && !name.starts_with('.')
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
@@ -139,19 +142,22 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         }
         let index = m.hosts.len() as u32;
         for p in host.processes {
-            let (argv, env) = match p {
-                RawProcess::Line(line) => {
-                    (line.split_whitespace().map(str::to_string).collect(), Vec::new())
-                }
+            let (argv, env): (Vec<String>, Vec<(String, String)>) = match p {
+                RawProcess::Line(line) => (
+                    line.split_whitespace().map(str::to_string).collect(),
+                    Vec::new(),
+                ),
                 RawProcess::Argv(argv) => (argv.iter().map(Scalar::text).collect(), Vec::new()),
                 RawProcess::Full { argv, env } => (
                     argv.iter().map(Scalar::text).collect(),
                     env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
                 ),
             };
-            let argv: Vec<String> = argv;
             if argv.is_empty() {
-                return Err(format!("run file: host {} has a process with no program", host.name));
+                return Err(format!(
+                    "run file: host {} has a process with no program",
+                    host.name
+                ));
             }
             m.processes.push(Process {
                 host: index,
@@ -161,7 +167,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         }
         m.hosts.push(Host {
             name: host.name,
-            root: host.root,
+            files: host.files,
         });
     }
     if m.processes.is_empty() {
@@ -185,7 +191,7 @@ net-latency: 5ms
 allow: [/opt/content]
 hosts:
   - name: alpha
-    root: sites/alpha
+    files: [site/index.html, site/img]
     processes:
       - [./srv, --port, 80, "two words", "007", true]
   - name: beta
@@ -198,8 +204,8 @@ hosts:
         .unwrap();
         assert_eq!(m.hosts.len(), 2);
         assert_eq!(m.hosts[0].name, "alpha");
-        assert_eq!(m.hosts[0].root.as_deref(), Some("sites/alpha"));
-        assert_eq!(m.hosts[1].root, None);
+        assert_eq!(m.hosts[0].files, ["site/index.html", "site/img"]);
+        assert!(m.hosts[1].files.is_empty());
         assert_eq!(m.processes[0].host, 0);
         assert_eq!(
             m.processes[0].argv,
@@ -210,7 +216,10 @@ hosts:
         assert_eq!(m.processes[2].argv, ["./cli", "--", "--seed", "3"]);
         assert_eq!(
             m.processes[2].env,
-            [("LEVEL".to_string(), "2".to_string()), ("MODE".to_string(), "fast".to_string())]
+            [
+                ("LEVEL".to_string(), "2".to_string()),
+                ("MODE".to_string(), "fast".to_string())
+            ]
         );
         assert_eq!(m.seed, Some(7));
         assert_eq!(m.quantum.as_deref(), Some("10000..100000"));
@@ -229,11 +238,15 @@ hosts:
     fn errors_say_what_is_wrong() {
         let err = |text: &str| parse(text).unwrap_err();
         assert!(err("hosts: [{name: a}]").contains("no processes"));
-        assert!(err("hosts: [{name: a, processes: [p]}, {name: a, processes: [p]}]")
-            .contains("declared twice"));
+        assert!(
+            err("hosts: [{name: a, processes: [p]}, {name: a, processes: [p]}]")
+                .contains("declared twice")
+        );
         assert!(err("hosts: [{name: 'a b', processes: [p]}]").contains("host name"));
+        assert!(err("hosts: [{name: '..', processes: [p]}]").contains("host name"));
         assert!(err("hosts: [{name: a, processes: [[]]}]").contains("no program"));
         assert!(err("hosts: [{name: a, procs: [p]}]").contains("procs"));
+        assert!(err("hosts: [{name: a, root: /x, processes: [p]}]").contains("root"));
         assert!(err("sed: 1\nhosts: [{name: a, processes: [p]}]").contains("sed"));
         assert!(err("processes: [p]").contains("hosts"));
         assert!(err("hosts: [{name: a, processes: [p]").contains("run file"));

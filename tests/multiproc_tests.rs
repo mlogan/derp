@@ -1,4 +1,4 @@
-//! Multi-process acceptance: guests listed in a manifest run under one
+//! Multi-process acceptance: guests listed in a YAML run file run under one
 //! scheduler, and the run-wide schedule is a function of the seed.
 
 mod common;
@@ -68,7 +68,18 @@ fn two_loops_processes_share_one_schedule() {
     let native = Command::new(&exe).arg("1").output().unwrap();
     let expected = String::from_utf8(native.stdout).unwrap();
     let manifest = dir.join("two.manifest");
-    std::fs::write(&manifest, "host a\n    loops 1\nhost b\n    loops 1\n").unwrap();
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: a
+    processes:
+      - loops 1
+  - name: b
+    processes:
+      - loops 1
+",
+    )
+    .unwrap();
     let scratch = dir.join("scratch");
 
     let mut hashes = Vec::new();
@@ -110,7 +121,16 @@ fn a_guest_that_dies_holding_the_baton_does_not_hang_the_run() {
         &dir,
     );
     let manifest = dir.join("crash.manifest");
-    std::fs::write(&manifest, "host a\n    crash\n    fine\n").unwrap();
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: a
+    processes:
+      - crash
+      - fine
+",
+    )
+    .unwrap();
     common::supervisor_dylib();
     let out = Command::new(common::rewrite_bin())
         .args(["run", "--seed", "1", "--scratch"])
@@ -139,7 +159,15 @@ fn spawned_forked_and_execed_children_join_the_schedule() {
     let dir = common::scratch_dir("multiproc_spawn");
     common::build_c("spawn_tree", &dir, &[]);
     let manifest = dir.join("tree.manifest");
-    std::fs::write(&manifest, "host a\n    spawn_tree\n").unwrap();
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: a
+    processes:
+      - spawn_tree
+",
+    )
+    .unwrap();
     let scratch = dir.join("scratch");
 
     let mut orders = Vec::new();
@@ -197,7 +225,15 @@ fn pipeline_is_correct_with_a_stable_schedule() {
     let expected = String::from_utf8(native.stdout).unwrap();
     assert!(expected.starts_with("count=66666 checksum="), "{expected}");
     let manifest = dir.join("pipeline.manifest");
-    std::fs::write(&manifest, "host a\n    pipeline\n").unwrap();
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: a
+    processes:
+      - pipeline
+",
+    )
+    .unwrap();
     let scratch = dir.join("scratch");
 
     let mut hashes = Vec::new();
@@ -283,7 +319,14 @@ fn check_echo(name: &str, manifest_text: &str) {
 fn tcp_echo_between_two_hosts() {
     check_echo(
         "multiproc_tcp",
-        "host alpha\n    tcp_echo server 7000 4\nhost beta\n    tcp_echo client alpha 7000 4\n",
+        r"hosts:
+  - name: alpha
+    processes:
+      - tcp_echo server 7000 4
+  - name: beta
+    processes:
+      - tcp_echo client alpha 7000 4
+",
     );
 }
 
@@ -291,7 +334,12 @@ fn tcp_echo_between_two_hosts() {
 fn unix_domain_echo_on_one_host() {
     check_echo(
         "multiproc_unix",
-        "host alpha\n    tcp_echo server --unix /virtual/echo.sock 4\n    tcp_echo client --unix /virtual/echo.sock 4\n",
+        r"hosts:
+  - name: alpha
+    processes:
+      - tcp_echo server --unix /virtual/echo.sock 4
+      - tcp_echo client --unix /virtual/echo.sock 4
+",
     );
 }
 
@@ -302,7 +350,14 @@ fn udp_ping_survives_lost_datagrams() {
     let manifest = dir.join("udp.manifest");
     std::fs::write(
         &manifest,
-        "host alpha\n    udp_ping server 5353\nhost beta\n    udp_ping client alpha 5353 20\n",
+        r"hosts:
+  - name: alpha
+    processes:
+      - udp_ping server 5353
+  - name: beta
+    processes:
+      - udp_ping client alpha 5353 20
+",
     )
     .unwrap();
     let scratch = dir.join("scratch");
@@ -346,8 +401,17 @@ fn two_hosts_share_a_port_and_loopback_stays_home() {
     let manifest = dir.join("hosts.manifest");
     std::fs::write(
         &manifest,
-        "host red\n    two_hosts server 8080\nhost blue\n    two_hosts server 8080\n\
-         host green\n    two_hosts client 8080 red blue\n",
+        r"hosts:
+  - name: red
+    processes:
+      - two_hosts server 8080
+  - name: blue
+    processes:
+      - two_hosts server 8080
+  - name: green
+    processes:
+      - two_hosts client 8080 red blue
+",
     )
     .unwrap();
     let scratch = dir.join("scratch");
@@ -386,7 +450,15 @@ fn timed_waits_follow_the_virtual_clock() {
     let dir = common::scratch_dir("multiproc_timers");
     common::build_c("timers", &dir, &[]);
     let manifest = dir.join("timers.manifest");
-    std::fs::write(&manifest, "host a\n    timers\n").unwrap();
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: a
+    processes:
+      - timers
+",
+    )
+    .unwrap();
     let scratch = dir.join("scratch");
     let started = std::time::Instant::now();
     for seed in 1..=4u64 {
@@ -412,13 +484,27 @@ fn a_fixed_latency_between_hosts_changes_the_schedule_not_the_results() {
     let echo = dir.join("echo.manifest");
     std::fs::write(
         &echo,
-        "host alpha\n    tcp_echo server 7000 4\nhost beta\n    tcp_echo client alpha 7000 4\n",
+        r"hosts:
+  - name: alpha
+    processes:
+      - tcp_echo server 7000 4
+  - name: beta
+    processes:
+      - tcp_echo client alpha 7000 4
+",
     )
     .unwrap();
     let udp = dir.join("udp.manifest");
     std::fs::write(
         &udp,
-        "host alpha\n    udp_ping server 5353\nhost beta\n    udp_ping client alpha 5353 20\n",
+        r"hosts:
+  - name: alpha
+    processes:
+      - udp_ping server 5353
+  - name: beta
+    processes:
+      - udp_ping client alpha 5353 20
+",
     )
     .unwrap();
     let latency = ["--net-latency", "5ms"];
@@ -462,9 +548,17 @@ fn check_poll_server(mode: &str) {
     std::fs::write(
         &manifest,
         format!(
-            "host hub\n    poll_server server {mode} 6000 4\n\
-             host spoke\n    poll_server client hub 6000 0 5\n    poll_server client hub 6000 1 5\n\
-             \x20   poll_server client hub 6000 2 5\n    poll_server client hub 6000 3 5 stall\n"
+            r"hosts:
+  - name: hub
+    processes:
+      - poll_server server {mode} 6000 4
+  - name: spoke
+    processes:
+      - poll_server client hub 6000 0 5
+      - poll_server client hub 6000 1 5
+      - poll_server client hub 6000 2 5
+      - poll_server client hub 6000 3 5 stall
+"
         ),
     )
     .unwrap();
@@ -521,7 +615,11 @@ fn a_locked_file_counter_is_always_exact() {
     let manifest = dir.join("flock.manifest");
     std::fs::write(
         &manifest,
-        "host a\n    counter_file counter.txt 4 300 --flock\n",
+        r"hosts:
+  - name: a
+    processes:
+      - counter_file counter.txt 4 300 --flock
+",
     )
     .unwrap();
     let scratch = dir.join("scratch");
@@ -563,7 +661,15 @@ fn an_unlocked_file_counter_loses_updates_reproducibly() {
     let dir = common::scratch_dir("multiproc_counter");
     common::build_c("counter_file", &dir, &[]);
     let manifest = dir.join("racy.manifest");
-    std::fs::write(&manifest, "host a\n    counter_file counter.txt 4 500\n").unwrap();
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: a
+    processes:
+      - counter_file counter.txt 4 500
+",
+    )
+    .unwrap();
     let scratch = dir.join("scratch");
     // Branch hooks only: the switch between the read and the write comes
     // from the I/O calls being hook events.
@@ -589,7 +695,15 @@ fn a_shared_mapping_races_only_with_memory_hooks() {
     let dir = common::scratch_dir("multiproc_map");
     common::build_c("shared_map", &dir, &[]);
     let manifest = dir.join("map.manifest");
-    std::fs::write(&manifest, "host a\n    shared_map\n").unwrap();
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: a
+    processes:
+      - shared_map
+",
+    )
+    .unwrap();
     let scratch = dir.join("scratch");
     let exact = "total=400000 expected=400000\n";
     for seed in 1..=4u64 {
@@ -613,7 +727,15 @@ fn rust_std_net_echo_with_a_spawned_client() {
     let dir = common::scratch_dir("multiproc_rustnet");
     common::build_rust("net", &dir);
     let manifest = dir.join("net.manifest");
-    std::fs::write(&manifest, "host a\n    net\n").unwrap();
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: a
+    processes:
+      - net
+",
+    )
+    .unwrap();
     let scratch = dir.join("scratch");
     let mut hashes = Vec::new();
     for seed in 1..=3u64 {
@@ -640,4 +762,83 @@ fn rust_std_net_echo_with_a_spawned_client() {
     }
     hashes.dedup();
     assert!(hashes.len() > 1, "every seed produced the same schedule");
+}
+
+#[test]
+fn run_file_settings_environment_and_errors() {
+    let dir = common::scratch_dir("multiproc_runfile");
+    common::build_c_source(
+        "showenv",
+        "#include <stdio.h>\n#include <stdlib.h>\nint main(int c, char **v){ const char *m = getenv(\"MODE\"); \
+         printf(\"%s %s mode=%s\\n\", v[0], c > 1 ? v[1] : \"-\", m ? m : \"unset\"); return 0; }\n",
+        &dir,
+    );
+    let manifest = dir.join("run.yaml");
+    std::fs::write(
+        &manifest,
+        r#"seed: 41
+quantum: 2000..3000
+net-latency: 2ms
+hosts:
+  - name: a
+    processes:
+      - argv: [showenv, "two words"]
+        env: { MODE: fast }
+      - showenv plain
+"#,
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    common::supervisor_dylib();
+    let run = |extra: &[&str]| {
+        let out = Command::new(common::rewrite_bin())
+            .args(["run", "--capture"])
+            .args(extra)
+            .arg("--scratch")
+            .arg(&scratch)
+            .arg("--manifest")
+            .arg(&manifest)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // The seed is stamped into the rewritten binary, so the report shows
+    // which one the run used.
+    let report = run(&[]);
+    assert!(report.contains("p0.seed=41"), "{report}");
+    let read = |i: usize| std::fs::read_to_string(scratch.join(format!("stdout.{i}"))).unwrap();
+    assert_eq!(read(0), "showenv two words mode=fast\n");
+    assert_eq!(read(1), "showenv plain mode=unset\n");
+    let report = run(&["--seed", "5"]);
+    assert!(report.contains("p0.seed=5"), "{report}");
+
+    for (text, complaint) in [
+        (
+            "hosts:\n  - name: a\n    root: /tmp/x\n    processes: [p]\n",
+            "root",
+        ),
+        (
+            "quantum: backwards\nhosts:\n  - name: a\n    processes: [showenv]\n",
+            "bad quantum",
+        ),
+        ("host a\n    showenv\n", "run file"),
+    ] {
+        let bad = dir.join("bad.yaml");
+        std::fs::write(&bad, text).unwrap();
+        let out = Command::new(common::rewrite_bin())
+            .args(["run", "--scratch"])
+            .arg(&scratch)
+            .arg("--manifest")
+            .arg(&bad)
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(complaint), "{complaint}: {err}");
+    }
 }

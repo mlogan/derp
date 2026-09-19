@@ -20,14 +20,35 @@ Options worth knowing:
   `1000..10000` finds races in short programs and costs about 57% on two
   compute-bound processes; `10000..100000` costs about 10% and misses races
   in short programs.
-- `--manifest FILE` lists virtual hosts and the processes on each; hosts
-  get `10.0.0.1` upward and are reachable by name. `--net-latency 5ms`
+- `--manifest FILE` is the run file, in YAML (below). Hosts get `10.0.0.1`
+  upward in the order listed and are reachable by name. `--net-latency 5ms`
   delays traffic between different hosts in virtual time.
 - `--capture` writes each guest's stdout to `stdout.<index>` in the
   `--scratch` directory. The report goes to stderr: `run.*` totals, then
   `p<index>.*` per process.
 - `REWRITE_PARK_SPINS=N` makes a parking thread spin first. It only helps
   when the baton bounces back within microseconds; off by default.
+
+## The run file
+
+```yaml
+seed: 7                  # optional; the command line overrides these four
+quantum: 1000..10000
+mem-hook-rate: 1/16
+net-latency: 5ms
+hosts:                   # in order: 10.0.0.1, 10.0.0.2, ...
+  - name: alpha
+    processes:
+      - [server, --port, 8080]          # argv verbatim
+      - client alpha 8080               # or a line, split on whitespace
+      - argv: [worker, "two words"]     # or a map, with an environment
+        env: { MODE: fast }
+```
+
+Processes start in file order. `argv[0]` names the program, relative to the
+run file, and reaches the guest exactly as written. Numbers and booleans in
+an argument list are taken as their text; quote one whose spelling matters
+(`"007"`). Unknown keys are errors.
 
 Plans and progress: `IMPLEMENTATION_PLAN_REWRITE.md`,
 `IMPLEMENTATION_PLAN_MULTIPROC.md`, `TASKS_REWRITE.md`,

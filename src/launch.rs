@@ -96,6 +96,8 @@ pub struct Guest {
     pub args: Vec<OsString>,
     /// Index of the virtual host the process lives on
     pub host: u32,
+    /// `KEY=VALUE` pairs for this guest only, after `Run::env`
+    pub env: Vec<(String, String)>,
     /// Redirect the guest's stdout to this file (created or truncated)
     pub stdout: Option<PathBuf>,
 }
@@ -182,7 +184,7 @@ fn spawn(
         s.extend(d.as_os_str().as_bytes());
         env.push(CString::new(s).unwrap());
     }
-    for (k, v) in run.env.iter().chain(extra_env) {
+    for (k, v) in run.env.iter().chain(&guest.env).chain(extra_env) {
         env.push(CString::new(format!("{k}={v}")).unwrap());
     }
 
@@ -699,6 +701,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
             argv0: None,
             args: cfg.args.clone(),
             host: 0,
+            env: Vec::new(),
             stdout: cfg.stdout.clone(),
         }],
         hosts: vec!["h0".into()],

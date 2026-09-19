@@ -26,17 +26,27 @@ options:
   --no-supervisor                      no scheduling: the dylib only provides the stubs' counter
   --aslr                               leave ASLR on
   --native                             run the original binary without the dylib
-  --manifest FILE                      processes to start, by virtual host
+  --manifest FILE                      run file (YAML): hosts and their processes
   --scratch DIR                        working directory and TMPDIR of a manifest run
                                        (default: a directory under the system temp dir)
   --capture                            manifest run: each guest's stdout goes to stdout.<index>
                                        in the scratch directory instead of ours
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
-manifest:
-  host NAME                            opens a host
-      prog arg \"two words\"           one process; the tokens are its argv verbatim
-  Processes start in file order. Program paths are relative to the manifest.
+run file:
+  seed: 7                              optional; the command line overrides these four
+  quantum: 1000..10000
+  mem-hook-rate: 1/16
+  net-latency: 5ms
+  hosts:                               in order: 10.0.0.1, 10.0.0.2, ...
+    - name: alpha
+      files: [site/index.html]         copied into the host's fresh directory
+      processes:
+        - [server, --port, 8080]       argv verbatim
+        - client alpha 8080            or a line, split on whitespace
+        - argv: [worker]               or a map, with an environment
+          env: { MODE: fast }
+  Program paths are relative to the run file. See README.md.
 ";
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
@@ -44,7 +54,10 @@ fn fail(msg: impl std::fmt::Display) -> ExitCode {
     ExitCode::from(2)
 }
 
+#[derive(Clone)]
 struct Cli {
+    /// Settings given on the command line, which a run file cannot override
+    given: Vec<&'static str>,
     opts: Options,
     quantum: (u32, u32),
     supervisor: bool,
@@ -71,8 +84,35 @@ fn parse_duration_ns(s: &str) -> Option<u64> {
     digits.parse::<u64>().ok()?.checked_mul(scale)
 }
 
+fn parse_quantum(v: &str) -> Result<(u32, u32), String> {
+    v.split_once("..")
+        .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
+        .filter(|&(lo, hi): &(u32, u32)| lo >= 1 && hi >= lo)
+        .ok_or(format!("bad quantum {v}"))
+}
+
+/// The run's settings: the run file's, unless the command line gave them.
+fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, String> {
+    let mut cli = cli.clone();
+    let from_file = |name: &str| !cli.given.contains(&name);
+    if let (Some(seed), true) = (m.seed, from_file("seed")) {
+        cli.opts.seed = seed;
+    }
+    if let (Some(q), true) = (&m.quantum, from_file("quantum")) {
+        cli.quantum = parse_quantum(q)?;
+    }
+    if let (Some(r), true) = (&m.mem_hook_rate, from_file("mem-hook-rate")) {
+        cli.opts.mem_rate = rw::parse_rate(r).ok_or(format!("bad rate {r}"))?;
+    }
+    if let (Some(l), true) = (&m.net_latency, from_file("net-latency")) {
+        cli.net_latency_ns = parse_duration_ns(l).ok_or(format!("bad duration {l}"))?;
+    }
+    Ok(cli)
+}
+
 fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
     let mut cli = Cli {
+        given: Vec::new(),
         opts: Options::default(),
         quantum: launch::DEFAULT_QUANTUM,
         supervisor: true,
@@ -96,18 +136,16 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         match a.as_str() {
             "--seed" => {
                 cli.opts.seed = take_value(&mut args)?.parse().map_err(|_| "bad seed")?;
+                cli.given.push("seed");
             }
             "--mem-hook-rate" => {
                 let v = take_value(&mut args)?;
                 cli.opts.mem_rate = rw::parse_rate(&v).ok_or(format!("bad rate {v}"))?;
+                cli.given.push("mem-hook-rate");
             }
             "--quantum" => {
-                let v = take_value(&mut args)?;
-                cli.quantum = v
-                    .split_once("..")
-                    .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
-                    .filter(|&(lo, hi): &(u32, u32)| lo >= 1 && hi >= lo)
-                    .ok_or(format!("bad quantum {v}"))?;
+                cli.quantum = parse_quantum(&take_value(&mut args)?)?;
+                cli.given.push("quantum");
             }
             "--manifest" => cli.manifest = Some(take_value(&mut args)?.into()),
             "--scratch" => cli.scratch = Some(take_value(&mut args)?.into()),
@@ -115,6 +153,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             "--net-latency" => {
                 let v = take_value(&mut args)?;
                 cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
+                cli.given.push("net-latency");
             }
             "--no-supervisor" => cli.supervisor = false,
             "--aslr" => cli.disable_aslr = false,
@@ -208,6 +247,7 @@ fn stdout_file(scratch: &Path, index: usize) -> PathBuf {
 /// each guest's stdout goes to `stdout.<index>` in the scratch directory.
 fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallible<RunOutcome> {
     let m = manifest::parse(&std::fs::read_to_string(path)?)?;
+    let cli = &with_run_file_settings(cli, &m)?;
     let base = path.parent().unwrap_or(Path::new("."));
     let mut guests = Vec::new();
     for (i, p) in m.processes.iter().enumerate() {
@@ -223,6 +263,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
             argv0: Some(p.argv[0].clone().into()),
             args: p.argv[1..].iter().map(Into::into).collect(),
             host: p.host,
+            env: p.env.clone(),
             stdout: capture.then(|| stdout_file(scratch, i)),
         });
     }
@@ -230,7 +271,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
     let scratch = std::fs::canonicalize(scratch)?;
     let run = Run {
         guests,
-        hosts: m.hosts.clone(),
+        hosts: m.hosts.iter().map(|h| h.name.clone()).collect(),
         dylib: dylib_for(cli)?,
         env: vec![
             ("TMPDIR".into(), scratch.to_string_lossy().into_owned()),

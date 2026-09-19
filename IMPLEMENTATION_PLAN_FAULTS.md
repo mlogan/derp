@@ -18,7 +18,7 @@ hosts:
       - argv: [ping_pong, pong, 7000]
         daemon: true
         restart: on-failure      # never (default) | on-failure | always
-        restart-delay: 20ms      # virtual time between death and the new life (default 10ms)
+        restart-delay: 20ms      # virtual time between death and the new life (as built: a range, default 100ms)
         max-restarts: 10         # default: no limit
         crash:
           every: 50ms..200ms     # virtual time into each life, drawn per life
@@ -58,7 +58,7 @@ is a `SIGKILL`); `always` also after `exit(0)`.
 
 ## Report
 
-`run.crashes_injected`, `run.restarts`; per process `restart_of=<index>`.
+`run.crashes_injected`, `run.restarts`; per process `restart_of=<index>` (as built: `p<i>.entry`).
 
 ## Tests (`ping_pong.c`)
 

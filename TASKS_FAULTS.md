@@ -49,8 +49,48 @@ Tracks `IMPLEMENTATION_PLAN_FAULTS.md`. Branch `mlogan-fault-injection`.
 
 - Only processes the launcher starts from the run file are restarted; a
   guest's own children are their parent's to restart.
-- Real pipes and files of a crashed process close when the kernel gets to
-  it, in real time; only its virtual sockets close at the crash point.
+- A run holds 1024 processes, and every life is one: a run that would
+  need more ends with an error saying so. An unlimited `crash:` on a run
+  that is otherwise deadlocked keeps it going until then.
 - A crash lands on a hand-off, so its virtual time is the first yield at or
   after `crash_at`, not `crash_at` exactly.
-- Eight crashes at most per hand-off; more wait for the next one.
+- A process killed while one of its unscheduled threads holds the shared
+  lock wedges the run (GCD guests are refused, so nothing does this today).
+- The crashed process's own last `REWRITE_TRACE` line can be lost; the
+  schedule hash is unaffected.
+
+## Deviations from the plan
+
+- `restart-delay` became a range with a 100 ms default and may not be zero
+  (a restart is never instantaneous).
+- The report names a life's run-file entry (`p<i>.entry`), not
+  `restart_of`.
+
+## Review (2026-09-19)
+
+Three reviewers; every confirmed finding is fixed and has a test.
+
+- **Hang**: more than eight crashes due at once spun forever under the
+  lock. The kill queue is gone: `take_kills` scans for `killed &&
+  !signalled`.
+- **Determinism**: the launcher's `process_died` repeated a crashed
+  process's wakes at a moment of real time. It now only records the exit;
+  instead whoever takes up the baton next waits (in real time, the
+  schedule standing still) until the victim is really dead and then wakes
+  I/O waiters once (`settle_deaths`). Real pipes and locks of a crashed
+  process are thereby released at a fixed point too.
+- **Determinism**: a crash due before the replacement had attached waited
+  for the attach. Crashes now land on schedule whatever the state; a life
+  that finds itself crashed while attaching goes by itself.
+- `kill` of a process that is down between lives no longer reaches
+  `kill(0, …)`; an already-crashed target is `ESRCH`.
+- Full tables: `will_restart` and `register_restart` share one predicate
+  and the run ends with an error instead of a false deadlock.
+- Fault keys without the supervisor are an error; durations over a year
+  are rejected; a replacement that dies before it is watched is handled
+  before the first baton; captured stdout is always opened `O_APPEND`.
+- Simplifications taken: `restart_of`, `Tracked::ours` and the pending-kill
+  tuple removed, `pending_crash` shared. Deferred: one coordinator call per
+  death, a `Supervision` struct for the launcher loop, a common
+  `retire` for `crash`/`process_died`, manifest normalisation, test
+  scaffolding helpers.

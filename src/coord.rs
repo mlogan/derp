@@ -82,6 +82,7 @@ impl Coordinator {
             mem
         };
         let shared = unsafe { Shared::init(mem.cast::<Shared>(), seed, quantum.0, quantum.1) };
+        shared.set_launcher();
         Ok(Coordinator { shared, mem, path })
     }
 

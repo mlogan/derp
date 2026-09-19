@@ -10,7 +10,7 @@
 
 use std::cell::UnsafeCell;
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use crate::rng::Rng;
 
@@ -256,6 +256,8 @@ pub struct Shared {
     /// lock: only the baton holder runs guest code.
     counter: UnsafeCell<i64>,
     lock: AtomicU32,
+    /// Real pid of the launcher, or 0 for a run that has none
+    launcher: AtomicI32,
     state: UnsafeCell<State>,
 }
 
@@ -307,6 +309,11 @@ extern "C" {
 
 const UL_COMPARE_AND_WAIT_SHARED: u32 = 3;
 const ULF_NO_ERRNO: u32 = 0x0100_0000;
+/// Exit status of a guest that found its launcher gone (`EX_SOFTWARE`)
+pub const ORPHANED_EXIT: i32 = 70;
+/// A parked thread looks for the launcher this often, in real time
+const PARK_CHECK_NS: u64 = 1_000_000_000;
+
 const PARK_OP: u32 = UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO;
 
 pub fn fnv(mut h: u64, v: u64) -> u64 {
@@ -357,13 +364,42 @@ impl Shared {
         (shared.magic == MAGIC && shared.size == Self::SIZE as u64).then_some(shared)
     }
 
+    /// The calling process runs the run: guests that outlive it exit.
+    pub fn set_launcher(&self) {
+        self.launcher
+            .store(unsafe { libc::getpid() }, Ordering::Relaxed);
+    }
+
+    /// Exit if the launcher is gone. Nobody is left to reap this process,
+    /// end the run or release a lock the launcher held, so a guest that
+    /// stayed would park or spin forever.
+    pub fn exit_if_orphaned(&self) {
+        let launcher = self.launcher.load(Ordering::Relaxed);
+        if launcher == 0 || launcher == unsafe { libc::getpid() } {
+            return;
+        }
+        // EPERM would still mean it exists
+        let gone = unsafe { libc::kill(launcher, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            unsafe { libc::_exit(ORPHANED_EXIT) };
+        }
+    }
+
     pub fn lock(&self) -> Guard<'_> {
+        let mut spins = 0u32;
         while self
             .lock
             .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             std::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            // Critical sections are microseconds long: this many spins
+            // means the holder may have died with the lock
+            if spins.is_multiple_of(1 << 22) {
+                self.exit_if_orphaned();
+            }
         }
         Guard { shared: self }
     }
@@ -397,7 +433,8 @@ impl Shared {
             std::hint::spin_loop();
         }
         while atomic.load(Ordering::Acquire) == seen {
-            unsafe { __ulock_wait2(PARK_OP, word, u64::from(seen), 0, 0) };
+            unsafe { __ulock_wait2(PARK_OP, word, u64::from(seen), PARK_CHECK_NS, 0) };
+            self.exit_if_orphaned();
         }
     }
 }

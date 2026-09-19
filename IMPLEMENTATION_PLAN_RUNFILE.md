@@ -16,7 +16,7 @@ allow:                   # extra paths every host may touch (step 2)
   - /opt/site-content
 hosts:                   # a list: order assigns 10.0.0.1, 10.0.0.2, ...
   - name: alpha
-    root: sites/alpha    # optional, relative to the run file (step 2)
+    files: [site/index.html, site/img]   # copied into the host's fresh directory (step 2)
     processes:
       - [server, --port, 8080]          # argv verbatim
       - client alpha 8080               # or a line, split on whitespace
@@ -33,8 +33,13 @@ hosts:                   # a list: order assigns 10.0.0.1, 10.0.0.2, ...
 Not a sandbox: a guard against configurations that would let one host see
 another's files by accident. Symlinks and deliberate tricks may escape.
 
-- Each host gets a root directory: `<scratch>/<name>` created empty, or the
-  run file's `root:` used in place and never deleted.
+- The launcher creates every host's root directory fresh at the start of
+  each run, as `<scratch>/<name>`. The run file never names it. (Mark,
+  2026-09-19: "we don't want to declare a host dir, we want the supervisor
+  to create one for us each time we start.")
+- A host's `files:` are inputs copied into the fresh root before anything
+  starts: a file lands as `<root>/<basename>`, a directory as
+  `<root>/<basename>/` with its contents. Paths are relative to the run file.
 - Processes start with the root as cwd, `PWD`, `HOME`, and `TMPDIR=<root>/tmp`.
   Spawned children inherit the host and therefore the root.
 - The supervisor interposes the calls that take path names. A path is made

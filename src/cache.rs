@@ -20,9 +20,42 @@ pub fn read_macho(path: &Path) -> Fallible<MachO> {
 }
 
 pub fn rewrite_file(input: &Path, output: &Path, opts: &Options) -> Fallible<rw::Stats> {
+    let stats = rewrite_without_symbols(input, output, opts)?;
+    link_debug_symbols(input, output);
+    Ok(stats)
+}
+
+fn rewrite_without_symbols(input: &Path, output: &Path, opts: &Options) -> Fallible<rw::Stats> {
     let r = rw::rewrite(&read_macho(input)?, opts)?;
     write_exe(output, &r.image)?;
     Ok(r.stats)
+}
+
+fn with_dsym_suffix(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".dSYM");
+    PathBuf::from(name)
+}
+
+/// Make `<output>.dSYM` point at the input's dSYM bundle, if it has one.
+/// A debugger looks for the bundle by the executable's file name, and the
+/// rewritten file has another name (and, for installed programs, another
+/// directory), so source-line breakpoints would stay pending. The bundle
+/// itself still fits: rewriting keeps the UUID and patches text in place.
+/// Best effort: debugging is not what a run depends on.
+fn link_debug_symbols(input: &Path, output: &Path) {
+    let Ok(bundle) = std::fs::canonicalize(with_dsym_suffix(input)) else {
+        return;
+    };
+    let link = with_dsym_suffix(output);
+    if std::fs::read_link(&link).is_ok_and(|target| target == bundle) {
+        return;
+    }
+    // Only ever replace a link, never a real bundle someone put there
+    if std::fs::symlink_metadata(&link).is_ok_and(|m| m.file_type().is_symlink()) {
+        let _ = std::fs::remove_file(&link);
+    }
+    let _ = std::os::unix::fs::symlink(&bundle, &link);
 }
 
 /// Where rewritten copies of `input` go: next to it, unless it lives where
@@ -90,7 +123,7 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
             std::process::id(),
             NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
-        let stats = rewrite_file(input, &tmp, opts)?;
+        let stats = rewrite_without_symbols(input, &tmp, opts)?;
         std::fs::rename(&tmp, &out)?;
         eprintln!(
             "rewrite: {} sites hooked -> {}",
@@ -98,5 +131,7 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
             out.display()
         );
     }
+    // Also on a cache hit: the program may have gained a dSYM since
+    link_debug_symbols(input, &out);
     Ok(out)
 }

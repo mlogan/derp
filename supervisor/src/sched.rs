@@ -492,70 +492,104 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
     }
     // A deadline of 0 would mean none; one in the past expires at once
     s.threads[me].deadline = deadline.map_or(0, |d| d.max(1));
-    match s.hand_off(Some((me, st, key)), site) {
-        Handoff::Idle => {
-            let stuck = state != State::Exited || s.any_alive();
-            drop(s);
-            if !stuck {
-                return;
+    let handoff = s.hand_off(Some((me, st, key)), site);
+    let after = After::of(&mut s, handoff);
+    let stuck = state != State::Exited || s.any_alive();
+    drop(s);
+    if after.carry_out(sh, me, state, site) || !stuck {
+        return;
+    }
+
+    // Nothing can run. A GCD worker may be about to wake one of us (a block
+    // finishing under dispatch_sync, a semaphore): look again in real time.
+    // The virtual clock and the trace do not move meanwhile.
+    let outside = has_outside_threads();
+    let anywhere = with(|s, pid| {
+        s.procs[pid as usize].has_outside_threads |= outside;
+        s.any_outside_threads()
+    }) == Some(true);
+    if !anywhere {
+        fatal("deadlock: every thread is blocked");
+    }
+    let began = std::time::Instant::now();
+    loop {
+        unsafe { libc::usleep(200) };
+        let mut s = sh.lock();
+        let handoff = s.choose(Some(me), site);
+        let after = After::of(&mut s, handoff);
+        drop(s);
+        if after.carry_out(sh, me, state, site) {
+            return;
+        }
+        if began.elapsed() > std::time::Duration::from_secs(30) {
+            fatal("deadlock: every thread is blocked, and no outside thread woke one");
+        }
+    }
+}
+
+/// What a hand-off decided, copied out from under the lock.
+struct After {
+    handoff: Handoff,
+    quantum: i64,
+    issued: u64,
+    clock: u64,
+    /// Processes the scheduler crashed during this hand-off; the signal is
+    /// ours to send
+    kills: ([i32; shared::MAX_PENDING_KILLS], usize),
+    /// One of them is this process
+    crashed_self: bool,
+}
+
+impl After {
+    fn of(s: &mut shared::State, handoff: Handoff) -> After {
+        After {
+            handoff,
+            quantum: s.pending_quantum,
+            issued: s.issued,
+            clock: s.clock_ns,
+            kills: s.take_kills(),
+            crashed_self: s.procs[pid() as usize].killed,
+        }
+    }
+
+    /// Returns false when the run was idle and the caller has to wait.
+    fn carry_out(self, sh: &Shared, me: usize, state: State, site: u64) -> bool {
+        let own = unsafe { libc::getpid() };
+        for &victim in &self.kills.0[..self.kills.1] {
+            if victim != own && victim > 0 {
+                unsafe { libc::kill(victim, libc::SIGKILL) };
             }
-            let outside = has_outside_threads();
-            let anywhere = with(|s, pid| {
-                s.procs[pid as usize].has_outside_threads |= outside;
-                s.any_outside_threads()
-            }) == Some(true);
-            if !anywhere {
-                fatal("deadlock: every thread is blocked");
+        }
+        match self.handoff {
+            Handoff::Idle if self.crashed_self => die(),
+            Handoff::Idle => false,
+            Handoff::Stay => {
+                install_quantum(self.quantum);
+                true
             }
-            // A GCD worker may be about to wake one of us (a block finishing
-            // under dispatch_sync, a semaphore). Look again in real time;
-            // the virtual clock and the trace do not move meanwhile.
-            let began = std::time::Instant::now();
-            loop {
-                unsafe { libc::usleep(200) };
-                let mut s = sh.lock();
-                match s.choose(Some(me), site) {
-                    Handoff::Idle => {}
-                    Handoff::Stay => {
-                        let q = s.pending_quantum;
-                        drop(s);
-                        install_quantum(q);
-                        return;
-                    }
-                    Handoff::Switch { to, seen } => {
-                        let (issued, clock) = (s.issued, s.clock_ns);
-                        drop(s);
-                        trace_switch(me, to, issued, site, clock);
-                        sh.unpark(to);
-                        if state != State::Exited {
-                            sh.park(me, seen);
-                            install_quantum(sh.lock().pending_quantum);
-                        }
-                        return;
-                    }
+            Handoff::Switch { to, seen } => {
+                trace_switch(me, to, self.issued, site, self.clock);
+                sh.unpark(to);
+                // Our own crash comes after the baton is safely elsewhere
+                if self.crashed_self {
+                    die();
                 }
-                drop(s);
-                if began.elapsed() > std::time::Duration::from_secs(30) {
-                    fatal("deadlock: every thread is blocked, and no outside thread woke one");
+                if state != State::Exited {
+                    sh.park(me, seen);
+                    install_quantum(sh.lock().pending_quantum);
                 }
+                true
             }
         }
-        Handoff::Stay => {
-            let q = s.pending_quantum;
-            drop(s);
-            install_quantum(q);
-        }
-        Handoff::Switch { to, seen } => {
-            let issued = s.issued;
-            let clock = s.clock_ns;
-            drop(s);
-            trace_switch(me, to, issued, site, clock);
-            sh.unpark(to);
-            if state != State::Exited {
-                sh.park(me, seen);
-                install_quantum(sh.lock().pending_quantum);
-            }
-        }
+    }
+}
+
+/// The scheduler crashed this process: its threads are already out of the
+/// schedule, so all that is left is to go the way a crash goes.
+fn die() -> ! {
+    unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    loop {
+        unsafe { libc::pause() };
     }
 }
 

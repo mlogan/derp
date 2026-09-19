@@ -99,6 +99,8 @@ pub struct Guest {
     pub cwd: Option<PathBuf>,
     /// Killed when every guest that is not a daemon has exited
     pub daemon: bool,
+    /// Crashes to inject into it and whether it is started again
+    pub faults: shared::Faults,
 }
 
 /// Several guests under one scheduler
@@ -135,6 +137,9 @@ pub struct RunOutcome {
     pub initial: usize,
     /// Which of the initial guests were daemons, killed at the end
     pub daemons: Vec<bool>,
+    /// For each of `guests`, the index in `Run::guests` it was started
+    /// from; a restarted process shares it with its earlier lives
+    pub specs: Vec<Option<usize>>,
     pub totals: Totals,
     /// The survivors were killed because every thread was blocked
     pub deadlock: bool,
@@ -143,6 +148,8 @@ pub struct RunOutcome {
 /// A process of the run as the launcher sees it, indexed like the shared
 /// process table
 struct Tracked {
+    /// Which of `Run::guests` this is a life of; None for a guest's child
+    spec: Option<usize>,
     pid: libc::pid_t,
     /// Our own child (we reap it) rather than a guest's
     ours: bool,
@@ -163,6 +170,7 @@ fn spawn(
     guest: &Guest,
     extra_env: &[(String, String)],
     guest_sock: Option<libc::c_int>,
+    later_life: bool,
 ) -> io::Result<libc::pid_t> {
     let ours = [
         "DYLD_INSERT_LIBRARIES",
@@ -239,7 +247,14 @@ fn spawn(
                 &raw mut actions,
                 1,
                 p.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC,
+                // A restarted process goes on where its earlier lives wrote
+                libc::O_WRONLY
+                    | libc::O_CREAT
+                    | if later_life {
+                        libc::O_APPEND
+                    } else {
+                        libc::O_TRUNC
+                    },
                 0o644,
             );
         }
@@ -271,6 +286,7 @@ fn spawn(
 impl Tracked {
     fn new(pid: libc::pid_t, ours: bool) -> Self {
         Tracked {
+            spec: None,
             pid,
             ours,
             status: None,
@@ -512,6 +528,7 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
     }
     let deadlock = result?;
     let totals = coord.as_ref().map(Coordinator::totals).unwrap_or_default();
+    let specs: Vec<Option<usize>> = procs.iter().map(|p| p.spec).collect();
     let guests = procs
         .into_iter()
         .map(|c| {
@@ -537,6 +554,7 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
         guests,
         initial: run.guests.len(),
         daemons: run.guests.iter().map(|g| g.daemon).collect(),
+        specs,
         totals,
         deadlock,
     })
@@ -546,9 +564,70 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
 /// just exited held the baton, so everything else is parked and dies where
 /// it stands, before the baton could be handed to it.
 fn only_daemons_left(run: &Run, procs: &[Tracked]) -> bool {
-    let daemon = |i: usize| run.guests[i].daemon;
-    let work_left = (0..run.guests.len()).any(|i| !daemon(i) && procs[i].status.is_none());
+    let work_left = procs
+        .iter()
+        .any(|p| p.status.is_none() && p.spec.is_some_and(|g| !run.guests[g].daemon));
     !work_left && run.guests.iter().any(|g| g.daemon)
+}
+
+/// The environment that makes a guest process `proc_index` of the run.
+fn guest_env(run: &Run, coord: Option<(&Coordinator, u32)>) -> Vec<(String, String)> {
+    let mut env = vec![("REWRITE_SEED".to_string(), run.seed.to_string())];
+    if run.passive {
+        env.push((PASSIVE_VAR.into(), "1".into()));
+    }
+    env.push((shared::EXTERNAL_VAR.into(), external_objects()));
+    if let Some((coord, proc_index)) = coord {
+        env.push((
+            shared::SHARED_VAR.into(),
+            coord.path().to_string_lossy().into_owned(),
+        ));
+        env.push((shared::PROC_VAR.into(), proc_index.to_string()));
+    }
+    env
+}
+
+/// Put `tracked` at `index`, which follows the shared process table and may
+/// be ahead of what we have heard of.
+fn track(procs: &mut Vec<Tracked>, index: usize, tracked: Tracked) {
+    while procs.len() <= index {
+        // A process whose spawn failed in the guest, or that we hear of later
+        let mut t = Tracked::new(0, false);
+        t.status = Some(0);
+        procs.push(t);
+    }
+    procs[index] = tracked;
+}
+
+/// If the scheduler registered a next life for `index`, start it. When the
+/// real process comes up is of no consequence: its main thread only becomes
+/// runnable once the restart delay is over, in virtual time.
+fn respawn(
+    run: &Run,
+    coord: &Coordinator,
+    events: &Events,
+    guest_sock: Option<libc::c_int>,
+    procs: &mut Vec<Tracked>,
+    gone: &mut Vec<usize>,
+    index: usize,
+) -> io::Result<()> {
+    let (Some(new), Some(spec)) = (coord.replacement_of(index as u32), procs[index].spec) else {
+        return Ok(());
+    };
+    let new = new as usize;
+    if procs.get(new).is_some_and(|p| p.spec.is_some()) {
+        return Ok(());
+    }
+    let env = guest_env(run, Some((coord, new as u32)));
+    let pid = spawn(run, &run.guests[spec], &env, guest_sock, true)?;
+    let mut tracked = Tracked::new(pid, true);
+    tracked.spec = Some(spec);
+    track(procs, new, tracked);
+    if !events.watch_exit(pid, new) {
+        procs[new].reap(true);
+        gone.push(new);
+    }
+    Ok(())
 }
 
 fn end_run(procs: &mut [Tracked]) {
@@ -622,33 +701,36 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
         c.set_net_latency(run.net_latency_ns);
         c.add_hosts(&run.hosts);
     }
-    for guest in &run.guests {
-        let mut env = vec![("REWRITE_SEED".to_string(), run.seed.to_string())];
-        if run.passive {
-            env.push((PASSIVE_VAR.into(), "1".into()));
-        }
-        env.push((shared::EXTERNAL_VAR.into(), external_objects()));
-        if let Some(coord) = coord {
-            let pid = coord.register(guest.host);
-            debug_assert_eq!(pid as usize, procs.len());
-            env.push((
-                shared::SHARED_VAR.into(),
-                coord.path().to_string_lossy().into_owned(),
-            ));
-            env.push((shared::PROC_VAR.into(), pid.to_string()));
-        }
-        let spawned = spawn(run, guest, &env, guest_sock);
+    for (spec, guest) in run.guests.iter().enumerate() {
+        let registered = coord.map(|c| (c, c.register(guest.host, guest.faults, spec as u32)));
+        debug_assert!(registered.is_none_or(|(_, pid)| pid as usize == procs.len()));
+        let spawned = spawn(run, guest, &guest_env(run, registered), guest_sock, false);
         if spawned.is_err() {
             if let Some(g) = guest_sock {
                 unsafe { libc::close(g) };
             }
         }
-        procs.push(Tracked::new(spawned?, true));
+        let mut tracked = Tracked::new(spawned?, true);
+        tracked.spec = Some(spec);
+        procs.push(tracked);
     }
+    // The guests' end of the socket stays open here: a restarted process
+    // inherits it from us.
+    let result = supervise_started(run, coord, &events, channel.as_mut(), guest_sock, procs);
     if let Some(g) = guest_sock {
         unsafe { libc::close(g) };
     }
+    result
+}
 
+fn supervise_started(
+    run: &Run,
+    coord: Option<&Coordinator>,
+    events: &Events,
+    mut channel: Option<&mut Channel>,
+    guest_sock: Option<libc::c_int>,
+    procs: &mut Vec<Tracked>,
+) -> io::Result<bool> {
     if let Some(coord) = coord {
         coord.wait_attached(procs.len() as u32, |pid| procs[pid as usize].reap(false))?;
     }
@@ -664,10 +746,10 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     if let Some(coord) = coord {
         for i in std::mem::take(&mut gone) {
             coord.process_died(i as u32, procs[i].status.unwrap_or(0));
+            respawn(run, coord, events, guest_sock, procs, &mut gone, i)?;
         }
         coord.start();
     }
-    gone.clear();
     if only_daemons_left(run, procs) {
         end_run(procs);
     }
@@ -676,9 +758,9 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     while procs.iter().any(|c| c.status.is_none()) {
         let event = events.wait()?;
         // A dying guest's last frames may still be queued behind its exit
-        if let Some(ch) = channel.as_mut() {
+        if let Some(ch) = channel.as_deref_mut() {
             for frame in ch.drain() {
-                handle_frame(run, ch, &events, procs, &mut gone, &frame);
+                handle_frame(run, ch, events, procs, &mut gone, &frame);
             }
             if std::mem::take(&mut ch.closed) {
                 events.unwatch_socket(ch.fd);
@@ -693,17 +775,20 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
                 p.status = Some(status);
             }
         }
-        for index in std::mem::take(&mut gone) {
-            if only_daemons_left(run, procs) {
+        while let Some(index) = gone.pop() {
+            let status = procs[index].status.unwrap_or(0);
+            let restarting = coord.is_some_and(|c| c.will_restart(index as u32, status));
+            if !restarting && only_daemons_left(run, procs) {
                 end_run(procs);
                 break;
             }
             let Some(coord) = coord else { continue };
-            let status = procs[index].status.unwrap_or(0);
             if coord.process_died(index as u32, status) {
                 deadlock = true;
                 end_run(procs);
+                break;
             }
+            respawn(run, coord, events, guest_sock, procs, &mut gone, index)?;
         }
     }
     Ok(deadlock)
@@ -725,13 +810,7 @@ fn handle_frame(
         shared::MSG_SPAWNED if frame.payload.len() == 8 => {
             let child = u32::from_le_bytes(frame.payload[..4].try_into().unwrap()) as usize;
             let pid = i32::from_le_bytes(frame.payload[4..].try_into().unwrap());
-            while procs.len() <= child {
-                // Placeholder for a process whose spawn failed in the guest
-                let mut t = Tracked::new(0, false);
-                t.status = Some(0);
-                procs.push(t);
-            }
-            procs[child] = Tracked::new(pid, false);
+            track(procs, child, Tracked::new(pid, false));
             if !events.watch_exit(pid, child) {
                 procs[child].status = Some(0);
                 gone.push(child);
@@ -759,6 +838,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
             stdout: cfg.stdout.clone(),
             cwd: None,
             daemon: false,
+            faults: shared::Faults::default(),
         }],
         hosts: vec!["h0".into()],
         dylib: cfg.dylib.clone(),

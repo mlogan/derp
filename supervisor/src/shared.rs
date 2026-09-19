@@ -58,6 +58,41 @@ pub const EXTERNAL_VAR: &str = "REWRITE_EXTERNAL";
 /// held to, and extra locations every host may touch (`:`-separated)
 pub const HOST_ROOT_VAR: &str = "REWRITE_HOST_ROOT";
 pub const ALLOW_VAR: &str = "REWRITE_ALLOW";
+/// Key of a restarted process's main thread until its restart delay is
+/// over: nothing wakes it but the deadline
+pub const RESTART_KEY: u64 = 0x7FFF_FFFF_0003;
+
+pub const RESTART_NEVER: u8 = 0;
+/// After a signal or a non-zero exit
+pub const RESTART_ON_FAILURE: u8 = 1;
+pub const RESTART_ALWAYS: u8 = 2;
+pub const NO_LIMIT: u32 = u32::MAX;
+
+/// What the run file says about a process's crashes and restarts. All
+/// times are virtual. Zeroed means: never crashed on purpose, never
+/// restarted.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Faults {
+    pub restart: u8,
+    /// How long the process stays down before its next life may run, drawn
+    /// from this range at each death. While it is down its host has no such
+    /// process: connections to it are refused.
+    pub restart_delay_lo_ns: u64,
+    pub restart_delay_hi_ns: u64,
+    /// `NO_LIMIT`, or how many restarts are left
+    pub restarts_left: u32,
+    /// A crash is injected this far into each life, drawn from the range
+    /// (both 0: none)
+    pub crash_lo_ns: u64,
+    pub crash_hi_ns: u64,
+    /// `NO_LIMIT`, or how many crashes are left to inject
+    pub crashes_left: u32,
+}
+
+/// Real pids the scheduler has condemned and the caller must signal
+pub const MAX_PENDING_KILLS: usize = 8;
+
 /// `ProcRec::parent` of the processes the launcher started
 pub const NO_PROC: u32 = u32::MAX;
 /// First virtual pid; process `i` of the run is `VPID_BASE + i`. Real pids
@@ -156,6 +191,16 @@ pub struct ProcRec {
     pub outside_wakes: u64,
     /// Some thread of this process runs outside the scheduler (GCD workers)
     pub has_outside_threads: bool,
+    pub faults: Faults,
+    /// Virtual time at which this life is crashed (0: not)
+    pub crash_at: u64,
+    /// The process registered to take this one's place, or `NO_PROC`
+    pub replaced_by: u32,
+    /// The process whose place this one took, or `NO_PROC`
+    pub restart_of: u32,
+    /// Which run-file entry the launcher started this from (`NO_PROC` for a
+    /// guest's own child, which only its parent could restart)
+    pub spec: u32,
 }
 
 #[repr(C)]
@@ -178,6 +223,13 @@ pub struct State {
     pub nthreads: u32,
     pub nprocs: u32,
     next_cond_seq: u64,
+    /// Crash times come from their own stream, so that adding faults to a
+    /// run does not shift the choice of threads
+    fault_rng: Rng,
+    pub crashes_injected: u64,
+    pub restarts: u64,
+    pending_kills: [i32; MAX_PENDING_KILLS],
+    n_pending_kills: u32,
     pub threads: [ThreadRec; MAX_THREADS],
     pub procs: [ProcRec; MAX_PROCS],
     pub net: netstate::Net,
@@ -271,6 +323,7 @@ impl Shared {
         let shared = &*mem;
         let mut s = shared.lock();
         s.rng = Rng::seed_from_u64(seed);
+        s.fault_rng = Rng::seed_from_u64(seed ^ 0xFA17_FA17_FA17_FA17);
         s.quantum_lo = quantum_lo;
         s.quantum_hi = quantum_hi;
         s.trace_hash = 0xCBF2_9CE4_8422_2325;
@@ -345,7 +398,148 @@ impl State {
         p.state = P_STARTING;
         p.host = host;
         p.parent = parent;
+        p.replaced_by = NO_PROC;
+        p.restart_of = NO_PROC;
+        p.spec = NO_PROC;
         pid as u32
+    }
+
+    /// Fault settings of a process the launcher starts from run-file entry
+    /// `spec`; its first crash time is drawn now.
+    pub fn set_faults(&mut self, pid: u32, faults: Faults, spec: u32) {
+        let p = &mut self.procs[pid as usize];
+        p.faults = faults;
+        p.spec = spec;
+        let from = self.clock_ns;
+        self.draw_crash(pid, from);
+    }
+
+    fn draw_crash(&mut self, pid: u32, life_starts: u64) {
+        let f = self.procs[pid as usize].faults;
+        self.procs[pid as usize].crash_at = if f.crash_hi_ns == 0 || f.crashes_left == 0 {
+            0
+        } else {
+            let span = f.crash_hi_ns - f.crash_lo_ns + 1;
+            (life_starts + f.crash_lo_ns + self.fault_rng.below(span)).max(1)
+        };
+    }
+
+    /// Everything a violent death means to the rest of the run, done here
+    /// and now rather than when the launcher notices: the process's threads
+    /// leave the schedule, its virtual sockets close (peers see EOF or
+    /// EPIPE from this point), its parent's `waitpid` wakes, and its
+    /// restart, if it gets one, is registered. The caller sends the signal.
+    pub fn crash(&mut self, victim: u32) {
+        for t in self.live() {
+            if t.pid == victim {
+                t.state = T_EXITED;
+                t.cond_key = 0;
+                t.deadline = 0;
+            }
+        }
+        let p = &mut self.procs[victim as usize];
+        p.killed = true;
+        p.crash_at = 0;
+        let parent = p.parent;
+        self.net.process_died(victim);
+        self.wake_io();
+        if parent != NO_PROC {
+            self.wake_all(parent, WAIT_KEY);
+        }
+        if self.procs[victim as usize].faults.restart != RESTART_NEVER {
+            self.register_restart(victim);
+        }
+    }
+
+    /// Whether the launcher will be asked to start `pid` again after it
+    /// died with `status`.
+    pub fn will_restart(&self, pid: u32, status: i32) -> bool {
+        let p = &self.procs[pid as usize];
+        if p.replaced_by != NO_PROC {
+            return true;
+        }
+        let wanted = match p.faults.restart {
+            RESTART_ALWAYS => true,
+            RESTART_ON_FAILURE => status != 0,
+            _ => false,
+        };
+        wanted && p.spec != NO_PROC && p.faults.restarts_left > 0
+    }
+
+    /// The next life of `victim`: a new process on the same host whose main
+    /// thread is blocked until the restart delay is over. The real process
+    /// is the launcher's to spawn; when it does cannot matter, since the
+    /// thread is not runnable before its time and a baton handed to a
+    /// process that has not attached yet waits for it.
+    fn register_restart(&mut self, victim: u32) {
+        let old = &self.procs[victim as usize];
+        let (host, spec, mut faults) = (old.host, old.spec, old.faults);
+        if old.replaced_by != NO_PROC
+            || spec == NO_PROC
+            || faults.restarts_left == 0
+            || self.nprocs as usize >= MAX_PROCS
+            || self.nthreads as usize >= MAX_THREADS
+        {
+            return;
+        }
+        let new = self.add_proc(host, NO_PROC);
+        if faults.restarts_left != NO_LIMIT {
+            faults.restarts_left -= 1;
+        }
+        let span = faults.restart_delay_hi_ns - faults.restart_delay_lo_ns + 1;
+        let down_for = faults.restart_delay_lo_ns + self.fault_rng.below(span);
+        let starts = self.clock_ns + down_for.max(1);
+        let p = &mut self.procs[new as usize];
+        p.faults = faults;
+        p.spec = spec;
+        p.restart_of = victim;
+        self.procs[victim as usize].replaced_by = new;
+        let main = self.add_thread(new);
+        let t = &mut self.threads[main];
+        t.state = T_BLOCKED;
+        t.key = RESTART_KEY;
+        t.deadline = starts;
+        self.draw_crash(new, starts);
+        self.restarts += 1;
+    }
+
+    /// Crash every live process whose time has come. Their real pids are
+    /// queued for the caller (`take_kills`). One that has not attached yet
+    /// has no pid to signal and is crashed on a later check.
+    fn inject_due_crashes(&mut self) {
+        for pid in 0..self.nprocs {
+            let p = &self.procs[pid as usize];
+            let due = p.crash_at != 0 && p.crash_at <= self.clock_ns;
+            if !due || p.state != P_LIVE || p.killed {
+                continue;
+            }
+            if self.n_pending_kills as usize == MAX_PENDING_KILLS {
+                return;
+            }
+            let real = p.real_pid;
+            let f = &mut self.procs[pid as usize].faults;
+            if f.crashes_left != NO_LIMIT {
+                f.crashes_left -= 1;
+            }
+            self.crash(pid);
+            self.crashes_injected += 1;
+            self.pending_kills[self.n_pending_kills as usize] = real;
+            self.n_pending_kills += 1;
+        }
+    }
+
+    fn next_crash(&self) -> Option<u64> {
+        self.procs[..self.nprocs as usize]
+            .iter()
+            .filter(|p| p.crash_at != 0 && p.state == P_LIVE && !p.killed)
+            .map(|p| p.crash_at)
+            .min()
+    }
+
+    /// Real pids condemned since the last call; the caller sends `SIGKILL`.
+    pub fn take_kills(&mut self) -> ([i32; MAX_PENDING_KILLS], usize) {
+        let n = std::mem::take(&mut self.n_pending_kills) as usize;
+        (self.pending_kills, n)
     }
 
     /// Register a thread of `pid`; it starts parked and runnable. Slots are
@@ -491,17 +685,23 @@ impl State {
     /// nothing is runnable the clock jumps to the earliest deadline.
     fn pick(&mut self) -> Option<usize> {
         self.clock_moved();
+        self.inject_due_crashes();
         self.expire_deadlines();
         let mut runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         while runnable == 0 {
-            // A timed waiter's deadline or a payload in flight, whichever
-            // comes first
-            let next = match (self.earliest_deadline(), self.net.next_due()) {
-                (Some(a), Some(b)) => a.min(b),
-                (a, b) => a.or(b)?,
-            };
+            // A timed waiter's deadline, a payload in flight or a crash,
+            // whichever comes first
+            let next = [
+                self.earliest_deadline(),
+                self.net.next_due(),
+                self.next_crash(),
+            ]
+            .into_iter()
+            .flatten()
+            .min()?;
             self.clock_ns = self.clock_ns.max(next);
             self.clock_moved();
+            self.inject_due_crashes();
             self.expire_deadlines();
             runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         }
@@ -560,8 +760,14 @@ impl State {
     /// after reaping, so nothing of the process can still be running.
     /// None when the process did not hold the baton.
     pub fn process_died(&mut self, pid: u32, status: i32) -> Option<Handoff> {
+        // A death the process caused itself (exit, abort): it held the
+        // baton, so this moment is a point of the schedule too.
+        if self.will_restart(pid, status) {
+            self.register_restart(pid);
+        }
         self.procs[pid as usize].state = P_EXITED;
         self.procs[pid as usize].exit_status = status;
+        self.procs[pid as usize].crash_at = 0;
         // Its descriptors are closed: peers may see EOF or EPIPE now
         self.net.process_died(pid);
         self.wake_io();

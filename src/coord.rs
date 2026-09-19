@@ -31,6 +31,8 @@ pub struct Totals {
     pub net_dropped: u64,
     pub net_bytes: u64,
     pub net_passthrough: u64,
+    pub crashes_injected: u64,
+    pub restarts: u64,
 }
 
 static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
@@ -101,11 +103,23 @@ impl Coordinator {
 
     /// Register a process and its main thread before it is spawned, so
     /// process and thread ids follow launch order.
-    pub fn register(&self, host: u32) -> u32 {
+    pub fn register(&self, host: u32, faults: shared::Faults, spec: u32) -> u32 {
         let mut s = self.shared.lock();
         let pid = s.add_proc(host, shared::NO_PROC);
         s.add_thread(pid);
+        s.set_faults(pid, faults, spec);
         pid
+    }
+
+    /// Whether process `pid`, dead with `status`, gets another life.
+    pub fn will_restart(&self, pid: u32, status: i32) -> bool {
+        self.shared.lock().will_restart(pid, status)
+    }
+
+    /// The process registered to take `pid`'s place, for us to spawn.
+    pub fn replacement_of(&self, pid: u32) -> Option<u32> {
+        let next = self.shared.lock().procs[pid as usize].replaced_by;
+        (next != shared::NO_PROC).then_some(next)
     }
 
     /// Wait until each of the first `n` processes has attached, or
@@ -143,15 +157,20 @@ impl Coordinator {
     /// baton and every surviving thread is blocked: a deadlock.
     pub fn process_died(&self, pid: u32, status: i32) -> bool {
         let mut s = self.shared.lock();
-        match s.process_died(pid, status) {
-            Some(Handoff::Switch { to, .. }) => {
-                drop(s);
-                self.shared.unpark(to);
-                false
+        let handoff = s.process_died(pid, status);
+        // Passing the baton on may have crashed someone
+        let (kills, n) = s.take_kills();
+        let deadlock = matches!(handoff, Some(Handoff::Idle)) && s.any_alive();
+        drop(s);
+        for &victim in &kills[..n] {
+            if victim > 0 {
+                unsafe { libc::kill(victim, libc::SIGKILL) };
             }
-            Some(Handoff::Idle) => s.any_alive(),
-            Some(Handoff::Stay) | None => false,
         }
+        if let Some(Handoff::Switch { to, .. }) = handoff {
+            self.shared.unpark(to);
+        }
+        deadlock
     }
 
     pub fn totals(&self) -> Totals {
@@ -166,6 +185,8 @@ impl Coordinator {
             net_dropped: s.net.dropped,
             net_bytes: s.net.bytes,
             net_passthrough: s.net.passthrough,
+            crashes_injected: s.crashes_injected,
+            restarts: s.restarts,
         }
     }
 }

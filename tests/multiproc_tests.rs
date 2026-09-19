@@ -1194,3 +1194,186 @@ fn daemons_are_killed_in_runs_without_the_scheduler_too() {
         );
     }
 }
+
+/// The indices of the `pong N life L` lines, and the lives that answered.
+fn pongs(stdout: &str) -> (Vec<u32>, Vec<u32>) {
+    stdout
+        .lines()
+        .filter_map(|l| {
+            let mut words = l.strip_prefix("pong ")?.split(' ');
+            let index: u32 = words.next()?.parse().ok()?;
+            let life: u32 = words.nth(1)?.parse().ok()?;
+            Some((index, life))
+        })
+        .unzip()
+}
+
+#[test]
+fn a_server_that_keeps_crashing_is_restarted_and_the_client_reconnects() {
+    let dir = common::scratch_dir("faults_server");
+    common::build_c("ping_pong", &dir, &[]);
+    let manifest = dir.join("server.yaml");
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: server
+    processes:
+      - argv: [ping_pong, pong, 7000]
+        daemon: true
+        restart: on-failure
+        restart-delay: 50ms..150ms
+        crash: { every: 100ms..300ms, times: 3 }
+  - name: client
+    processes:
+      - ping_pong ping server 7000 120
+",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let mut outages_by_seed = Vec::new();
+    for seed in 1..=3u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 2);
+        let (indices, lives) = pongs(&r.stdout[1]);
+        // Every ping answered once, in order, by lives 1 to 4 in turn
+        assert_eq!(indices, (0..120).collect::<Vec<u32>>(), "seed {seed}");
+        assert!(
+            lives.windows(2).all(|w| w[0] <= w[1]),
+            "seed {seed}: {lives:?}"
+        );
+        assert_eq!((lives[0], lives[119]), (1, 4), "seed {seed}");
+        assert!(r.stdout[1].ends_with("client life 1 done: 120 pongs, 3 reconnects\n"));
+        assert_eq!(
+            r.stdout[0],
+            "server life 1 is up\nserver life 2 is up\nserver life 3 is up\nserver life 4 is up\n"
+        );
+        // A restart is not instantaneous: the server is down for its
+        // restart delay, on the clock the client reads
+        let outages: Vec<u64> = r.stdout[1]
+            .lines()
+            .filter_map(|l| {
+                l.strip_prefix("server was out of reach for ")?
+                    .strip_suffix(" ms")?
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        assert_eq!(outages.len(), 3, "seed {seed}");
+        assert!(
+            outages.iter().all(|&ms| (50..=200).contains(&ms)),
+            "seed {seed}: {outages:?}"
+        );
+        assert_eq!(r.u64("run.crashes_injected"), 3);
+        assert_eq!(r.u64("run.restarts"), 3);
+        assert_eq!(r.u64("run.processes"), 5);
+        assert_eq!(r.fields["p4.entry"], "0");
+        // The host directory outlives the process
+        assert_eq!(
+            std::fs::read_to_string(scratch.join("server/lives")).unwrap(),
+            "4\n"
+        );
+
+        let again = run_manifest(&manifest, &scratch, seed, 2);
+        assert_eq!(again.stdout, r.stdout, "seed {seed} not repeatable");
+        assert_eq!(
+            again.fields["run.schedule_hash"],
+            r.fields["run.schedule_hash"]
+        );
+        outages_by_seed.push(outages);
+    }
+    outages_by_seed.dedup();
+    assert!(
+        outages_by_seed.len() > 1,
+        "every seed crashed the server at the same moments"
+    );
+}
+
+#[test]
+fn a_client_that_crashes_resumes_from_what_it_wrote_down() {
+    let dir = common::scratch_dir("faults_client");
+    common::build_c("ping_pong", &dir, &[]);
+    let manifest = dir.join("client.yaml");
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: server
+    processes:
+      - argv: [ping_pong, pong, 7000]
+        daemon: true
+  - name: client
+    processes:
+      - argv: [ping_pong, ping, server, 7000, 120]
+        restart: on-failure
+        restart-delay: 200ms
+        crash: { every: 150ms..250ms, times: 2 }
+",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    for seed in 1..=3u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 2);
+        // Its three lives share one stdout. A pong may show twice if the
+        // crash came between printing it and writing the progress down;
+        // none may be missing.
+        let (mut indices, _) = pongs(&r.stdout[1]);
+        indices.dedup();
+        assert_eq!(indices, (0..120).collect::<Vec<u32>>(), "seed {seed}");
+        assert_eq!(
+            r.stdout[1].matches(" resumes at ping ").count(),
+            2,
+            "seed {seed}"
+        );
+        assert!(r.stdout[1].ends_with("client life 3 done: 120 pongs, 0 reconnects\n"));
+        assert_eq!(r.u64("run.crashes_injected"), 2);
+        assert_eq!(r.u64("run.restarts"), 2);
+        // The run's verdict is the last life's: it succeeded
+        assert_eq!(r.fields["p1.status"], "signal 9");
+        assert_eq!(r.fields["p3.status"], "exit 0");
+        let again = run_manifest(&manifest, &scratch, seed, 2);
+        assert_eq!(again.stdout, r.stdout, "seed {seed} not repeatable");
+        assert_eq!(
+            again.fields["run.schedule_hash"],
+            r.fields["run.schedule_hash"]
+        );
+    }
+}
+
+#[test]
+fn restarts_stop_where_the_run_file_says() {
+    let dir = common::scratch_dir("faults_limits");
+    common::build_c("ping_pong", &dir, &[]);
+    common::supervisor_dylib();
+    let scratch = dir.join("scratch");
+    for (policy, crashes, restarts) in [
+        ("restart: never", 1, 0),
+        ("restart: on-failure\n        max-restarts: 1", 2, 1),
+    ] {
+        let manifest = dir.join("limits.yaml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "hosts:\n  - name: server\n    processes:\n      - argv: [ping_pong, pong, 7000]\n        daemon: true\n\
+                 \x20 - name: client\n    processes:\n      - argv: [ping_pong, ping, server, 7000, 100000]\n\
+                 \x20       {policy}\n        crash: {{ every: 100ms }}\n"
+            ),
+        )
+        .unwrap();
+        let out = Command::new(common::rewrite_bin())
+            .args(["run", "--capture", "--seed", "1", "--scratch"])
+            .arg(&scratch)
+            .arg("--manifest")
+            .arg(&manifest)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        // The client never finishes its 100,000 pings: its last life crashed
+        assert!(!out.status.success(), "{policy}: {err}");
+        assert!(
+            err.contains(&format!("run.crashes_injected={crashes}\n")),
+            "{policy}: {err}"
+        );
+        assert!(
+            err.contains(&format!("run.restarts={restarts}\n")),
+            "{policy}: {err}"
+        );
+    }
+}

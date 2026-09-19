@@ -60,7 +60,7 @@ unsafe fn scan(fds: &mut [libc::pollfd], socks: &[Option<u32>]) -> c_int {
 /// Wait for readiness in the scheduler. `timeout_ns` of `None` is forever.
 unsafe fn wait(fds: &mut [libc::pollfd], timeout_ns: Option<u64>) -> c_int {
     let socks: Vec<Option<u32>> = fds.iter().map(|p| crate::net::lookup(p.fd)).collect();
-    let deadline = timeout_ns.map(|t| sched::now() + t);
+    let deadline = timeout_ns.map(|t| sched::now().saturating_add(t));
     loop {
         let ready = scan(fds, &socks);
         if ready != 0 || timeout_ns == Some(0) {
@@ -71,6 +71,11 @@ unsafe fn wait(fds: &mut [libc::pollfd], timeout_ns: Option<u64>) -> c_int {
             return scan(fds, &socks);
         }
     }
+}
+
+/// A block may end early without a wake (see `ProcRec::outside_wakes`).
+fn sleep_until(deadline: u64) {
+    while !sched::block_until(shared::SLEEP_KEY, Some(deadline)) {}
 }
 
 /// Whether the set is ours to wait on: some descriptor's readiness must
@@ -92,10 +97,7 @@ pub unsafe extern "C" fn my_poll(fds: *mut libc::pollfd, n: libc::nfds_t, timeou
     };
     if my_id().is_some() && set.is_empty() && timeout > 0 {
         // A sleep in disguise
-        sched::block_until(
-            shared::SLEEP_KEY,
-            Some(sched::now() + timeout as u64 * 1_000_000),
-        );
+        sleep_until(sched::now().saturating_add(timeout as u64 * 1_000_000));
         return 0;
     }
     if !between_guests(set) {
@@ -144,7 +146,7 @@ pub unsafe extern "C" fn my_select(
         .then(|| (*timeout).tv_sec as u64 * 1_000_000_000 + (*timeout).tv_usec as u64 * 1000);
     if my_id().is_some() && fds.is_empty() {
         if let Some(ns) = timeout_ns.filter(|&ns| ns > 0) {
-            sched::block_until(shared::SLEEP_KEY, Some(sched::now() + ns));
+            sleep_until(sched::now().saturating_add(ns));
             return 0;
         }
     }
@@ -152,6 +154,10 @@ pub unsafe extern "C" fn my_select(
         return libc::select(nfds, readfds, writefds, errorfds, timeout);
     }
     wait(&mut fds, timeout_ns);
+    if fds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
+        *libc::__error() = libc::EBADF;
+        return -1;
+    }
     for set in [readfds, writefds, errorfds] {
         if !set.is_null() {
             libc::FD_ZERO(set);

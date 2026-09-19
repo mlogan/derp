@@ -275,6 +275,9 @@ impl Net {
             .position(|s| s.state == S_FREE)
             .ok_or(Errno(libc::ENFILE))?;
         self.idents[i] = 0;
+        // Payloads still in flight to the slot's previous life die with it;
+        // left counted, they would keep the run "not idle" forever.
+        self.discard_flight(i as u32);
         let s = &mut self.socks[i];
         s.state = S_NEW;
         s.kind = kind;
@@ -378,6 +381,9 @@ impl Net {
     }
 
     pub fn listen(&mut self, sock: u32, backlog: i32) -> Result<(), NetError> {
+        if self.socks[sock as usize].kind != KIND_STREAM {
+            return Err(Errno(libc::EOPNOTSUPP));
+        }
         if self.socks[sock as usize].state == S_NEW {
             if self.socks[sock as usize].family != FAMILY_INET {
                 return Err(Errno(libc::EDESTADDRREQ));
@@ -661,6 +667,22 @@ impl Net {
         taken
     }
 
+    /// Drop every record in flight to `sock`.
+    fn discard_flight(&mut self, sock: u32) {
+        while self.socks[sock as usize].fl_len as usize >= FLIGHT_HEADER {
+            let mut header = [0u8; FLIGHT_HEADER];
+            self.flight_peek(sock, 0, &mut header);
+            let len = u32::from_le_bytes(header[9..].try_into().unwrap()) as usize;
+            let record = (FLIGHT_HEADER + len).min(self.socks[sock as usize].fl_len as usize);
+            self.flight_skip(sock, record);
+            self.in_flight = self.in_flight.saturating_sub(1);
+        }
+        let d = &mut self.socks[sock as usize];
+        d.fl_head = 0;
+        d.fl_len = 0;
+        d.fl_stream = 0;
+    }
+
     /// When the next payload in flight is due, if any is
     pub fn next_due(&self) -> Option<u64> {
         (self.in_flight > 0).then_some(self.next_due)
@@ -708,6 +730,12 @@ impl Net {
                         d.fl_stream -= len as u32;
                         d.bytes_in += len as u64;
                         self.bytes += len as u64;
+                        // Landing frees flight-ring room: the sender's
+                        // window may have opened
+                        let sender = d.far_end;
+                        if d.state == S_CONNECTED && sender != NO_SOCK {
+                            self.socks[sender as usize].wr_events += 1;
+                        }
                     }
                     _ => {
                         let mut data_len = [0u8; 4];
@@ -788,6 +816,13 @@ impl Net {
         u32::from_le_bytes(len) as usize
     }
 
+    /// Whether a datagram socket on `host` is bound to `name`.
+    pub fn dgram_bound(&self, host: u32, name: &Addr) -> bool {
+        self.socks.iter().any(|t| {
+            t.kind == KIND_DGRAM && t.state == S_BOUND && t.host == host && t.local.same_name(name)
+        })
+    }
+
     /// Give a datagram socket a default destination. It then only
     /// receives from that address.
     pub fn connect_dgram(&mut self, sock: u32, dest: Addr) -> Result<(), NetError> {
@@ -850,6 +885,10 @@ impl Net {
                 && t.state == S_BOUND
                 && t.host == dest_host
                 && t.local.same_name(&dest)
+                && (family != FAMILY_INET
+                    || t.local.ip == 0
+                    || t.local.ip >> 24 == 127 && dest.ip >> 24 == 127
+                    || t.local.ip == dest.ip)
                 && (!t.has_peer || t.peer.same_name(&from) && t.peer.ip == from.ip)
         });
         let taken = match target {
@@ -911,7 +950,11 @@ impl Net {
         if read {
             s.shut_rd = true;
             s.rx_len = 0;
+            // The peer's writes now fail instead of blocking
+            let peer = s.far_end;
+            self.socks[peer as usize].wr_events += 1;
         }
+        let s = &mut self.socks[sock as usize];
         if write && !s.shut_wr {
             s.shut_wr = true;
             let (host, peer) = (s.host, s.far_end);
@@ -936,6 +979,7 @@ impl Net {
                     } else {
                         let host = self.socks[far as usize].host;
                         self.deliver(host, near, Payload::Fin);
+                        self.socks[near as usize].wr_events += 1;
                         self.socks[far as usize].state = S_CLOSED;
                     }
                 }
@@ -947,8 +991,12 @@ impl Net {
                     self.socks[peer as usize].state = S_FREE;
                     self.socks[sock as usize].state = S_FREE;
                 } else {
-                    let host = self.socks[sock as usize].host;
-                    self.deliver(host, peer, Payload::Fin);
+                    // A shutdown already sent the FIN, and the flight ring
+                    // keeps room for exactly one
+                    if !self.socks[sock as usize].shut_wr {
+                        let host = self.socks[sock as usize].host;
+                        self.deliver(host, peer, Payload::Fin);
+                    }
                     self.socks[peer as usize].wr_events += 1;
                     self.socks[sock as usize].state = S_CLOSED;
                 }
@@ -1335,6 +1383,76 @@ mod tests {
         assert_eq!(n.recv_dgram(server, &mut buf, false), Err(WouldBlock));
         n.advance(10_000_000);
         assert_eq!(n.recv_dgram(server, &mut buf, false).unwrap().0, 4);
+    }
+
+    #[test]
+    fn a_reused_slot_does_not_leave_payloads_counted_in_flight() {
+        let mut n = net();
+        n.latency_ns = 5_000_000;
+        let l = listener(&mut n, 0, 80);
+        let c = client(&mut n, 1);
+        n.connect(c, 0, &Addr::inet(n.hosts[0].addr, 80)).unwrap();
+        let far = n.accept(l).unwrap();
+        n.add_ref(0, far);
+        // The server answers and closes; the client closes before either the
+        // answer or the FIN has landed, and its slot is taken again at once.
+        assert_eq!(n.send(far, b"bye"), Ok(3));
+        n.drop_ref(0, far);
+        n.drop_ref(1, c);
+        assert_eq!(n.socks[c as usize].state, S_FREE);
+        assert!(n.next_due().is_some());
+        let again = n.socket(1, FAMILY_INET, KIND_STREAM).unwrap();
+        assert_eq!(again, c);
+        assert_eq!(n.next_due(), None, "nothing is in flight to anyone");
+        assert!(!n.advance(1_000_000_000));
+    }
+
+    #[test]
+    fn shutdown_then_close_sends_one_fin() {
+        let mut n = net();
+        n.latency_ns = 5_000_000;
+        let l = listener(&mut n, 0, 80);
+        let c = client(&mut n, 1);
+        n.connect(c, 0, &Addr::inet(n.hosts[0].addr, 80)).unwrap();
+        let far = n.accept(l).unwrap();
+        n.add_ref(0, far);
+        // Fill the window to the last byte, then both ways of saying goodbye
+        let big = vec![5u8; 2 * RING];
+        let sent = n.send(c, &big).unwrap();
+        n.shutdown(c, false, true).unwrap();
+        n.drop_ref(1, c);
+        n.advance(5_000_000);
+        let mut buf = vec![0u8; RING];
+        let mut got = 0;
+        while let Ok(k) = n.recv(far, &mut buf, false) {
+            if k == 0 {
+                break;
+            }
+            assert!(buf[..k].iter().all(|&b| b == 5));
+            got += k;
+        }
+        assert_eq!(got, sent);
+        assert_eq!(n.next_due(), None);
+    }
+
+    #[test]
+    fn a_datagram_socket_bound_to_loopback_is_not_reachable_from_outside() {
+        let mut n = net();
+        let local = n.socket(0, FAMILY_INET, KIND_DGRAM).unwrap();
+        n.add_ref(0, local);
+        n.bind(local, Addr::inet(LOOPBACK, 5000)).unwrap();
+        let remote = dgram(&mut n, 1, None);
+        let to = (0, Addr::inet(n.hosts[0].addr, 5000));
+        assert_eq!(n.send_dgram(remote, Some(to), b"x"), Ok(1));
+        let mut buf = [0u8; 8];
+        assert_eq!(n.recv_dgram(local, &mut buf, false), Err(WouldBlock));
+        let home = dgram(&mut n, 0, None);
+        assert_eq!(
+            n.send_dgram(home, Some((0, Addr::inet(LOOPBACK, 5000))), b"y"),
+            Ok(1)
+        );
+        assert_eq!(n.recv_dgram(local, &mut buf, false).unwrap().0, 1);
+        assert_eq!(n.listen(local, 1), Err(Errno(libc::EOPNOTSUPP)));
     }
 
     #[test]

@@ -39,33 +39,21 @@ pub fn init() {
             let (dev, ino) = e.split_once(':')?;
             Some((dev.parse().ok()?, ino.parse().ok()?))
         })
+        // Padding entries of the fixed-width list
+        .filter(|&(dev, ino): &(i64, u64)| dev != 0 || ino != 0)
         .collect();
     *EXTERNAL.lock() = parsed;
 }
 
-/// Whether blocking on `fd` is ours to turn into a readiness wait: a pipe
-/// or socket between guests, in blocking mode, used by a scheduled thread.
-fn managed(fd: c_int) -> bool {
-    if my_id().is_none() {
-        return false;
-    }
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
-        return false;
-    }
-    let kind = st.st_mode & libc::S_IFMT;
-    if kind != libc::S_IFIFO && kind != libc::S_IFSOCK {
-        return false;
-    }
-    if EXTERNAL.lock().contains(&(i64::from(st.st_dev), st.st_ino)) {
-        return false;
-    }
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    flags >= 0 && flags & libc::O_NONBLOCK == 0
+/// A kernel network socket: what `leave_virtual_network` left behind. Its
+/// peer is outside the run, so it blocks for real. (`fstat` gives these
+/// neither a device nor an inode.)
+fn kernel_network_socket(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFSOCK && st.st_dev == 0 && st.st_ino == 0
 }
 
-/// A pipe or kernel socket whose other end is a guest's, whatever its
-/// blocking mode: what `poll` may wait on in the scheduler.
+/// A pipe or kernel socket whose other end is a guest's: its state only
+/// changes when a guest acts, so waiting on it belongs in the scheduler.
 pub fn is_guest_object(fd: c_int) -> bool {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
@@ -73,17 +61,23 @@ pub fn is_guest_object(fd: c_int) -> bool {
     }
     let kind = st.st_mode & libc::S_IFMT;
     (kind == libc::S_IFIFO || kind == libc::S_IFSOCK)
+        && !kernel_network_socket(&st)
         && !EXTERNAL.lock().contains(&(i64::from(st.st_dev), st.st_ino))
 }
 
-/// Any pipe or socket, for deciding whether an act can unblock a peer
-fn shared_object(fd: c_int) -> bool {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
+/// Whether a blocking call on `fd` becomes a readiness wait: a guest
+/// object in blocking mode, used by a scheduled thread.
+fn managed(fd: c_int) -> bool {
+    if my_id().is_none() || !is_guest_object(fd) {
         return false;
     }
-    let kind = st.st_mode & libc::S_IFMT;
-    kind == libc::S_IFIFO || kind == libc::S_IFSOCK
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    flags >= 0 && flags & libc::O_NONBLOCK == 0
+}
+
+/// In the child of a `fork`: see `SpinLock::force_unlock`.
+pub fn forked() {
+    EXTERNAL.force_unlock();
 }
 
 /// Times a thread of this process parked for readiness, for the report
@@ -95,7 +89,13 @@ fn park_for_io() {
 }
 
 fn wake_io() {
-    sched::with(|s, _| s.wake_io());
+    let outside = !sched::on_scheduled_thread();
+    sched::with(|s, pid| {
+        if outside {
+            sched::note_outside_wake(s, pid);
+        }
+        s.wake_io();
+    });
 }
 
 fn ready(fd: c_int, events: libc::c_short) -> bool {
@@ -121,7 +121,7 @@ fn when_readable(fd: c_int, f: impl Fn() -> isize) -> isize {
     }
     let n = f();
     // Draining a full pipe lets its writer go on
-    if n > 0 && my_id().is_some() && shared_object(fd) {
+    if n > 0 && my_id().is_some() && is_guest_object(fd) {
         wake_io();
     }
     n
@@ -160,7 +160,7 @@ fn write_managed(fd: c_int, buf: *const c_void, n: usize, real: impl Fn() -> isi
         return write_all(fd, buf.cast(), n);
     }
     let r = real();
-    if r > 0 && my_id().is_some() && shared_object(fd) {
+    if r > 0 && my_id().is_some() && is_guest_object(fd) {
         wake_io();
     }
     r
@@ -169,6 +169,20 @@ fn write_managed(fd: c_int, buf: *const c_void, n: usize, real: impl Fn() -> isi
 /// Scatter read from a virtual socket: fill the buffers in order and
 /// stop at the first one that comes up short.
 unsafe fn readv_virtual(fd: c_int, sock: u32, iov: *const libc::iovec, n: c_int) -> isize {
+    let vectors = std::slice::from_raw_parts(iov, n.max(0) as usize);
+    if crate::net::is_datagram(sock) {
+        // One datagram, scattered: reading per vector would take one each
+        let room: usize = vectors.iter().map(|v| v.iov_len).sum();
+        let mut data = vec![0u8; room];
+        let got = crate::net::recv_fd(fd, sock, data.as_mut_ptr(), room, 0);
+        let mut rest = &data[..got.max(0) as usize];
+        for v in vectors {
+            let k = rest.len().min(v.iov_len);
+            std::ptr::copy_nonoverlapping(rest.as_ptr(), v.iov_base.cast::<u8>(), k);
+            rest = &rest[k..];
+        }
+        return got;
+    }
     let mut total = 0isize;
     for v in std::slice::from_raw_parts(iov, n.max(0) as usize) {
         // Only the first buffer may wait for data
@@ -186,6 +200,17 @@ unsafe fn readv_virtual(fd: c_int, sock: u32, iov: *const libc::iovec, n: c_int)
 }
 
 unsafe fn writev_virtual(fd: c_int, sock: u32, iov: *const libc::iovec, n: c_int) -> isize {
+    if crate::net::is_datagram(sock) {
+        // One datagram, gathered
+        let mut data = Vec::new();
+        for v in std::slice::from_raw_parts(iov, n.max(0) as usize) {
+            data.extend_from_slice(std::slice::from_raw_parts(
+                v.iov_base.cast::<u8>(),
+                v.iov_len,
+            ));
+        }
+        return crate::net::send_fd(fd, sock, data.as_ptr(), data.len(), 0);
+    }
     let mut total = 0isize;
     for v in std::slice::from_raw_parts(iov, n.max(0) as usize) {
         let sent = crate::net::send_fd(fd, sock, v.iov_base.cast(), v.iov_len, 0);
@@ -261,7 +286,7 @@ unsafe fn writev_managed(
     }
     if !managed(fd) {
         let r = real();
-        if r > 0 && my_id().is_some() && shared_object(fd) {
+        if r > 0 && my_id().is_some() && is_guest_object(fd) {
             wake_io();
         }
         return r;
@@ -291,6 +316,11 @@ pub unsafe extern "C" fn my_writev_nocancel(fd: c_int, iov: *const libc::iovec, 
 }
 
 fn close_managed(fd: c_int, real: impl Fn() -> c_int) -> c_int {
+    // "Close everything above 2" (Python's subprocess does it before exec)
+    // must not take the launcher's socket: spawning needs it.
+    if fd == shared::COORD_FD && crate::coord::connected() {
+        return 0;
+    }
     if my_id().is_some() {
         crate::kq::closed(fd);
     }

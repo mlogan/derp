@@ -25,6 +25,12 @@ impl<T> SpinLock<T> {
         }
     }
 
+    /// In the child of a `fork`: a thread of the parent may have held the
+    /// lock at that moment, and it does not exist here to release it.
+    pub fn force_unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+
     pub fn lock(&self) -> Guard<'_, T> {
         while self
             .locked

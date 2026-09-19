@@ -6,7 +6,8 @@
 //! `EV_ONESHOT` registrations are modelled; `EV_DISPATCH` and the rest are
 //! logged and treated as level-triggered.
 //!
-//! The registry is process-local: a kqueue is not inherited by `fork`.
+//! A kqueue is not inherited by `fork`, so the child starts with an empty
+//! registry (`forked`).
 
 use std::ffi::{c_int, c_void};
 
@@ -40,6 +41,12 @@ struct Registry(Vec<Kq>);
 unsafe impl Send for Registry {}
 
 static KQS: SpinLock<Registry> = SpinLock::new(Registry(Vec::new()));
+
+/// In the child of a `fork`: the parent's kqueues are not ours.
+pub fn forked() {
+    KQS.force_unlock();
+    KQS.lock().0.clear();
+}
 
 /// A descriptor was closed: a kqueue goes away with its registrations, and
 /// any other descriptor drops out of every kqueue, as in the kernel.

@@ -50,6 +50,10 @@ pub fn lookup(fd: c_int) -> Option<u32> {
     sched::with(|s, _| s.net.by_ident(ident)).flatten()
 }
 
+pub fn is_datagram(sock: u32) -> bool {
+    kind_of(sock) == KIND_DGRAM
+}
+
 fn kind_of(sock: u32) -> u8 {
     sched::with(|s, _| s.net.socks[sock as usize].kind).unwrap_or(KIND_STREAM)
 }
@@ -309,6 +313,12 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
             here
         };
         if dgram {
+            // Nobody on this host has that name: refused, which for a path
+            // that is a socket in the real filesystem (syslog) means the
+            // system's, below
+            if dest.family == FAMILY_UNIX && !s.net.dgram_bound(host, &dest) {
+                return Err(NetError::Errno(libc::ECONNREFUSED));
+            }
             s.net.connect_dgram(sock, dest)
         } else {
             s.net.connect(sock, host, &dest)
@@ -350,6 +360,10 @@ pub unsafe extern "C" fn my_accept(fd: c_int, addr: *mut Sockaddr, len: *mut Soc
     });
     match accepted {
         Ok(peer) => {
+            // As on Darwin, the new socket starts with the listener's mode
+            if nonblocking(fd) {
+                libc::fcntl(new_fd, libc::F_SETFL, libc::O_NONBLOCK);
+            }
             store_addr(&peer, addr, len);
             new_fd
         }
@@ -640,7 +654,7 @@ pub unsafe extern "C" fn my_getpeername(
     };
     let peer = sched::with(|s, _| {
         let k = &s.net.socks[sock as usize];
-        (k.far_end != shared::netstate::NO_SOCK).then_some(k.peer)
+        (k.far_end != shared::netstate::NO_SOCK || k.has_peer).then_some(k.peer)
     })
     .flatten();
     match peer {
@@ -807,6 +821,8 @@ pub unsafe extern "C" fn my_dup2(fd: c_int, target: c_int) -> c_int {
     let replaced = if fd == target { None } else { lookup(target) };
     let new = libc::dup2(fd, target);
     if new >= 0 && fd != target {
+        // Whatever `target` was is closed, registrations and all
+        crate::kq::closed(target);
         if let Some(sock) = sock {
             duplicated(sock);
         }
@@ -884,9 +900,8 @@ std::arch::global_asm!(
 pub fn adopt_inherited(sh: &shared::Shared, pid: u32) {
     let limit = unsafe { libc::getdtablesize() }.clamp(0, 4096);
     let idents: Vec<u64> = (0..limit).filter_map(ident_of).collect();
-    if idents.is_empty() {
-        return;
-    }
+    // Also when there are none: after an `execve` that closed them all, the
+    // old image's references have to go
     let mut s = sh.lock();
     let held: Vec<u32> = idents.iter().filter_map(|&i| s.net.by_ident(i)).collect();
     s.net.set_refs(pid, &held);

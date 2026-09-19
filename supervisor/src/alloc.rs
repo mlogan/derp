@@ -60,6 +60,11 @@ static HEAP: SpinLock<Heap> = SpinLock::new(Heap {
     broken: false,
 });
 
+/// In the child of a `fork`: see `SpinLock::force_unlock`.
+pub fn forked() {
+    HEAP.force_unlock();
+}
+
 /// True when the region is in use at its fixed address
 pub fn region_fixed() -> bool {
     let h = HEAP.lock();
@@ -199,7 +204,10 @@ impl Heap {
             return std::ptr::null_mut();
         }
         let slack = if align > 16 { align } else { 0 };
-        let Some((raw, class_size)) = self.alloc_raw(size.max(1) + HEADER + slack) else {
+        let Some(wanted) = size.max(1).checked_add(HEADER + slack) else {
+            return std::ptr::null_mut();
+        };
+        let Some((raw, class_size)) = self.alloc_raw(wanted) else {
             return std::ptr::null_mut();
         };
         let payload = (raw + HEADER + align - 1) & !(align - 1);

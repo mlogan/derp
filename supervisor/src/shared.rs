@@ -18,8 +18,10 @@ use crate::rng::Rng;
 pub mod netstate;
 
 pub const MAGIC: u64 = 0x0031_4448_5357_5252;
-pub const MAX_THREADS: usize = 1024;
-pub const MAX_PROCS: usize = 256;
+/// Slots are never reused, so these bound what a whole run may create. A
+/// server with a thread per request gets through a thousand quickly.
+pub const MAX_THREADS: usize = 16384;
+pub const MAX_PROCS: usize = 1024;
 /// Base of the fixed region every guest sets up. The stubs materialize
 /// this address with one `movz`, so it has a single non-zero 16-bit chunk.
 /// Low addresses are unreliable: whatever the kernel places first above the
@@ -128,6 +130,8 @@ pub struct ThreadRec {
     pub signaled: bool,
     /// Set when the wait ended because `deadline` passed
     pub timed_out: bool,
+    /// `ProcRec::outside_wakes` when this thread last looked
+    pub wakes_seen: u64,
     /// Virtual time at which a blocked thread gives up waiting (0: never)
     pub deadline: u64,
     /// Bumped by whoever hands this thread the baton
@@ -144,6 +148,16 @@ pub struct ProcRec {
     pub exit_status: i32,
     /// The parent has collected the exit with `waitpid`
     pub reaped: bool,
+    /// Another guest sent it a fatal signal: it is as good as dead, though
+    /// the launcher has not seen the exit yet
+    pub killed: bool,
+    /// Bumped by every wake that comes from a thread the scheduler does not
+    /// run. Such a wake is not serialized by the baton, so it can land
+    /// between a thread's "would I block?" check and its blocking; a thread
+    /// that sees the count move backs out and checks again.
+    pub outside_wakes: u64,
+    /// Some thread of this process runs outside the scheduler (GCD workers)
+    pub has_outside_threads: bool,
     /// Address the process mapped the shared file at, for the launcher's
     /// placement check
     pub mapped_at: u64,
@@ -417,7 +431,7 @@ impl State {
                 .live()
                 .iter()
                 .enumerate()
-                .filter(|(_, t)| t.pid == pid && t.cond_key == cond)
+                .filter(|(_, t)| t.pid == pid && t.cond_key == cond && t.state != T_EXITED)
                 .min_by_key(|(_, t)| t.cond_seq)
                 .map(|(i, _)| i);
             let Some(id) = first else { return };
@@ -559,12 +573,14 @@ impl State {
         if parent != NO_PROC {
             self.wake_all(parent, WAIT_KEY);
         }
-        let mut held = None;
-        for (i, t) in self.live().iter_mut().enumerate() {
+        // Whoever was last given the baton has it, whatever its state says:
+        // a thread that found the run idle (and aborted over it, or was
+        // polling) is already recorded as blocked.
+        let current = self.current as usize;
+        let held = (current < self.nthreads as usize && self.threads[current].pid == pid)
+            .then_some(current);
+        for t in self.live() {
             if t.pid == pid && t.state != T_EXITED {
-                if t.state == T_RUNNING {
-                    held = Some(i);
-                }
                 t.state = T_EXITED;
                 t.cond_key = 0;
                 t.deadline = 0;
@@ -580,7 +596,10 @@ impl State {
     pub fn exited_child(&self, parent: u32, which: Option<u32>) -> Option<u32> {
         (0..self.nprocs).find(|&i| {
             let p = &self.procs[i as usize];
-            p.parent == parent && p.state == P_EXITED && !p.reaped && which.is_none_or(|w| w == i)
+            p.parent == parent
+                && (p.state == P_EXITED || p.killed)
+                && !p.reaped
+                && which.is_none_or(|w| w == i)
         })
     }
 
@@ -590,6 +609,14 @@ impl State {
             let p = &self.procs[i as usize];
             p.parent == parent && !p.reaped && which.is_none_or(|w| w == i)
         })
+    }
+
+    /// Whether any live process has threads outside the scheduler, which
+    /// could still wake someone when the run looks idle.
+    pub fn any_outside_threads(&self) -> bool {
+        self.procs[..self.nprocs as usize]
+            .iter()
+            .any(|p| p.state == P_LIVE && p.has_outside_threads)
     }
 
     /// True while some thread that has not exited belongs to a live process.

@@ -17,6 +17,10 @@ use crate::spin::SpinLock;
 
 struct Policy {
     root: Vec<u8>,
+    /// The scratch directory, where every host's directory lives. It is
+    /// usually under `/var/folders`, which is a system location; without
+    /// this, a sibling host's files would pass as "system".
+    scratch: Vec<u8>,
     allow: Vec<Vec<u8>>,
     host: String,
 }
@@ -119,8 +123,11 @@ pub fn init() {
         .map(|a| unprivate(&normalize(a.as_bytes(), b"/")).to_vec())
         .collect();
     let host = root.rsplit('/').next().unwrap_or("").to_string();
+    let root = unprivate(&normalize(root.as_bytes(), b"/")).to_vec();
+    let cut = root.iter().rposition(|&b| b == b'/').unwrap_or(0);
     *POLICY.lock() = Some(Policy {
-        root: unprivate(&normalize(root.as_bytes(), b"/")).to_vec(),
+        scratch: root[..cut.max(1)].to_vec(),
+        root,
         allow,
         host,
     });
@@ -182,13 +189,14 @@ unsafe fn check(call: &str, path: *const c_char, ancestors: bool) -> bool {
     // CoreFoundation reads this from the real home directory (from the
     // password database, not `HOME`) in every program that links it.
     let ambient = seen.ends_with(b"/.CFUserTextEncoding") || ancestors && seen == b"/private";
+    let sibling = under(seen, &policy.scratch) && !under(seen, &policy.root);
     let ok = ambient
         || under(seen, &policy.root)
         || ancestors
             && (under(&policy.root, seen)
                 || SYSTEM.iter().any(|sys| under(sys, seen))
                 || policy.allow.iter().any(|a| under(a, seen)))
-        || SYSTEM.iter().any(|s| under(seen, s))
+        || !sibling && SYSTEM.iter().any(|s| under(seen, s))
         || policy.allow.iter().any(|a| under(seen, a));
     if !ok && ancestors {
         // Only asking. On this host the path does not exist; that is worth
@@ -260,6 +268,8 @@ guarded!(my_utimes, permits, utimes, -1, (times: *const libc::timeval) -> c_int)
 guarded!(my_mkfifo, permits, mkfifo, -1, (mode: libc::mode_t) -> c_int);
 guarded!(my_creat, permits, creat, -1, (mode: libc::mode_t) -> c_int);
 guarded!(my_readlink, permits_metadata, readlink, -1, (buf: *mut c_char, len: usize) -> isize);
+guarded!(my_statfs, permits_metadata, statfs, -1, (buf: *mut libc::statfs) -> c_int);
+guarded!(my_lchown, permits, lchown, -1, (uid: libc::uid_t, gid: libc::gid_t) -> c_int);
 guarded!(my_opendir, permits, opendir, std::ptr::null_mut(), () -> *mut libc::DIR);
 
 pub unsafe extern "C" fn my_rename(from: *const c_char, to: *const c_char) -> c_int {
@@ -284,16 +294,103 @@ pub unsafe extern "C" fn my_symlink(target: *const c_char, at: *const c_char) ->
     libc::symlink(target, at)
 }
 
-/// A path relative to a directory descriptor was checked when that
-/// directory was opened.
-pub unsafe fn permits_at(call: &str, dirfd: c_int, path: *const c_char) -> bool {
+/// A path relative to a directory descriptor is checked against that
+/// directory's own path: `openat(dir, "../other-host/x")` must not pass
+/// because `dir` did.
+unsafe fn check_at(call: &str, dirfd: c_int, path: *const c_char, ancestors: bool) -> bool {
     let relative_to_fd = dirfd != libc::AT_FDCWD && !path.is_null() && *path.cast::<u8>() != b'/';
-    relative_to_fd || permits(call, path)
+    if !relative_to_fd {
+        return check(call, path, ancestors);
+    }
+    let mut dir = [0 as c_char; libc::PATH_MAX as usize];
+    if libc::fcntl(dirfd, libc::F_GETPATH, dir.as_mut_ptr()) != 0 {
+        return true;
+    }
+    let mut full = CStr::from_ptr(dir.as_ptr()).to_bytes().to_vec();
+    full.push(b'/');
+    full.extend_from_slice(CStr::from_ptr(path).to_bytes());
+    full.push(0);
+    check(call, full.as_ptr().cast(), ancestors)
+}
+
+pub unsafe fn permits_at(call: &str, dirfd: c_int, path: *const c_char) -> bool {
+    check_at(call, dirfd, path, false)
 }
 
 unsafe fn permits_metadata_at(call: &str, dirfd: c_int, path: *const c_char) -> bool {
-    let relative_to_fd = dirfd != libc::AT_FDCWD && !path.is_null() && *path.cast::<u8>() != b'/';
-    relative_to_fd || permits_metadata(call, path)
+    check_at(call, dirfd, path, true)
+}
+
+pub unsafe extern "C" fn my_renameat(
+    from_fd: c_int,
+    from: *const c_char,
+    to_fd: c_int,
+    to: *const c_char,
+) -> c_int {
+    if !permits_at("renameat", from_fd, from) || !permits_at("renameat", to_fd, to) {
+        return -1;
+    }
+    libc::renameat(from_fd, from, to_fd, to)
+}
+
+pub unsafe extern "C" fn my_faccessat(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: c_int,
+    flags: c_int,
+) -> c_int {
+    if !permits_metadata_at("faccessat", dirfd, path) {
+        return -1;
+    }
+    libc::faccessat(dirfd, path, mode, flags)
+}
+
+pub unsafe extern "C" fn my_readlinkat(
+    dirfd: c_int,
+    path: *const c_char,
+    buf: *mut c_char,
+    len: usize,
+) -> isize {
+    if !permits_metadata_at("readlinkat", dirfd, path) {
+        return -1;
+    }
+    libc::readlinkat(dirfd, path, buf, len)
+}
+
+pub unsafe extern "C" fn my_fchmodat(
+    dirfd: c_int,
+    path: *const c_char,
+    mode: libc::mode_t,
+    flags: c_int,
+) -> c_int {
+    if !permits_at("fchmodat", dirfd, path) {
+        return -1;
+    }
+    libc::fchmodat(dirfd, path, mode, flags)
+}
+
+pub unsafe extern "C" fn my_utimensat(
+    dirfd: c_int,
+    path: *const c_char,
+    times: *const libc::timespec,
+    flags: c_int,
+) -> c_int {
+    if !permits_at("utimensat", dirfd, path) {
+        return -1;
+    }
+    libc::utimensat(dirfd, path, times, flags)
+}
+
+pub unsafe extern "C" fn my_clonefile(from: *const c_char, to: *const c_char, flags: u32) -> c_int {
+    if !permits("clonefile", from) || !permits("clonefile", to) {
+        return -1;
+    }
+    libc::clonefile(from, to, flags)
+}
+
+/// In the child of a `fork`: see `SpinLock::force_unlock`.
+pub fn forked() {
+    POLICY.force_unlock();
 }
 
 pub unsafe extern "C" fn my_fstatat(

@@ -113,6 +113,7 @@ extern "C" {
     fn pthread_mach_thread_np(t: libc::pthread_t) -> u32;
     fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
     fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+    fn mach_port_deallocate(task: u32, name: u32) -> i32;
 }
 
 /// Whether the thread with this Mach port is one the scheduler runs.
@@ -133,6 +134,10 @@ fn has_outside_threads() -> bool {
         return false;
     }
     unsafe {
+        // `task_threads` hands out a send right per thread
+        for i in 0..count as usize {
+            mach_port_deallocate(mach_task_self_, *list.add(i));
+        }
         vm_deallocate(
             mach_task_self_,
             list as usize,
@@ -160,11 +165,26 @@ pub fn with<R>(f: impl FnOnce(&mut shared::State, u32) -> R) -> Option<R> {
 /// Make every thread of this process blocked on `addr` runnable; returns
 /// how many there were. Safe from a thread the scheduler does not run.
 pub fn wake_all(addr: usize) -> usize {
-    let woken = with(|s, pid| s.wake_all(pid, addr as u64)).unwrap_or(0);
-    if woken > 0 && my_id().is_none() {
+    let outside = !on_scheduled_thread();
+    let woken = with(|s, pid| {
+        if outside {
+            note_outside_wake(s, pid);
+        }
+        s.wake_all(pid, addr as u64)
+    })
+    .unwrap_or(0);
+    if woken > 0 && outside {
         OUTSIDE_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
     }
     woken
+}
+
+/// A wake from a thread the scheduler does not run: see
+/// `ProcRec::outside_wakes`.
+pub fn note_outside_wake(s: &mut shared::State, pid: u32) {
+    let p = &mut s.procs[pid as usize];
+    p.outside_wakes += 1;
+    p.has_outside_threads = true;
 }
 
 /// Scheduled threads made runnable by a thread the scheduler does not run.
@@ -384,8 +404,20 @@ pub fn become_forked_child(child: u32) {
         p.state = shared::P_LIVE;
     }
     PID.store(child, Ordering::Relaxed);
-    // Only the forking thread exists here, under a new port name
+    // Only the forking thread exists here, under a new port name. A thread
+    // of the parent may have been inside `set_my_id` at the fork.
+    PORTS.force_unlock();
     PORTS.lock().clear();
+    crate::alloc::forked();
+    crate::hostfs::forked();
+    crate::io::forked();
+    crate::process::forked();
+    crate::kq::forked();
+    crate::determinism::forked(
+        Config::from_env()
+            .seed
+            .wrapping_add(u64::from(child).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+    );
     HOOKS.store(0, Ordering::Relaxed);
     crate::io::IO_WAITS.store(0, Ordering::Relaxed);
     for c in &crate::interpose::COUNTS {
@@ -444,8 +476,22 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
         State::Exited => (shared::T_EXITED, 0),
     };
     let mut s = sh.lock();
-    debug_assert_eq!(s.current as usize, me);
+    if s.current as usize != me {
+        // Guest code on a thread that does not hold the baton: a signal
+        // handler on a parked thread. It must not hand over what it lacks.
+        drop(s);
+        crate::report::log("a thread without the baton tried to yield (signal handler?); ignored");
+        return;
+    }
     s.threads[me].timed_out = false;
+    if st == shared::T_BLOCKED {
+        // An outside thread's wake is not serialized by the baton and may
+        // have come since the caller decided to block: let it look again.
+        let wakes = s.procs[pid() as usize].outside_wakes;
+        if std::mem::replace(&mut s.threads[me].wakes_seen, wakes) != wakes {
+            return;
+        }
+    }
     // A deadline of 0 would mean none; one in the past expires at once
     s.threads[me].deadline = deadline.map_or(0, |d| d.max(1));
     match s.hand_off(Some((me, st, key)), site) {
@@ -455,7 +501,12 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
             if !stuck {
                 return;
             }
-            if state == State::Exited || !has_outside_threads() {
+            let outside = has_outside_threads();
+            let anywhere = with(|s, pid| {
+                s.procs[pid as usize].has_outside_threads |= outside;
+                s.any_outside_threads()
+            }) == Some(true);
+            if !anywhere {
                 fatal("deadlock: every thread is blocked");
             }
             // A GCD worker may be about to wake one of us (a block finishing
@@ -474,10 +525,14 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
                         return;
                     }
                     Handoff::Switch { to, seen } => {
+                        let (issued, clock) = (s.issued, s.clock_ns);
                         drop(s);
+                        trace_switch(me, to, issued, site, clock);
                         sh.unpark(to);
-                        sh.park(me, seen);
-                        install_quantum(sh.lock().pending_quantum);
+                        if state != State::Exited {
+                            sh.park(me, seen);
+                            install_quantum(sh.lock().pending_quantum);
+                        }
                         return;
                     }
                 }

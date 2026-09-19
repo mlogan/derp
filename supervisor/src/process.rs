@@ -68,8 +68,8 @@ fn set_errno(e: c_int) -> c_int {
     -1
 }
 
-/// The guest's environment for a child, with our variables replaced.
-fn child_env(envp: *const *mut c_char, proc_index: u32) -> Vec<CString> {
+/// The guest's environment without our variables.
+fn guest_env(envp: *const *mut c_char) -> Vec<CString> {
     let mut out = Vec::new();
     let mut p = if envp.is_null() {
         unsafe { environ }
@@ -87,6 +87,13 @@ fn child_env(envp: *const *mut c_char, proc_index: u32) -> Vec<CString> {
         }
         p = unsafe { p.add(1) };
     }
+    out
+}
+
+/// The guest's environment for a child of the run, with our variables
+/// set for process `proc_index`.
+fn child_env(envp: *const *mut c_char, proc_index: u32) -> Vec<CString> {
+    let mut out = guest_env(envp);
     if let Some(i) = INHERIT.lock().as_ref() {
         for (k, v) in [
             ("DYLD_INSERT_LIBRARIES", i.dylib.as_str()),
@@ -193,6 +200,25 @@ fn unregister_child(child: u32) {
     });
 }
 
+/// A spawn the scheduler has no part in (from a GCD worker, say). The child
+/// must not inherit our variables: with `REWRITE_PROC` it would attach as
+/// its parent's process.
+unsafe fn spawn_outside_the_run(
+    pid_out: *mut libc::pid_t,
+    path: *const c_char,
+    actions: *const libc::posix_spawn_file_actions_t,
+    attr: *const libc::posix_spawnattr_t,
+    argv: *const *mut c_char,
+    envp: *const *mut c_char,
+) -> c_int {
+    if !in_run() {
+        return libc::posix_spawn(pid_out, path, actions, attr, argv, envp);
+    }
+    let env = guest_env(envp);
+    let env_ptrs = pointers(&env);
+    libc::posix_spawn(pid_out, path, actions, attr, argv, env_ptrs.as_ptr())
+}
+
 unsafe fn spawn_rewritten(
     pid_out: *mut libc::pid_t,
     path: *const c_char,
@@ -260,6 +286,10 @@ unsafe fn spawn_rewritten(
         unregister_child(child);
         return rc;
     }
+    // The child writes this too, but one that dies before attaching never
+    // does, and a real pid of 0 would turn `wait4` and `kill` loose on the
+    // whole process group.
+    sched::with(|s, _| s.procs[child as usize].real_pid = real);
     crate::coord::spawned(child, real);
     await_attach(child, real);
     if !pid_out.is_null() {
@@ -277,7 +307,7 @@ pub unsafe extern "C" fn my_posix_spawn(
     envp: *const *mut c_char,
 ) -> c_int {
     if !managed() {
-        return libc::posix_spawn(pid_out, path, actions, attr, argv, envp);
+        return spawn_outside_the_run(pid_out, path, actions, attr, argv, envp);
     }
     spawn_rewritten(pid_out, path, actions, attr, argv, envp)
 }
@@ -316,6 +346,7 @@ pub unsafe extern "C" fn my_fork() -> libc::pid_t {
         unregister_child(child);
         return set_errno(e);
     }
+    sched::with(|s, _| s.procs[child as usize].real_pid = real);
     crate::coord::spawned(child, real);
     await_attach(child, real);
     vpid_of(child)
@@ -345,6 +376,11 @@ fn restore_threads(retired: &[(usize, u32)]) {
             s.threads[i].state = state;
         }
     });
+}
+
+/// On arm64 Darwin `vfork` is `fork`.
+pub unsafe extern "C" fn my_vfork() -> libc::pid_t {
+    my_fork()
 }
 
 pub unsafe extern "C" fn my_execve(
@@ -463,13 +499,20 @@ extern "C" {
     fn _dyld_get_shared_cache_range(length: *mut usize) -> *const std::ffi::c_void;
 }
 
+static RANGE: SpinLock<Option<(usize, usize)>> = SpinLock::new(None);
+
+/// In the child of a `fork`: see `SpinLock::force_unlock`.
+pub fn forked() {
+    RANGE.force_unlock();
+    INHERIT.force_unlock();
+}
+
 /// Whether `address` is code of a system library. Virtual pids are for the
 /// guest's own code and the libraries it brought. libSystem's internals
 /// hand `getpid()` to the kernel (unified logging asks `proc_pidinfo` about
 /// it while CoreFoundation initializes, and crashes on an error), so they
 /// must see the real one.
 pub fn in_system_library(address: usize) -> bool {
-    static RANGE: SpinLock<Option<(usize, usize)>> = SpinLock::new(None);
     let mut range = RANGE.lock();
     let (start, len) = *range.get_or_insert_with(|| {
         let mut len = 0usize;
@@ -540,6 +583,15 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
         crate::report::log("kill: only SIGTERM and SIGKILL reach another guest; signal dropped");
         return 0;
     }
+    if sig == libc::SIGTERM {
+        // The target is parked. A SIGTERM handler would run its code without
+        // the baton, and a process that survives could never be scheduled
+        // again, so the signal that arrives is the one that cannot be caught.
+        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::report::log("kill: SIGTERM to another guest is delivered as SIGKILL");
+        }
+    }
     // The target is parked, so it dies where it stands. Its threads must
     // leave the runnable set now: the launcher only hears of the death
     // later, and the baton must not go to a thread that no longer exists.
@@ -551,6 +603,12 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
                 t.cond_key = 0;
             }
         }
+        // Its parent need not wait for the launcher to notice
+        s.procs[target as usize].killed = true;
+        let parent = s.procs[target as usize].parent;
+        if parent != shared::NO_PROC {
+            s.wake_all(parent, shared::WAIT_KEY);
+        }
     });
-    libc::kill(real, sig)
+    libc::kill(real, libc::SIGKILL)
 }

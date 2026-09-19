@@ -28,13 +28,16 @@ fn errno() -> c_int {
 /// when it could succeed.
 pub unsafe extern "C" fn my_flock(fd: c_int, op: c_int) -> c_int {
     sched::hook_event(sched::SITE_FILE);
-    if my_id().is_none() || op & libc::LOCK_NB != 0 {
+    if my_id().is_none() {
         return libc::flock(fd, op);
     }
     if op & libc::LOCK_UN != 0 {
         let rc = libc::flock(fd, op);
         sched::with(|s, _| s.wake_io());
         return rc;
+    }
+    if op & libc::LOCK_NB != 0 {
+        return libc::flock(fd, op);
     }
     loop {
         let rc = libc::flock(fd, op | libc::LOCK_NB);

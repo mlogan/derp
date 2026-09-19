@@ -33,9 +33,10 @@ use crate::gcd::{
     rewrite_dispatch_source_create_shim, rewrite_dispatch_write_shim,
 };
 use crate::hostfs::{
-    my_access, my_chdir, my_chmod, my_chown, my_creat, my_fstatat, my_link, my_lstat, my_mkdir,
-    my_mkdirat, my_mkfifo, my_opendir, my_readlink, my_rename, my_rmdir, my_stat, my_symlink,
-    my_truncate, my_unlink, my_unlinkat, my_utimes,
+    my_access, my_chdir, my_chmod, my_chown, my_clonefile, my_creat, my_faccessat, my_fchmodat,
+    my_fstatat, my_lchown, my_link, my_lstat, my_mkdir, my_mkdirat, my_mkfifo, my_opendir,
+    my_readlink, my_readlinkat, my_rename, my_renameat, my_rmdir, my_stat, my_statfs, my_symlink,
+    my_truncate, my_unlink, my_unlinkat, my_utimensat, my_utimes,
 };
 use crate::io::{
     close_nocancel, my_close, my_close_nocancel, my_read, my_read_nocancel, my_readv,
@@ -53,7 +54,8 @@ use crate::net::{
 };
 use crate::poll::{my_poll, my_select};
 use crate::process::{
-    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_wait, my_wait4, my_waitpid,
+    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_vfork, my_wait, my_wait4,
+    my_waitpid,
 };
 use crate::process::{rewrite_getpid_shim, rewrite_getppid_shim};
 use crate::sched::{self, my_id, State};
@@ -96,6 +98,7 @@ extern "C" {
     fn os_sync_wake_by_address_any(addr: *mut c_void, size: usize, flags: u32) -> c_int;
     fn os_sync_wake_by_address_all(addr: *mut c_void, size: usize, flags: u32) -> c_int;
     fn pthread_yield_np();
+    fn vfork() -> libc::pid_t;
     fn dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isize;
     fn dispatch_semaphore_signal(sema: *mut c_void) -> isize;
     fn CCRandomGenerateBytes(buf: *mut c_void, n: usize) -> c_int;
@@ -271,7 +274,11 @@ extern "C" fn my_pthread_cond_timedwait(
     };
     count(C_COND);
     // The deadline is absolute on the (virtual) realtime clock
-    let abs = unsafe { (*ts).tv_sec as u64 * 1_000_000_000 + (*ts).tv_nsec as u64 };
+    let abs = unsafe {
+        ((*ts).tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((*ts).tv_nsec as u64)
+    };
     let deadline = abs.saturating_sub(crate::determinism::REALTIME_BASE_NS);
     cond_enqueue(c as usize, me);
     my_pthread_mutex_unlock(m);
@@ -318,13 +325,13 @@ fn value_matches(addr: *mut c_void, value: u64, wide: bool) -> bool {
 /// Block on `addr` once, for at most `timeout_ns` of virtual time (0:
 /// forever). Returns false if the wait timed out.
 fn futex_block(addr: *mut c_void, timeout_ns: u64) -> bool {
-    let deadline = (timeout_ns != 0).then(|| sched::now() + timeout_ns);
+    let deadline = (timeout_ns != 0).then(|| sched::now().saturating_add(timeout_ns));
     !sched::block_until(addr as usize as u64, deadline)
 }
 
 /// Sleep for `ns` of virtual time: a wait nothing but the deadline ends.
 fn sleep_ns(ns: u64) {
-    let deadline = sched::now() + ns;
+    let deadline = sched::now().saturating_add(ns);
     while !sched::block_until(shared::SLEEP_KEY, Some(deadline)) {}
 }
 
@@ -549,7 +556,11 @@ extern "C" fn my_nanosleep(req: *const libc::timespec, rem: *mut libc::timespec)
         return unsafe { libc::nanosleep(req, rem) };
     }
     count(C_YIELD);
-    let ns = unsafe { (*req).tv_sec as u64 * 1_000_000_000 + (*req).tv_nsec as u64 };
+    let ns = unsafe {
+        ((*req).tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((*req).tv_nsec as u64)
+    };
     sleep_ns(ns);
     if !rem.is_null() {
         unsafe {
@@ -671,6 +682,15 @@ interposers! {
     my_mkfifo => libc::mkfifo,
     my_creat => libc::creat,
     my_opendir => libc::opendir,
+    my_renameat => libc::renameat,
+    my_faccessat => libc::faccessat,
+    my_readlinkat => libc::readlinkat,
+    my_fchmodat => libc::fchmodat,
+    my_utimensat => libc::utimensat,
+    my_clonefile => libc::clonefile,
+    my_statfs => libc::statfs,
+    my_lchown => libc::lchown,
+    my_vfork => vfork,
     rewrite_dispatch_async_shim => gcd_real::dispatch_async,
     rewrite_dispatch_async_f_shim => gcd_real::dispatch_async_f,
     rewrite_dispatch_after_shim => gcd_real::dispatch_after,

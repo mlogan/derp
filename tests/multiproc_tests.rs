@@ -907,6 +907,13 @@ fn each_host_is_held_to_its_own_directory() {
     assert!(!Path::new("/tmp/rewrite-hostfs-escape").exists());
     assert_eq!(r.u64("p0.paths_refused"), 7);
     assert_eq!(r.u64("p2.paths_refused"), 1);
+
+    // The default scratch directory is under /var/folders, which is a system
+    // location; a sibling host's directory must not pass as "system".
+    let tmp = std::env::temp_dir().join(format!("rewrite-hostfs-test-{}", std::process::id()));
+    let under_tmp = run_manifest(&manifest, &tmp, 1, 2);
+    let _ = std::fs::remove_dir_all(&tmp);
+    assert_eq!(under_tmp.stdout, r.stdout);
 }
 
 /// Homebrew's curl and python3.13, if installed. Apple's own copies ignore
@@ -1097,4 +1104,63 @@ hosts:
     // Same output (stack address included) and the same trace, byte for
     // byte, whatever the launcher's own environment was
     assert_eq!(seen[0], seen[1]);
+}
+
+#[test]
+fn a_deadlock_across_processes_ends_the_run() {
+    let dir = common::scratch_dir("multiproc_deadlock");
+    common::build_c("lifecycle", &dir, &[]);
+    let manifest = dir.join("stuck.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - lifecycle stuck\n      - lifecycle stuck\n",
+    )
+    .unwrap();
+    common::supervisor_dylib();
+    let out = Command::new(common::rewrite_bin())
+        .args(["run", "--capture", "--seed", "1", "--scratch"])
+        .arg(dir.join("scratch"))
+        .arg("--manifest")
+        .arg(&manifest)
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    // Whoever finds the run idle aborts; the launcher passes the baton on,
+    // and the other guest finds the same. Before, the first abort left
+    // nobody with the baton and the launcher waited forever.
+    assert_eq!(
+        err.matches("deadlock: every thread is blocked").count(),
+        2,
+        "{err}"
+    );
+    assert!(
+        err.contains("p0.status=signal 6") && err.contains("p1.status=signal 6"),
+        "{err}"
+    );
+}
+
+#[test]
+fn a_killed_child_can_be_reaped_at_once() {
+    let dir = common::scratch_dir("multiproc_kill");
+    common::build_c("lifecycle", &dir, &[]);
+    let manifest = dir.join("kill.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - lifecycle killer\n",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    for seed in 1..=3u64 {
+        let r = run_manifest(&manifest, &scratch, seed, 1);
+        assert_eq!(
+            r.stdout[0], "killing 100001: 0\nreaped 100001, killed by a signal: yes\nagain: -1\n",
+            "seed {seed}"
+        );
+        let again = run_manifest(&manifest, &scratch, seed, 1);
+        assert_eq!(
+            again.fields["run.schedule_hash"],
+            r.fields["run.schedule_hash"]
+        );
+    }
 }

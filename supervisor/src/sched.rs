@@ -299,6 +299,11 @@ fn join_run(path: &str) -> (&'static Shared, usize) {
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| fatal("REWRITE_PROC missing"));
     let mut s = sh.lock();
+    if s.procs[pid as usize].killed {
+        s.procs[pid as usize].signalled = true;
+        drop(s);
+        die();
+    }
     let n = s.nthreads as usize;
     // After an `execve` the process has older, retired threads: take the
     // one that is still alive.
@@ -315,6 +320,11 @@ fn join_run(path: &str) -> (&'static Shared, usize) {
     // counted before it can close its own copies.
     crate::net::adopt_inherited(sh, pid);
     let mut s = sh.lock();
+    if s.procs[pid as usize].killed {
+        s.procs[pid as usize].signalled = true;
+        drop(s);
+        die();
+    }
     let p = &mut s.procs[pid as usize];
     p.real_pid = unsafe { libc::getpid() };
     p.state = shared::P_LIVE;
@@ -492,70 +502,147 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
     }
     // A deadline of 0 would mean none; one in the past expires at once
     s.threads[me].deadline = deadline.map_or(0, |d| d.max(1));
-    match s.hand_off(Some((me, st, key)), site) {
-        Handoff::Idle => {
-            let stuck = state != State::Exited || s.any_alive();
-            drop(s);
-            if !stuck {
-                return;
-            }
-            let outside = has_outside_threads();
-            let anywhere = with(|s, pid| {
-                s.procs[pid as usize].has_outside_threads |= outside;
-                s.any_outside_threads()
-            }) == Some(true);
-            if !anywhere {
-                fatal("deadlock: every thread is blocked");
-            }
-            // A GCD worker may be about to wake one of us (a block finishing
-            // under dispatch_sync, a semaphore). Look again in real time;
-            // the virtual clock and the trace do not move meanwhile.
-            let began = std::time::Instant::now();
-            loop {
-                unsafe { libc::usleep(200) };
-                let mut s = sh.lock();
-                match s.choose(Some(me), site) {
-                    Handoff::Idle => {}
-                    Handoff::Stay => {
-                        let q = s.pending_quantum;
-                        drop(s);
-                        install_quantum(q);
-                        return;
-                    }
-                    Handoff::Switch { to, seen } => {
-                        let (issued, clock) = (s.issued, s.clock_ns);
-                        drop(s);
-                        trace_switch(me, to, issued, site, clock);
-                        sh.unpark(to);
-                        if state != State::Exited {
-                            sh.park(me, seen);
-                            install_quantum(sh.lock().pending_quantum);
-                        }
-                        return;
-                    }
+    let handoff = s.hand_off(Some((me, st, key)), site);
+    let after = After::of(&mut s, handoff);
+    let stuck = state != State::Exited || s.any_alive();
+    drop(s);
+    if after.carry_out(sh, me, state, site) || !stuck {
+        return;
+    }
+
+    // Nothing can run. A GCD worker may be about to wake one of us (a block
+    // finishing under dispatch_sync, a semaphore): look again in real time.
+    // The virtual clock and the trace do not move meanwhile.
+    let outside = has_outside_threads();
+    let anywhere = with(|s, pid| {
+        s.procs[pid as usize].has_outside_threads |= outside;
+        s.any_outside_threads()
+    }) == Some(true);
+    if !anywhere {
+        fatal("deadlock: every thread is blocked");
+    }
+    let began = std::time::Instant::now();
+    loop {
+        unsafe { libc::usleep(200) };
+        let mut s = sh.lock();
+        let handoff = s.choose(Some(me), site);
+        let after = After::of(&mut s, handoff);
+        drop(s);
+        if after.carry_out(sh, me, state, site) {
+            return;
+        }
+        if began.elapsed() > std::time::Duration::from_secs(30) {
+            fatal("deadlock: every thread is blocked, and no outside thread woke one");
+        }
+    }
+}
+
+/// What a hand-off decided, copied out from under the lock.
+struct After {
+    handoff: Handoff,
+    quantum: i64,
+    issued: u64,
+    clock: u64,
+    /// The hand-off crashed this process
+    crashed_self: bool,
+    unsettled: bool,
+}
+
+impl After {
+    fn of(s: &mut shared::State, handoff: Handoff) -> After {
+        After {
+            handoff,
+            quantum: s.pending_quantum,
+            issued: s.issued,
+            clock: s.clock_ns,
+            crashed_self: s.procs[pid() as usize].killed,
+            unsettled: signal_crashed(s),
+        }
+    }
+
+    /// Returns false when the run was idle and the caller has to wait.
+    fn carry_out(self, sh: &Shared, me: usize, state: State, site: u64) -> bool {
+        match self.handoff {
+            Handoff::Idle if self.crashed_self => die(),
+            Handoff::Idle => false,
+            Handoff::Stay => {
+                if self.unsettled {
+                    take_up_baton(sh);
+                } else {
+                    install_quantum(self.quantum);
                 }
-                drop(s);
-                if began.elapsed() > std::time::Duration::from_secs(30) {
-                    fatal("deadlock: every thread is blocked, and no outside thread woke one");
+                true
+            }
+            Handoff::Switch { to, seen } => {
+                trace_switch(me, to, self.issued, site, self.clock);
+                sh.unpark(to);
+                // Our own crash comes after the baton is safely elsewhere
+                if self.crashed_self {
+                    die();
                 }
+                if state != State::Exited {
+                    sh.park(me, seen);
+                    take_up_baton(sh);
+                }
+                true
             }
         }
-        Handoff::Stay => {
-            let q = s.pending_quantum;
-            drop(s);
-            install_quantum(q);
+    }
+}
+
+/// Send `SIGKILL` to the processes the scheduler has crashed, other than
+/// this one: its own crash waits until the baton is elsewhere. Returns
+/// whether a crashed process may still be alive.
+pub fn signal_crashed(s: &mut shared::State) -> bool {
+    let own = unsafe { libc::getpid() };
+    s.take_kills(|victim| {
+        if victim != own {
+            unsafe { libc::kill(victim, libc::SIGKILL) };
         }
-        Handoff::Switch { to, seen } => {
-            let issued = s.issued;
-            let clock = s.clock_ns;
-            drop(s);
-            trace_switch(me, to, issued, site, clock);
-            sh.unpark(to);
-            if state != State::Exited {
-                sh.park(me, seen);
-                install_quantum(sh.lock().pending_quantum);
+    });
+    s.unsettled > 0
+}
+
+/// The baton is ours: before running, wait in real time until every crashed
+/// process is really dead, so that what its death releases in the kernel is
+/// released at this point of the schedule and not at some later one.
+pub fn take_up_baton(sh: &Shared) {
+    wait_out_deaths(sh, true);
+}
+
+/// `take_up_baton` for a thread that already runs: its quantum stands.
+pub fn settle_deaths() {
+    if let Some(sh) = shared() {
+        wait_out_deaths(sh, false);
+    }
+}
+
+fn wait_out_deaths(sh: &Shared, new_quantum: bool) {
+    // Counted, not timed: this process's clock is the virtual one
+    const GIVE_UP_AFTER: u32 = 200_000;
+    for polls in 0.. {
+        let mut s = sh.lock();
+        if !s.settle_deaths() && polls > GIVE_UP_AFTER {
+            crate::report::log("a crashed process will not die; no longer waiting for it");
+            s.forget_unsettled();
+        }
+        if s.settle_deaths() {
+            if new_quantum {
+                install_quantum(s.pending_quantum);
             }
+            return;
         }
+        drop(s);
+        unsafe { libc::usleep(50) };
+    }
+}
+
+/// The scheduler crashed this process: its threads are already out of the
+/// schedule, so all that is left is to go the way a crash goes.
+fn die() -> ! {
+    unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
+    loop {
+        unsafe { libc::pause() };
     }
 }
 
@@ -564,7 +651,7 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
 pub fn wait_for_baton(id: usize) {
     let Some(sh) = shared() else { return };
     sh.park(id, 0);
-    install_quantum(sh.lock().pending_quantum);
+    take_up_baton(sh);
 }
 
 /// `REWRITE_TRACE=file`: one line per switch, appended by whoever gives the

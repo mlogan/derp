@@ -441,6 +441,11 @@ names are held to, and Homebrew's curl fetches from Python's `http.server`
 repeatably. Plan in `IMPLEMENTATION_PLAN_RUNFILE.md`, progress and findings
 in `TASKS_RUNFILE.md`.
 
+**Process fault injection** (branch `mlogan-fault-injection`, complete):
+seeded crashes in virtual time and run-file restart policies with virtual
+downtime. Plan in `IMPLEMENTATION_PLAN_FAULTS.md`, progress, limits and
+review results in `TASKS_FAULTS.md`.
+
 **Next Phase**: Not yet planned
 
 ---

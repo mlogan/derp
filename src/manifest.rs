@@ -20,6 +20,12 @@
 //!         env: { MODE: fast }
 //!       - argv: [httpd, --port, 80]     # a server that never exits: killed
 //!         daemon: true                  # when all other processes are done
+//!         restart: on-failure           # never (default) | on-failure | always
+//!         restart-delay: 200ms..1s      # virtual time it stays down (default 100ms)
+//!         max-restarts: 10              # default: no limit
+//!         crash:
+//!           every: 50ms..200ms          # into each life, drawn from the seed
+//!           times: 3                    # default: no limit
 //! ```
 //!
 //! Processes start in file order. `argv[0]` names the program, relative to
@@ -29,6 +35,8 @@
 use std::collections::BTreeMap;
 
 use serde::Deserialize;
+
+use crate::shared::{self, Faults};
 
 /// A YAML scalar used as an argument. Numbers and booleans are taken as
 /// their text; quote one whose spelling matters (`"1.10"`, `"007"`).
@@ -71,6 +79,19 @@ struct RawFull {
     env: BTreeMap<String, Scalar>,
     #[serde(default)]
     daemon: bool,
+    restart: Option<String>,
+    #[serde(rename = "restart-delay")]
+    restart_delay: Option<Scalar>,
+    #[serde(rename = "max-restarts")]
+    max_restarts: Option<u32>,
+    crash: Option<RawCrash>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCrash {
+    every: Scalar,
+    times: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +129,83 @@ pub struct Process {
     /// A server that never exits by itself: the run ends, and it is
     /// killed, when every process that is not a daemon has exited
     pub daemon: bool,
+    /// Crashes to inject and what happens after a death
+    pub faults: Faults,
+}
+
+/// How long a process stays down when `restart-delay` is not given. Not
+/// zero: a restart is never instantaneous.
+const DEFAULT_RESTART_DELAY_NS: u64 = 100_000_000;
+
+/// A year
+const MAX_DURATION_NS: u64 = 365 * 24 * 3600 * 1_000_000_000;
+
+/// `5ms`, `250us`, `10ns`, `1s`; a bare number is milliseconds.
+pub fn parse_duration_ns(s: &str) -> Option<u64> {
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let scale = match &s[digits.len()..] {
+        "ns" => 1,
+        "us" => 1_000,
+        "" | "ms" => 1_000_000,
+        "s" => 1_000_000_000,
+        _ => return None,
+    };
+    let ns = digits.parse::<u64>().ok()?.checked_mul(scale)?;
+    // Far from overflowing the virtual clock when added to it
+    (ns <= MAX_DURATION_NS).then_some(ns)
+}
+
+/// `50ms..200ms`, or one duration for both ends
+fn parse_duration_range(s: &str) -> Option<(u64, u64)> {
+    let (lo, hi) = s.split_once("..").unwrap_or((s, s));
+    let (lo, hi) = (parse_duration_ns(lo.trim())?, parse_duration_ns(hi.trim())?);
+    (lo <= hi).then_some((lo, hi))
+}
+
+fn faults_of(full: &RawFull) -> Result<Faults, String> {
+    let restart = match full.restart.as_deref() {
+        None | Some("never") => shared::RESTART_NEVER,
+        Some("on-failure") => shared::RESTART_ON_FAILURE,
+        Some("always") => shared::RESTART_ALWAYS,
+        Some(other) => {
+            return Err(format!(
+                "run file: restart: {other} (expected never, on-failure or always)"
+            ))
+        }
+    };
+    if restart == shared::RESTART_NEVER
+        && (full.restart_delay.is_some() || full.max_restarts.is_some())
+    {
+        return Err("run file: restart-delay and max-restarts need a restart policy".into());
+    }
+    let (delay_lo, delay_hi) = match &full.restart_delay {
+        None => (DEFAULT_RESTART_DELAY_NS, DEFAULT_RESTART_DELAY_NS),
+        Some(d) => parse_duration_range(&d.text())
+            .filter(|&(lo, _)| lo > 0)
+            .ok_or(format!("run file: bad restart-delay {}", d.text()))?,
+    };
+    let (crash_lo, crash_hi, crashes) = match &full.crash {
+        None => (0, 0, 0),
+        Some(c) => {
+            let (lo, hi) = parse_duration_range(&c.every.text())
+                .filter(|&(lo, _)| lo > 0)
+                .ok_or(format!("run file: bad crash every {}", c.every.text()))?;
+            (lo, hi, c.times.unwrap_or(shared::NO_LIMIT))
+        }
+    };
+    Ok(Faults {
+        restart,
+        restart_delay_lo_ns: delay_lo,
+        restart_delay_hi_ns: delay_hi,
+        restarts_left: if restart == shared::RESTART_NEVER {
+            0
+        } else {
+            full.max_restarts.unwrap_or(shared::NO_LIMIT)
+        },
+        crash_lo_ns: crash_lo,
+        crash_hi_ns: crash_hi,
+        crashes_left: crashes,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -195,27 +293,33 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         }
         let index = m.hosts.len() as u32;
         for p in host.processes {
-            let (argv, env, daemon): (Vec<String>, Vec<(String, String)>, bool) = match p {
-                RawProcess::Line(line) => (
-                    line.split_whitespace().map(str::to_string).collect(),
-                    Vec::new(),
-                    false,
-                ),
-                RawProcess::Argv(argv) => {
-                    (argv.iter().map(Scalar::text).collect(), Vec::new(), false)
-                }
-                RawProcess::Full(full) => {
-                    check_names(full.env.keys())?;
-                    (
-                        full.argv.iter().map(Scalar::text).collect(),
-                        full.env
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.text()))
-                            .collect(),
-                        full.daemon,
-                    )
-                }
-            };
+            let (argv, env, daemon, faults): (Vec<String>, Vec<(String, String)>, bool, Faults) =
+                match p {
+                    RawProcess::Line(line) => (
+                        line.split_whitespace().map(str::to_string).collect(),
+                        Vec::new(),
+                        false,
+                        Faults::default(),
+                    ),
+                    RawProcess::Argv(argv) => (
+                        argv.iter().map(Scalar::text).collect(),
+                        Vec::new(),
+                        false,
+                        Faults::default(),
+                    ),
+                    RawProcess::Full(full) => {
+                        check_names(full.env.keys())?;
+                        (
+                            full.argv.iter().map(Scalar::text).collect(),
+                            full.env
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.text()))
+                                .collect(),
+                            full.daemon,
+                            faults_of(&full)?,
+                        )
+                    }
+                };
             if argv.is_empty() {
                 return Err(format!(
                     "run file: host {} has a process with no program",
@@ -227,6 +331,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                 argv,
                 env,
                 daemon,
+                faults,
             });
         }
         m.hosts.push(Host {
@@ -312,6 +417,53 @@ hosts:
     }
 
     #[test]
+    fn crashes_and_restarts() {
+        let m = parse(
+            r"hosts:
+  - name: a
+    processes:
+      - argv: [srv]
+        restart: on-failure
+        restart-delay: 200ms..1s
+        max-restarts: 4
+        crash: { every: 50ms..200ms, times: 3 }
+      - argv: [cli]
+        restart: always
+        crash: { every: 1s }
+      - plain
+",
+        )
+        .unwrap();
+        assert_eq!(
+            m.processes[0].faults,
+            Faults {
+                restart: shared::RESTART_ON_FAILURE,
+                restart_delay_lo_ns: 200_000_000,
+                restart_delay_hi_ns: 1_000_000_000,
+                restarts_left: 4,
+                crash_lo_ns: 50_000_000,
+                crash_hi_ns: 200_000_000,
+                crashes_left: 3,
+            }
+        );
+        let f = m.processes[1].faults;
+        assert_eq!(f.restart, shared::RESTART_ALWAYS);
+        assert_eq!(
+            f.restart_delay_lo_ns, 100_000_000,
+            "never instantaneous by default"
+        );
+        assert_eq!(
+            (f.restarts_left, f.crashes_left),
+            (shared::NO_LIMIT, shared::NO_LIMIT)
+        );
+        assert_eq!(
+            (f.crash_lo_ns, f.crash_hi_ns),
+            (1_000_000_000, 1_000_000_000)
+        );
+        assert_eq!(m.processes[2].faults, Faults::default());
+    }
+
+    #[test]
     fn a_bare_number_is_a_valid_latency() {
         let m = parse("net-latency: 5\nhosts: [{name: a, processes: [p]}]\n").unwrap();
         assert_eq!(m.net_latency.as_deref(), Some("5"));
@@ -348,6 +500,31 @@ hosts:
                 .contains("reserved")
         );
         assert!(err("hosts: [{name: stdout.0, processes: [p]}]").contains("host name"));
+        assert!(
+            err("hosts: [{name: a, processes: [{argv: [p], restart: sometimes}]}]")
+                .contains("expected never")
+        );
+        assert!(
+            err("hosts: [{name: a, processes: [{argv: [p], restart-delay: 1s}]}]")
+                .contains("need a restart policy")
+        );
+        assert!(err(
+            "hosts: [{name: a, processes: [{argv: [p], restart: always, restart-delay: 0}]}]"
+        )
+        .contains("bad restart-delay"));
+        assert!(
+            err("hosts: [{name: a, processes: [{argv: [p], crash: {every: 9s..1s}}]}]")
+                .contains("bad crash every")
+        );
+        // Longer than a year: the virtual clock could not hold many of these
+        assert!(
+            err("hosts: [{name: a, processes: [{argv: [p], crash: {every: 99999999999s}}]}]")
+                .contains("bad crash every")
+        );
+        assert!(
+            err("hosts: [{name: a, processes: [{argv: [p], crash: {evry: 1s}}]}]")
+                .contains("run file")
+        );
         assert!(
             err("hosts: [{name: Web, processes: [p]}, {name: web, processes: [p]}]")
                 .contains("declared twice")

@@ -565,14 +565,17 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
     };
     let known = sched::with(|s, _| {
         let p = &s.procs[target as usize];
-        (target < s.nprocs && p.state != shared::P_EXITED).then_some(p.real_pid)
+        (target < s.nprocs && p.state != shared::P_EXITED && !p.killed).then_some(p.real_pid)
     })
     .flatten();
     let Some(real) = known else {
         return crate::errno::fail(libc::ESRCH);
     };
-    if target == sched::pid() || sig == 0 {
+    if target == sched::pid() {
         return libc::kill(real, sig);
+    }
+    if sig == 0 {
+        return 0;
     }
     if sig != libc::SIGTERM && sig != libc::SIGKILL {
         crate::report::log("kill: only SIGTERM and SIGKILL reach another guest; signal dropped");
@@ -587,23 +590,14 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
             crate::report::log("kill: SIGTERM to another guest is delivered as SIGKILL");
         }
     }
-    // The target is parked, so it dies where it stands. Its threads must
-    // leave the runnable set now: the launcher only hears of the death
-    // later, and the baton must not go to a thread that no longer exists.
+    // The target is parked, so it dies where it stands. All that its death
+    // means to the run happens now, under the lock: the launcher only hears
+    // of it later, and the baton must not go to a thread that is gone.
+    // One still down between lives has no real process yet.
     sched::with(|s, _| {
-        let n = s.nthreads as usize;
-        for t in &mut s.threads[..n] {
-            if t.pid == target {
-                t.state = shared::T_EXITED;
-                t.cond_key = 0;
-            }
-        }
-        // Its parent need not wait for the launcher to notice
-        s.procs[target as usize].killed = true;
-        let parent = s.procs[target as usize].parent;
-        if parent != shared::NO_PROC {
-            s.wake_all(parent, shared::WAIT_KEY);
-        }
+        s.crash(target);
+        sched::signal_crashed(s);
     });
-    libc::kill(real, libc::SIGKILL)
+    sched::settle_deaths();
+    0
 }

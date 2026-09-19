@@ -137,6 +137,27 @@ faults at the first hooked branch.
 `--no-supervisor` and `bench` still inject the dylib, in a passive mode
 that maps the region and schedules nothing. It adds under 1 ms of startup.
 
+## Debugging a guest
+
+lldb works on rewritten binaries. Text is patched in place and the UUID is
+kept, so the original debug information still fits: `breakpoint set --file
+F --line N` resolves to the same address as in the original, a breakpoint on
+an instruction the rewriter replaced still hits, and variables, backtraces,
+`next` and `finish` behave. You can launch a rewritten file under lldb with
+`DYLD_INSERT_LIBRARIES` set to the supervisor dylib, or attach to a guest of
+a real run by pid.
+
+- A debugger finds a dSYM by the executable's file name, so the rewriter
+  links `<rewritten file>.dSYM` to the input's bundle when it has one.
+  Debug information kept in object files needs nothing.
+- `step` into a hooked call stops inside its stub, which has no symbol, line
+  or unwind information, and from there only steps instructions. Set a
+  breakpoint on the callee and `continue` instead.
+- Time is virtual: a guest that only sleeps is over at once in real time,
+  possibly before you attach.
+- A stopped guest holds the baton, so the run stays deterministic; what you
+  change from the debugger is input.
+
 ## Small binaries lose `LC_FUNCTION_STARTS`
 
 The rewriter adds one 72-byte segment command and must leave 16 bytes for

@@ -1021,3 +1021,80 @@ fn a_guest_that_uses_gcd_is_turned_away() {
     assert_eq!(code, Some(0), "{stderr}");
     assert_eq!(stdout, "block ran: sync\ndone\n");
 }
+
+#[test]
+fn guests_start_from_a_fixed_environment() {
+    let dir = common::scratch_dir("multiproc_env");
+    common::build_c("envprobe", &dir, &[]);
+    let manifest = dir.join("env.yaml");
+    std::fs::write(
+        &manifest,
+        r"env: { FROM_FILE: run-wide }
+pass-env: [PASSED, NOT_SET_ANYWHERE]
+hosts:
+  - name: a
+    processes:
+      - argv: [envprobe]
+        env: { MINE: just-me }
+      - envprobe
+",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    common::supervisor_dylib();
+    // Two shells that could hardly differ more
+    let ambient: [&[(&str, String)]; 2] = [
+        &[
+            ("AMBIENT", "x".to_string()),
+            ("PASSED", "on-purpose".to_string()),
+        ],
+        &[
+            ("AMBIENT", "y".repeat(3000)),
+            ("PASSED", "on-purpose".to_string()),
+            ("OLDPWD", "/somewhere/else/entirely".to_string()),
+            ("http_proxy", "http://proxy.invalid:3128".to_string()),
+            ("LANG", "de_DE.UTF-8".to_string()),
+            ("TZ", "Pacific/Auckland".to_string()),
+        ],
+    ];
+    let mut seen = Vec::new();
+    for (i, vars) in ambient.iter().enumerate() {
+        let trace = dir.join(format!("trace{i}"));
+        let _ = std::fs::remove_file(&trace);
+        let out = Command::new(common::rewrite_bin())
+            .args(["run", "--capture", "--seed", "3", "--scratch"])
+            .arg(&scratch)
+            .arg("--manifest")
+            .arg(&manifest)
+            .envs(vars.iter().map(|(k, v)| (k, v)))
+            .env("REWRITE_TRACE", &trace)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let read = |n: usize| std::fs::read_to_string(scratch.join(format!("stdout.{n}"))).unwrap();
+        seen.push((read(0), read(1), std::fs::read_to_string(&trace).unwrap()));
+    }
+    let (first, second, trace) = &seen[0];
+    let lines: Vec<&str> = first.lines().collect();
+    assert_eq!(
+        lines[0],
+        "FROM_FILE HOME LANG LC_ALL LOGNAME MINE PASSED PATH PWD TMPDIR TZ USER "
+    );
+    assert_eq!(
+        lines[1],
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C TZ=UTC USER=guest"
+    );
+    assert_eq!(
+        lines[2],
+        "AMBIENT=(unset) PASSED=on-purpose FROM_FILE=run-wide MINE=just-me"
+    );
+    assert!(second.contains("MINE=(unset)"), "{second}");
+    assert!(trace.lines().count() > 3, "{trace}");
+    // Same output (stack address included) and the same trace, byte for
+    // byte, whatever the launcher's own environment was
+    assert_eq!(seen[0], seen[1]);
+}

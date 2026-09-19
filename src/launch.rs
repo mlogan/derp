@@ -115,6 +115,10 @@ pub struct Run {
     pub dylib: Option<PathBuf>,
     /// Extra `KEY=VALUE` pairs for every guest's environment
     pub env: Vec<(String, String)>,
+    /// Whether guests inherit the launcher's environment underneath what
+    /// the run sets. Run-file runs do not: the shell's variables would be
+    /// an unrecorded input, and their total length moves the guest's stack.
+    pub inherit_env: bool,
     pub disable_aslr: bool,
     pub seed: u64,
     pub quantum: (u32, u32),
@@ -184,6 +188,7 @@ fn spawn(
         .map(|(k, _)| k)
         .collect();
     let mut env: Vec<CString> = std::env::vars_os()
+        .filter(|_| run.inherit_env)
         .filter(|(k, _)| !ours.iter().any(|o| k == o))
         .filter(|(k, _)| !set.iter().any(|s| k == s.as_str()))
         .map(|(k, v)| {
@@ -197,6 +202,15 @@ fn spawn(
         let mut s = b"DYLD_INSERT_LIBRARIES=".to_vec();
         s.extend(d.as_os_str().as_bytes());
         env.push(CString::new(s).unwrap());
+    }
+    // The supervisor's own debugging switches, which a guest that does not
+    // inherit our environment would otherwise never see
+    if !run.inherit_env {
+        for name in ["REWRITE_TRACE", "REWRITE_PARK_SPINS"] {
+            if let Ok(value) = std::env::var(name) {
+                env.push(CString::new(format!("{name}={value}")).unwrap());
+            }
+        }
     }
     for (k, v) in run.env.iter().chain(&guest.env).chain(extra_env) {
         env.push(CString::new(format!("{k}={v}")).unwrap());
@@ -741,6 +755,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         hosts: vec!["h0".into()],
         dylib: cfg.dylib.clone(),
         env: cfg.env.clone(),
+        inherit_env: true,
         disable_aslr: cfg.disable_aslr,
         seed: cfg.seed,
         quantum: cfg.quantum,

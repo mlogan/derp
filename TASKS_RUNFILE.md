@@ -152,9 +152,34 @@ Found while re-running the curl/Python test next to the others (1 run in
   `p<i>.outside_wakes` counts scheduled threads woken by outside threads.
 - After these: 80 of 80 traces byte-identical under 8 busy-loop processes.
 
+## 5. Guests start from a fixed environment ✅ (2026-09-19)
+
+- Run-file runs no longer inherit the launcher's environment. Every guest
+  starts from `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `LANG=C`, `LC_ALL=C`,
+  `TZ=UTC`, `USER=guest`, `LOGNAME=guest`; then what the run file names in
+  `pass-env:` (taken from the launcher's environment), the host's `HOME`,
+  `PWD` and `TMPDIR`, the run file's top-level `env:`, the process's own
+  `env:`, and the supervisor's variables. Each name appears once.
+- Why: the shell's variables were an unrecorded input (`http_proxy` would
+  send curl out of the virtual network; `LANG` and `TZ` change output), and
+  their total length decides where the guest's stack starts.
+- Checked first: the strings the kernel puts above the environment
+  (`apple[]`) were a constant 292 bytes over 60 launches, so the environment
+  was the only variable part.
+- The default scratch directory's name is fixed width too (it is in `HOME`,
+  `PWD` and `TMPDIR`). The launcher forwards `REWRITE_TRACE` and
+  `REWRITE_PARK_SPINS` explicitly. A trace path of another length moves the
+  stack, so compare traces written to paths of equal length.
+- Single-program `rewrite run prog` still inherits the environment: that is
+  the quick way to try a binary, and people expect their variables there.
+- Test: `envprobe.c` under two ambient environments that differ by 3 KB, a
+  proxy, a locale and a time zone. Same variable names, same values, same
+  stack address, byte-identical trace. The test fails if inheritance is
+  switched back on (checked).
+
 ## Test summary
 
-`cargo test -p rewrite -p rewrite-supervisor`: all pass (25 + 4 + 20 + 3 + 4
+`cargo test -p rewrite -p rewrite-supervisor`: all pass (25 + 4 + 21 + 3 + 4
 in `rewrite`, 20 unit tests in the supervisor); clippy clean.
 
 ## Follow-ups

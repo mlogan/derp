@@ -38,6 +38,8 @@ run file:
   quantum: 1000..10000
   mem-hook-rate: 1/16
   net-latency: 5ms
+  env: { LOG_LEVEL: debug }            for every process
+  pass-env: [SSL_CERT_FILE]            inherited from your environment; nothing else is
   hosts:                               in order: 10.0.0.1, 10.0.0.2, ...
     - name: alpha
       files: [site/index.html]         copied into the host's fresh directory
@@ -233,10 +235,37 @@ fn prepare_scratch(dir: &Path) -> Fallible<()> {
     Ok(())
 }
 
+/// Fixed width: guests' `HOME`, `PWD` and `TMPDIR` contain this path, and
+/// the length of the environment decides where a guest's stack starts.
 fn scratch_dir(cli: &Cli) -> PathBuf {
-    cli.scratch
-        .clone()
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("rewrite-run-{}", std::process::id())))
+    cli.scratch.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("rewrite-run-{:010}", std::process::id()))
+    })
+}
+
+/// What every guest of a run-file run starts from, instead of our own
+/// environment. Anything else comes from the run file, by value (`env:`)
+/// or by name (`pass-env:`).
+const FIXED_ENV: [(&str, &str); 6] = [
+    ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+    ("LANG", "C"),
+    ("LC_ALL", "C"),
+    ("TZ", "UTC"),
+    ("USER", "guest"),
+    ("LOGNAME", "guest"),
+];
+
+/// Later entries replace earlier ones, so every name appears once:
+/// `getenv` returns the first match.
+fn layered(layers: &[&[(String, String)]]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in layers.iter().flat_map(|l| l.iter()) {
+        match out.iter_mut().find(|(name, _)| name == k) {
+            Some(entry) => entry.1.clone_from(v),
+            None => out.push((k.clone(), v.clone())),
+        }
+    }
+    out
 }
 
 fn stdout_file(scratch: &Path, index: usize) -> PathBuf {
@@ -265,6 +294,15 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
     let scratch = std::fs::canonicalize(scratch)?;
     let roots = rewrite::hostdir::prepare(&scratch, base, &m.hosts)?;
     let text = |p: &Path| p.to_string_lossy().into_owned();
+    let fixed: Vec<(String, String)> = FIXED_ENV
+        .iter()
+        .map(|&(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let passed: Vec<(String, String)> = m
+        .pass_env
+        .iter()
+        .filter_map(|k| Some((k.clone(), std::env::var(k).ok()?)))
+        .collect();
     let guests = m
         .processes
         .iter()
@@ -274,14 +312,16 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
             let root = &roots[p.host as usize];
             // The host's directory is home: where the process starts and
             // what its path names are held to
-            let mut env = vec![
+            let host_env = vec![
                 ("PWD".to_string(), text(root)),
                 ("HOME".to_string(), text(root)),
                 ("TMPDIR".to_string(), text(&root.join("tmp"))),
+            ];
+            let policy = vec![
                 (rewrite::shared::HOST_ROOT_VAR.to_string(), text(root)),
                 (rewrite::shared::ALLOW_VAR.to_string(), m.allow.join(":")),
             ];
-            env.extend(p.env.iter().cloned());
+            let env = layered(&[&fixed, &passed, &host_env, &m.env, &p.env, &policy]);
             Guest {
                 exe,
                 argv0: Some(p.argv[0].clone().into()),
@@ -299,6 +339,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         hosts: m.hosts.iter().map(|h| h.name.clone()).collect(),
         dylib: dylib_for(cli)?,
         env: Vec::new(),
+        inherit_env: false,
         disable_aslr: cli.disable_aslr,
         seed: cli.opts.seed,
         quantum: cli.quantum,

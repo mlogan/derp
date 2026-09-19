@@ -48,6 +48,15 @@ hosts:                   # in order: 10.0.0.1, 10.0.0.2, ...
         env: { MODE: fast }
 ```
 
+Guests of a run file do not inherit your shell's environment. They start
+from a fixed one (`PATH=/usr/bin:/bin:/usr/sbin:/sbin`, `LANG=C`, `LC_ALL=C`,
+`TZ=UTC`, `USER=guest`, `LOGNAME=guest`, and `HOME`, `PWD`, `TMPDIR` in the
+host's directory). Add to it in the run file: a top-level `env:` map for
+every process, `env:` on a process, or `pass-env: [NAME, ...]` to inherit
+named variables on purpose. Otherwise a proxy setting or a locale would be
+an input nobody wrote down, and the environment's length even decides where
+a guest's stack starts. Single-program `rewrite run prog` still inherits.
+
 A process written as a map may also say `daemon: true`: a server that never
 exits. When every other process of the run file has exited, the launcher
 kills what is left and the run is over.

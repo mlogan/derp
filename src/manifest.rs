@@ -8,6 +8,8 @@
 //! net-latency: 5ms
 //! allow:                   # extra paths every host may touch
 //!   - /opt/site-content
+//! env: { LOG_LEVEL: debug } # for every process; guests start from a fixed
+//! pass-env: [SSL_CERT_FILE] # environment, and inherit only what is named
 //! hosts:                   # in order: 10.0.0.1, 10.0.0.2, ...
 //!   - name: alpha
 //!     files: [site/index.html, site/img]   # copied into the host's directory
@@ -84,6 +86,10 @@ struct RawRun {
     net_latency: Option<Scalar>,
     #[serde(default)]
     allow: Vec<String>,
+    #[serde(default)]
+    env: BTreeMap<String, Scalar>,
+    #[serde(default)]
+    pass_env: Vec<String>,
     hosts: Vec<RawHost>,
 }
 
@@ -115,6 +121,12 @@ pub struct Manifest {
     pub mem_hook_rate: Option<String>,
     pub net_latency: Option<String>,
     pub allow: Vec<String>,
+    /// Variables for every process of the run
+    pub env: Vec<(String, String)>,
+    /// Variables every process inherits from the launcher's environment.
+    /// Guests start from a fixed environment; this is how an input from
+    /// outside is let in on purpose, and on the record.
+    pub pass_env: Vec<String>,
 }
 
 /// A host's name is also the name of its directory.
@@ -135,6 +147,8 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         mem_hook_rate: raw.mem_hook_rate.as_ref().map(Scalar::text),
         net_latency: raw.net_latency.as_ref().map(Scalar::text),
         allow: raw.allow,
+        env: raw.env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
+        pass_env: raw.pass_env,
         ..Manifest::default()
     };
     for host in raw.hosts {
@@ -241,6 +255,19 @@ hosts:
         assert_eq!(m.mem_hook_rate.as_deref(), Some("1/16"));
         assert_eq!(m.net_latency.as_deref(), Some("5ms"));
         assert_eq!(m.allow, ["/opt/content"]);
+        assert!(m.env.is_empty() && m.pass_env.is_empty());
+        let e = parse(
+            "env: {A: 1, B: two}\npass-env: [SSL_CERT_FILE]\nhosts: [{name: a, processes: [p]}]",
+        )
+        .unwrap();
+        assert_eq!(
+            e.env,
+            [
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "two".to_string())
+            ]
+        );
+        assert_eq!(e.pass_env, ["SSL_CERT_FILE"]);
     }
 
     #[test]

@@ -1,10 +1,6 @@
-//! End-of-run report on the fd the launcher hands us, plus a stderr log.
+//! End-of-run report to the launcher, plus a stderr log.
 
 use std::fmt::Write as _;
-
-fn report_fd() -> Option<i32> {
-    std::env::var("REWRITE_REPORT_FD").ok()?.parse().ok()
-}
 
 /// Write `msg` to stderr without allocating; interposers may log before
 /// libmalloc is initialized.
@@ -21,13 +17,13 @@ pub fn log(msg: &str) {
 }
 
 fn write_report() {
-    let Some(fd) = report_fd() else { return };
+    if !crate::coord::connected() {
+        return;
+    }
     let mut text = String::new();
     crate::sched::report(&mut text);
     let _ = writeln!(text, "heap_fixed={}", crate::alloc::region_fixed());
-    unsafe {
-        libc::write(fd, text.as_ptr().cast(), text.len());
-    }
+    crate::coord::report(&text);
 }
 
 extern "C" fn at_exit() {

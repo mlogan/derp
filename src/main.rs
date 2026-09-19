@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use rewrite::launch::{self, Launch};
-use rewrite::macho::{self, MachO};
+use rewrite::cache::{cached_rewrite, read_macho, rewrite_file, write_exe, Fallible};
+use rewrite::launch::{self, Guest, Launch, Run, RunOutcome};
+use rewrite::manifest;
 use rewrite::rewrite::{self as rw, Options};
 
 const USAGE: &str = "\
@@ -15,14 +16,39 @@ usage:
   rewrite run [opts] <prog> [args…]    rewrite (cached), then launch under the supervisor
   rewrite bench [opts] <prog> [args…]  time native vs rewritten (no supervisor)
   rewrite repeat [opts] <prog> [args…] run N times; exit status, stdout and schedule hash must agree
+  rewrite run|repeat [opts] --manifest FILE
+                                       several processes under one scheduler; see below
 options:
   --runs N                             repetitions for repeat (default 100)
   --seed S                             run seed (default 0)
   --mem-hook-rate R                    0, 1 or a fraction like 1/16 (default 0)
   --quantum LO..HI                     hook events per quantum (default 1000..10000)
-  --no-supervisor                      run the rewritten binary without the dylib
+  --no-supervisor                      no scheduling: the dylib only provides the stubs' counter
   --aslr                               leave ASLR on
   --native                             run the original binary without the dylib
+  --manifest FILE                      run file (YAML): hosts and their processes
+  --scratch DIR                        where a run file's host directories are made, fresh
+                                       (default: a directory under the system temp dir)
+  --capture                            manifest run: each guest's stdout goes to stdout.<index>
+                                       in the scratch directory instead of ours
+  --net-latency T                      virtual-time delay between different hosts, such as
+                                       5ms, 250us or 1s (default 0)
+run file:
+  seed: 7                              optional; the command line overrides these four
+  quantum: 1000..10000
+  mem-hook-rate: 1/16
+  net-latency: 5ms
+  env: { LOG_LEVEL: debug }            for every process
+  pass-env: [SSL_CERT_FILE]            inherited from your environment; nothing else is
+  hosts:                               in order: 10.0.0.1, 10.0.0.2, ...
+    - name: alpha
+      files: [site/index.html]         copied into the host's fresh directory
+      processes:
+        - [server, --port, 8080]       argv verbatim
+        - client alpha 8080            or a line, split on whitespace
+        - argv: [worker]               or a map, with an environment
+          env: { MODE: fast }
+  Program paths are relative to the run file. See README.md.
 ";
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
@@ -30,21 +56,72 @@ fn fail(msg: impl std::fmt::Display) -> ExitCode {
     ExitCode::from(2)
 }
 
+#[derive(Clone)]
 struct Cli {
+    /// Settings given on the command line, which a run file cannot override
+    given: Vec<&'static str>,
     opts: Options,
-    quantum: String,
+    quantum: (u32, u32),
     supervisor: bool,
+    manifest: Option<PathBuf>,
+    scratch: Option<PathBuf>,
+    capture: bool,
+    net_latency_ns: u64,
     disable_aslr: bool,
     native: bool,
     runs: u32,
     rest: Vec<OsString>,
 }
 
+/// `5ms`, `250us`, `10ns`, `1s`; a bare number is milliseconds.
+fn parse_duration_ns(s: &str) -> Option<u64> {
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let scale = match &s[digits.len()..] {
+        "ns" => 1,
+        "us" => 1_000,
+        "" | "ms" => 1_000_000,
+        "s" => 1_000_000_000,
+        _ => return None,
+    };
+    digits.parse::<u64>().ok()?.checked_mul(scale)
+}
+
+fn parse_quantum(v: &str) -> Result<(u32, u32), String> {
+    v.split_once("..")
+        .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
+        .filter(|&(lo, hi): &(u32, u32)| lo >= 1 && hi >= lo)
+        .ok_or(format!("bad quantum {v}"))
+}
+
+/// The run's settings: the run file's, unless the command line gave them.
+fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, String> {
+    let mut cli = cli.clone();
+    let from_file = |name: &str| !cli.given.contains(&name);
+    if let (Some(seed), true) = (m.seed, from_file("seed")) {
+        cli.opts.seed = seed;
+    }
+    if let (Some(q), true) = (&m.quantum, from_file("quantum")) {
+        cli.quantum = parse_quantum(q)?;
+    }
+    if let (Some(r), true) = (&m.mem_hook_rate, from_file("mem-hook-rate")) {
+        cli.opts.mem_rate = rw::parse_rate(r).ok_or(format!("bad rate {r}"))?;
+    }
+    if let (Some(l), true) = (&m.net_latency, from_file("net-latency")) {
+        cli.net_latency_ns = parse_duration_ns(l).ok_or(format!("bad duration {l}"))?;
+    }
+    Ok(cli)
+}
+
 fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
     let mut cli = Cli {
+        given: Vec::new(),
         opts: Options::default(),
-        quantum: "1000..10000".into(),
+        quantum: launch::DEFAULT_QUANTUM,
         supervisor: true,
+        manifest: None,
+        scratch: None,
+        capture: false,
+        net_latency_ns: 0,
         disable_aslr: true,
         native: false,
         runs: 100,
@@ -61,12 +138,25 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         match a.as_str() {
             "--seed" => {
                 cli.opts.seed = take_value(&mut args)?.parse().map_err(|_| "bad seed")?;
+                cli.given.push("seed");
             }
             "--mem-hook-rate" => {
                 let v = take_value(&mut args)?;
                 cli.opts.mem_rate = rw::parse_rate(&v).ok_or(format!("bad rate {v}"))?;
+                cli.given.push("mem-hook-rate");
             }
-            "--quantum" => cli.quantum = take_value(&mut args)?,
+            "--quantum" => {
+                cli.quantum = parse_quantum(&take_value(&mut args)?)?;
+                cli.given.push("quantum");
+            }
+            "--manifest" => cli.manifest = Some(take_value(&mut args)?.into()),
+            "--scratch" => cli.scratch = Some(take_value(&mut args)?.into()),
+            "--capture" => cli.capture = true,
+            "--net-latency" => {
+                let v = take_value(&mut args)?;
+                cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
+                cli.given.push("net-latency");
+            }
             "--no-supervisor" => cli.supervisor = false,
             "--aslr" => cli.disable_aslr = false,
             "--native" => cli.native = true,
@@ -82,53 +172,18 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
     Ok(cli)
 }
 
-type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
-
-fn write_exe(path: &Path, image: &[u8]) -> Fallible<()> {
-    std::fs::write(path, image)?;
-    std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
-    macho::adhoc_sign(path)?;
-    Ok(())
-}
-
-fn read_macho(path: &Path) -> Fallible<MachO> {
-    Ok(MachO::parse(std::fs::read(path)?)?)
-}
-
 fn copy(input: &Path, output: &Path) -> Fallible<()> {
-    write_exe(output, &read_macho(input)?.emit(&[], &[], &[])?)
+    write_exe(output, &read_macho(input)?.emit(&[], &[])?)
 }
 
-fn do_rewrite(input: &Path, output: &Path, opts: &Options) -> Fallible<rw::Stats> {
-    let r = rw::rewrite(&read_macho(input)?, opts)?;
-    write_exe(output, &r.image)?;
-    Ok(r.stats)
-}
-
-/// Rewrite into a cache file next to the program, keyed by options and
-/// the input's modification time.
-fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
-    let mtime = std::fs::metadata(input)?
-        .modified()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
-    let name = format!(
-        "{}.rw-{}-{}of{}-{mtime}",
-        input.file_name().unwrap_or_default().to_string_lossy(),
-        opts.seed,
-        opts.mem_rate.0,
-        opts.mem_rate.1
-    );
-    let out = input.with_file_name(name);
-    if !out.exists() {
-        let stats = do_rewrite(input, &out, opts)?;
-        eprintln!(
-            "rewrite: {} sites hooked -> {}",
-            stats.branch_sites + stats.call_sites + stats.mem_sites,
-            out.display()
-        );
+/// Every rewritten binary needs the dylib; only native runs go without.
+fn dylib_for(cli: &Cli) -> Fallible<Option<PathBuf>> {
+    if cli.native {
+        return Ok(None);
     }
-    Ok(out)
+    launch::default_dylib()
+        .map(Some)
+        .ok_or_else(|| "supervisor dylib not found next to the rewrite binary".into())
 }
 
 fn run_guest(
@@ -138,24 +193,16 @@ fn run_guest(
     quiet: bool,
     stdout: Option<PathBuf>,
 ) -> Fallible<launch::Outcome> {
-    let dylib = if cli.supervisor && !cli.native {
-        Some(
-            launch::default_dylib()
-                .ok_or("supervisor dylib not found next to the rewrite binary")?,
-        )
-    } else {
-        None
-    };
     let cfg = Launch {
         exe,
         args,
-        dylib,
-        env: vec![
-            ("REWRITE_SEED".into(), cli.opts.seed.to_string()),
-            ("REWRITE_QUANTUM".into(), cli.quantum.clone()),
-        ],
+        dylib: dylib_for(cli)?,
         disable_aslr: cli.disable_aslr,
         stdout,
+        seed: cli.opts.seed,
+        quantum: cli.quantum,
+        passive: !cli.supervisor,
+        rewrite: (!cli.native).then(|| cli.opts.clone()),
     };
     let outcome = launch::launch(&cfg)?;
     if !quiet {
@@ -164,6 +211,189 @@ fn run_guest(
         }
     }
     Ok(outcome)
+}
+
+const SCRATCH_MARKER: &str = ".rewrite-scratch";
+
+/// Create the run's scratch directory empty. An existing directory is
+/// only cleared if an earlier run of ours marked it.
+fn prepare_scratch(dir: &Path) -> Fallible<()> {
+    if dir.exists() {
+        let ours = dir.join(SCRATCH_MARKER).exists();
+        if !ours && std::fs::read_dir(dir)?.next().is_some() {
+            return Err(format!(
+                "{} exists, is not empty and was not created by rewrite",
+                dir.display()
+            )
+            .into());
+        }
+        std::fs::remove_dir_all(dir)?;
+    }
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join(SCRATCH_MARKER), "")?;
+    Ok(())
+}
+
+/// Fixed width: guests' `HOME`, `PWD` and `TMPDIR` contain this path, and
+/// the length of the environment decides where a guest's stack starts.
+fn scratch_dir(cli: &Cli) -> PathBuf {
+    cli.scratch.clone().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!("rewrite-run-{:010}", std::process::id()))
+    })
+}
+
+/// What every guest of a run-file run starts from, instead of our own
+/// environment. Anything else comes from the run file, by value (`env:`)
+/// or by name (`pass-env:`).
+const FIXED_ENV: [(&str, &str); 6] = [
+    ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+    ("LANG", "C"),
+    ("LC_ALL", "C"),
+    ("TZ", "UTC"),
+    ("USER", "guest"),
+    ("LOGNAME", "guest"),
+];
+
+/// Later entries replace earlier ones, so every name appears once:
+/// `getenv` returns the first match.
+fn layered(layers: &[&[(String, String)]]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in layers.iter().flat_map(|l| l.iter()) {
+        match out.iter_mut().find(|(name, _)| name == k) {
+            Some(entry) => entry.1.clone_from(v),
+            None => out.push((k.clone(), v.clone())),
+        }
+    }
+    out
+}
+
+fn stdout_file(scratch: &Path, index: usize) -> PathBuf {
+    scratch.join(format!("stdout.{index}"))
+}
+
+/// Start the manifest's processes under one scheduler. With `capture`,
+/// each guest's stdout goes to `stdout.<index>` in the scratch directory.
+fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallible<RunOutcome> {
+    let m = manifest::parse(&std::fs::read_to_string(path)?)?;
+    let cli = &with_run_file_settings(cli, &m)?;
+    let base = path.parent().unwrap_or(Path::new("."));
+    // Programs first: a run file that names a missing one should fail
+    // before anything is created.
+    let mut programs = Vec::new();
+    for p in &m.processes {
+        let prog = std::fs::canonicalize(base.join(&p.argv[0]))
+            .map_err(|e| format!("{}: {e}", p.argv[0]))?;
+        programs.push(if cli.native {
+            prog
+        } else {
+            cached_rewrite(&prog, &cli.opts)?
+        });
+    }
+    prepare_scratch(scratch)?;
+    let scratch = std::fs::canonicalize(scratch)?;
+    let roots = rewrite::hostdir::prepare(&scratch, base, &m.hosts)?;
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+    let fixed: Vec<(String, String)> = FIXED_ENV
+        .iter()
+        .map(|&(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let passed: Vec<(String, String)> = m
+        .pass_env
+        .iter()
+        .filter_map(|k| Some((k.clone(), std::env::var(k).ok()?)))
+        .collect();
+    let guests = m
+        .processes
+        .iter()
+        .zip(programs)
+        .enumerate()
+        .map(|(i, (p, exe))| {
+            let root = &roots[p.host as usize];
+            // The host's directory is home: where the process starts and
+            // what its path names are held to
+            let host_env = vec![
+                ("PWD".to_string(), text(root)),
+                ("HOME".to_string(), text(root)),
+                ("TMPDIR".to_string(), text(&root.join("tmp"))),
+            ];
+            let policy = vec![
+                (rewrite::shared::HOST_ROOT_VAR.to_string(), text(root)),
+                (rewrite::shared::ALLOW_VAR.to_string(), m.allow.join(":")),
+            ];
+            let env = layered(&[&fixed, &passed, &host_env, &m.env, &p.env, &policy]);
+            Guest {
+                exe,
+                argv0: Some(p.argv[0].clone().into()),
+                args: p.argv[1..].iter().map(Into::into).collect(),
+                host: p.host,
+                env,
+                stdout: capture.then(|| stdout_file(&scratch, i)),
+                cwd: Some(root.clone()),
+                daemon: p.daemon,
+            }
+        })
+        .collect();
+    let run = Run {
+        guests,
+        hosts: m.hosts.iter().map(|h| h.name.clone()).collect(),
+        dylib: dylib_for(cli)?,
+        inherit_env: false,
+        disable_aslr: cli.disable_aslr,
+        seed: cli.opts.seed,
+        quantum: cli.quantum,
+        passive: !cli.supervisor,
+        rewrite: (!cli.native).then(|| cli.opts.clone()),
+        net_latency_ns: cli.net_latency_ns,
+    };
+    let outcome = launch::launch_run(&run)?;
+    if outcome.deadlock {
+        return Err("deadlock: every guest thread was blocked; the run was killed".into());
+    }
+    Ok(outcome)
+}
+
+/// Fields every guest reports but that describe the whole run
+const RUN_WIDE: [&str; 3] = ["switches", "expiries", "schedule_hash"];
+
+/// The aggregated report: run-wide totals, then each process's own fields.
+fn print_run_report(o: &RunOutcome) {
+    eprintln!("run.processes={}", o.guests.len());
+    eprintln!("run.threads={}", o.totals.threads);
+    eprintln!("run.switches={}", o.totals.switches);
+    eprintln!("run.expiries={}", o.totals.expiries);
+    eprintln!("run.schedule_hash={:016x}", o.totals.schedule_hash);
+    eprintln!("run.net_connections={}", o.totals.net_connections);
+    eprintln!("run.net_datagrams={}", o.totals.net_datagrams);
+    eprintln!("run.net_dropped={}", o.totals.net_dropped);
+    eprintln!("run.net_bytes={}", o.totals.net_bytes);
+    eprintln!("run.net_passthrough={}", o.totals.net_passthrough);
+    for (i, g) in o.guests.iter().enumerate() {
+        eprintln!("p{i}.status={}", describe_status(g));
+        for (k, v) in &g.report.fields {
+            if !RUN_WIDE.contains(&k.as_str()) {
+                eprintln!("p{i}.{k}={v}");
+            }
+        }
+    }
+}
+
+fn describe_status(o: &launch::Outcome) -> String {
+    match (o.exit_code(), o.signal()) {
+        (Some(c), _) => format!("exit {c}"),
+        (None, Some(s)) => format!("signal {s}"),
+        _ => "abnormal".into(),
+    }
+}
+
+/// Exit status of a manifest run: the first of the manifest's own
+/// processes that did not exit 0. What their children return is their
+/// business, and daemons are killed by design.
+fn exit_from_run(o: &RunOutcome) -> ExitCode {
+    o.guests[..o.initial]
+        .iter()
+        .zip(&o.daemons)
+        .find(|(g, &daemon)| !daemon && g.exit_code() != Some(0))
+        .map_or(ExitCode::SUCCESS, |(g, _)| exit_from(g))
 }
 
 fn exit_from(outcome: &launch::Outcome) -> ExitCode {
@@ -197,6 +427,7 @@ fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
     let native = time(&prog, &plain)?;
     plain.native = false;
     let rewritten_t = time(&rewritten, &plain)?;
+    // Native timing has no dylib; the rewritten one loads it passively.
     println!("native    {native:.4}s");
     println!(
         "rewritten {rewritten_t:.4}s  ({:.2}x)",
@@ -205,49 +436,78 @@ fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
     Ok(())
 }
 
-/// Run the guest `cli.runs` times; every run must agree with the first on
-/// exit status, stdout and schedule hash.
+/// What must agree between runs: each guest's exit status and stdout, and
+/// the run-wide schedule hash.
+type Observed = (Vec<(String, String)>, String);
+
+fn observe_single(cli: &Cli, exe: &Path, args: &[OsString], out: &Path) -> Fallible<Observed> {
+    let o = run_guest(
+        exe.to_path_buf(),
+        cli,
+        args.to_vec(),
+        true,
+        Some(out.to_path_buf()),
+    )?;
+    let text = std::fs::read_to_string(out).unwrap_or_default();
+    let hash = o.report.get("schedule_hash").unwrap_or("").to_string();
+    Ok((vec![(describe_status(&o), text)], hash))
+}
+
+fn observe_manifest(cli: &Cli, manifest: &Path, scratch: &Path) -> Fallible<Observed> {
+    let o = run_manifest(cli, manifest, scratch, true)?;
+    let guests = o
+        .guests
+        .iter()
+        .enumerate()
+        .map(|(i, g)| {
+            let text = std::fs::read_to_string(stdout_file(scratch, i)).unwrap_or_default();
+            (describe_status(g), text)
+        })
+        .collect();
+    Ok((guests, format!("{:016x}", o.totals.schedule_hash)))
+}
+
+fn show(o: &Observed) -> String {
+    let guests: Vec<String> =
+        o.0.iter()
+            .map(|(status, text)| format!("[{status}] stdout={:?}", text.trim_end()))
+            .collect();
+    format!("hash={} {}", o.1, guests.join(" "))
+}
+
+/// Run `cli.runs` times; every run must agree with the first.
 fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
-    let prog = PathBuf::from(&rest[0]);
-    let exe = cached_rewrite(&prog, &cli.opts)?;
-    let out = std::env::temp_dir().join(format!("rewrite-repeat-{}", std::process::id()));
-    let mut first: Option<(Option<i32>, String, String)> = None;
+    let scratch = scratch_dir(cli);
+    let single = if cli.manifest.is_none() {
+        let exe = cached_rewrite(Path::new(&rest[0]), &cli.opts)?;
+        let out = std::env::temp_dir().join(format!("rewrite-repeat-{}", std::process::id()));
+        Some((exe, out))
+    } else {
+        None
+    };
+    let mut first: Option<Observed> = None;
     let mut result = Ok(());
     for i in 0..cli.runs {
-        let o = run_guest(
-            exe.clone(),
-            cli,
-            rest[1..].to_vec(),
-            true,
-            Some(out.clone()),
-        )?;
-        let text = std::fs::read_to_string(&out).unwrap_or_default();
-        let hash = o.report.get("schedule_hash").unwrap_or("").to_string();
-        let this = (o.exit_code(), text, hash);
+        let this = match (&single, &cli.manifest) {
+            (Some((exe, out)), _) => observe_single(cli, exe, &rest[1..], out)?,
+            (None, Some(m)) => observe_manifest(cli, m, &scratch)?,
+            (None, None) => unreachable!(),
+        };
         match &first {
             None => {
-                println!(
-                    "run 0: exit={:?} hash={} stdout={:?}",
-                    this.0,
-                    this.2,
-                    this.1.trim_end()
-                );
+                println!("run 0: {}", show(&this));
                 first = Some(this);
             }
             Some(f) if *f != this => {
-                result = Err(format!(
-                    "run {i} differs: exit={:?} hash={} stdout={:?}",
-                    this.0,
-                    this.2,
-                    this.1.trim_end()
-                )
-                .into());
+                result = Err(format!("run {i} differs: {}", show(&this)).into());
                 break;
             }
             Some(_) => {}
         }
     }
-    let _ = std::fs::remove_file(&out);
+    if let Some((_, out)) = &single {
+        let _ = std::fs::remove_file(out);
+    }
     if result.is_ok() {
         println!("{} runs identical", cli.runs);
     }
@@ -276,12 +536,19 @@ fn main() -> ExitCode {
                 ExitCode::SUCCESS
             }),
         Some("rewrite") if rest.len() == 2 => {
-            do_rewrite(Path::new(&rest[0]), Path::new(&rest[1]), &cli.opts).map(|stats| {
+            rewrite_file(Path::new(&rest[0]), Path::new(&rest[1]), &cli.opts).map(|stats| {
                 eprintln!("{stats}");
                 ExitCode::SUCCESS
             })
         }
-        Some("run") if !rest.is_empty() => {
+        Some("run") if rest.is_empty() && cli.manifest.is_some() => {
+            let manifest = cli.manifest.clone().unwrap();
+            run_manifest(&cli, &manifest, &scratch_dir(&cli), cli.capture).map(|o| {
+                print_run_report(&o);
+                exit_from_run(&o)
+            })
+        }
+        Some("run") if !rest.is_empty() && cli.manifest.is_none() => {
             let prog = PathBuf::from(&rest[0]);
             let exe = if cli.native {
                 Ok(prog)
@@ -292,7 +559,9 @@ fn main() -> ExitCode {
                 .map(|o| exit_from(&o))
         }
         Some("bench") if !rest.is_empty() => bench(cli, &rest).map(|()| ExitCode::SUCCESS),
-        Some("repeat") if !rest.is_empty() => repeat(&cli, &rest).map(|()| ExitCode::SUCCESS),
+        Some("repeat") if rest.is_empty() != cli.manifest.is_none() => {
+            repeat(&cli, &rest).map(|()| ExitCode::SUCCESS)
+        }
         _ => return fail(USAGE),
     };
     result.unwrap_or_else(fail)

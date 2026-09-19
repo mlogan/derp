@@ -18,7 +18,48 @@ use crate::determinism::{
     my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_gettimeofday,
     my_mach_absolute_time, my_mach_continuous_time, my_time,
 };
-use crate::sched::{self, my_id, State, SCHED};
+use crate::files::{
+    my_flock, my_fsync, my_lseek, my_pread, my_pwrite, open_nocancel, rewrite_open_nocancel_shim,
+    rewrite_open_shim, rewrite_openat_shim,
+};
+use crate::gcd as gcd_real;
+use crate::gcd::{
+    rewrite_dispatch_after_f_shim, rewrite_dispatch_after_shim, rewrite_dispatch_apply_f_shim,
+    rewrite_dispatch_apply_shim, rewrite_dispatch_async_f_shim, rewrite_dispatch_async_shim,
+    rewrite_dispatch_barrier_async_f_shim, rewrite_dispatch_barrier_async_shim,
+    rewrite_dispatch_group_async_f_shim, rewrite_dispatch_group_async_shim,
+    rewrite_dispatch_group_notify_f_shim, rewrite_dispatch_group_notify_shim,
+    rewrite_dispatch_io_create_shim, rewrite_dispatch_main_shim, rewrite_dispatch_read_shim,
+    rewrite_dispatch_source_create_shim, rewrite_dispatch_write_shim,
+};
+use crate::hostfs::{
+    my_access, my_chdir, my_chmod, my_chown, my_clonefile, my_creat, my_faccessat, my_fchmodat,
+    my_fstatat, my_lchown, my_link, my_lstat, my_mkdir, my_mkdirat, my_mkfifo, my_opendir,
+    my_readlink, my_readlinkat, my_rename, my_renameat, my_rmdir, my_stat, my_statfs, my_symlink,
+    my_truncate, my_unlink, my_unlinkat, my_utimensat, my_utimes,
+};
+use crate::io::{
+    close_nocancel, my_close, my_close_nocancel, my_read, my_read_nocancel, my_readv,
+    my_readv_nocancel, my_write, my_write_nocancel, my_writev, my_writev_nocancel, read_nocancel,
+    readv_nocancel, write_nocancel, writev_nocancel,
+};
+use crate::kq::my_kevent;
+use crate::names::{
+    my_freeaddrinfo, my_freeifaddrs, my_getaddrinfo, my_gethostname, my_getifaddrs,
+};
+use crate::net::{
+    my_accept, my_bind, my_connect, my_dup, my_dup2, my_getpeername, my_getsockname, my_getsockopt,
+    my_listen, my_recv, my_recvfrom, my_recvmsg, my_send, my_sendmsg, my_sendto, my_setsockopt,
+    my_shutdown, my_socket, rewrite_fcntl_shim, rewrite_ioctl_shim,
+};
+use crate::poll::{my_poll, my_select};
+use crate::process::{
+    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_vfork, my_wait, my_wait4,
+    my_waitpid,
+};
+use crate::process::{rewrite_getpid_shim, rewrite_getppid_shim};
+use crate::sched::{self, my_id, State};
+use crate::shared;
 
 #[repr(C)]
 struct Interpose {
@@ -30,14 +71,14 @@ unsafe impl Sync for Interpose {}
 
 macro_rules! interposers {
     ($($new:ident => $old:path),* $(,)?) => {
+        // Counted without recursion: the table is past the recursion limit
+        const INTERPOSER_COUNT: usize = [$(stringify!($new)),*].len();
         #[used]
         #[link_section = "__DATA,__interpose"]
-        static INTERPOSERS: [Interpose; interposers!(@count $($new)*)] = [
+        static INTERPOSERS: [Interpose; INTERPOSER_COUNT] = [
             $(Interpose { new: $new as *const (), old: $old as *const () },)*
         ];
     };
-    (@count) => { 0 };
-    (@count $x:ident $($rest:ident)*) => { 1 + interposers!(@count $($rest)*) };
 }
 
 extern "C" {
@@ -57,6 +98,7 @@ extern "C" {
     fn os_sync_wake_by_address_any(addr: *mut c_void, size: usize, flags: u32) -> c_int;
     fn os_sync_wake_by_address_all(addr: *mut c_void, size: usize, flags: u32) -> c_int;
     fn pthread_yield_np();
+    fn vfork() -> libc::pid_t;
     fn dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isize;
     fn dispatch_semaphore_signal(sema: *mut c_void) -> isize;
     fn CCRandomGenerateBytes(buf: *mut c_void, n: usize) -> c_int;
@@ -120,13 +162,9 @@ extern "C" fn trampoline(p: *mut c_void) -> *mut c_void {
 pub extern "C" fn thread_teardown(value: *mut c_void) {
     let id = value as usize - 1;
     count(C_EXIT);
-    {
-        let mut guard = SCHED.lock().unwrap();
-        if let Some(s) = guard.as_mut() {
-            s.wake_all(join_key(id));
-        }
-    }
-    sched::yield_baton_as(id, State::Exited, 0);
+    sched::forget_thread();
+    sched::wake_all(join_key(id));
+    sched::yield_baton_as(id, State::Exited, 0, None);
 }
 
 extern "C" fn my_pthread_create(
@@ -139,15 +177,14 @@ extern "C" fn my_pthread_create(
         return unsafe { libc::pthread_create(t, attr, f, arg) };
     }
     count(C_CREATE);
-    let id = SCHED.lock().unwrap().as_mut().unwrap().add_thread();
+    let id = sched::add_thread();
     let start = Box::into_raw(Box::new(Start { f, arg, id }));
     let rc = unsafe { libc::pthread_create(t, attr, trampoline, start.cast()) };
-    let mut guard = SCHED.lock().unwrap();
-    let s = guard.as_mut().unwrap();
     if rc == 0 {
-        s.threads[id].pthread = unsafe { *t };
+        let handle = unsafe { *t } as u64;
+        sched::with(|s, _| s.threads[id].pthread = handle);
     } else {
-        s.threads[id].state = State::Exited;
+        sched::with(|s, _| s.threads[id].state = shared::T_EXITED);
         drop(unsafe { Box::from_raw(start) });
     }
     rc
@@ -157,13 +194,11 @@ extern "C" fn my_pthread_join(t: libc::pthread_t, ret: *mut *mut c_void) -> c_in
     if my_id().is_some() {
         count(C_JOIN);
         loop {
-            let guard = SCHED.lock().unwrap();
-            let s = guard.as_ref().unwrap();
-            let Some(id) = s.find_pthread(t) else { break };
-            if s.threads[id].state == State::Exited {
-                break;
-            }
-            drop(guard);
+            let pending = sched::with(|s, pid| {
+                s.find_pthread(pid, t as u64)
+                    .filter(|&id| s.threads[id].state != shared::T_EXITED)
+            });
+            let Some(Some(id)) = pending else { break };
             sched::yield_baton(State::Blocked(join_key(id)), join_key(id) as u64);
         }
     }
@@ -188,50 +223,30 @@ extern "C" fn my_pthread_mutex_lock(m: *mut libc::pthread_mutex_t) -> c_int {
 
 extern "C" fn my_pthread_mutex_unlock(m: *mut libc::pthread_mutex_t) -> c_int {
     let rc = unsafe { libc::pthread_mutex_unlock(m) };
-    if my_id().is_some() {
-        if let Some(s) = SCHED.lock().unwrap().as_mut() {
-            s.wake_all(m as usize);
-        }
-    }
+    // Also from a thread the scheduler does not run: one of ours may wait
+    sched::wake_all(m as usize);
     rc
 }
 
-fn cond_enqueue(c: usize, me: usize, timed: bool) {
-    let mut guard = SCHED.lock().unwrap();
-    let s = guard.as_mut().unwrap();
-    s.threads[me].signaled = false;
-    s.threads[me].timed = timed;
-    s.threads[me].timed_out = false;
-    match s.cond_waiters.iter_mut().find(|(a, _)| *a == c) {
-        Some((_, q)) => q.push_back(me),
-        None => s
-            .cond_waiters
-            .push((c, std::collections::VecDeque::from([me]))),
-    }
+fn cond_enqueue(c: usize, me: usize) {
+    sched::with(|s, _| s.cond_enqueue(me, c as u64));
 }
 
-/// Returns true when signaled, false on timeout
-fn cond_block(c: usize, me: usize) -> bool {
+/// Returns true when signaled, false when `deadline` passed first
+fn cond_block(c: usize, me: usize, deadline: Option<u64>) -> bool {
     loop {
-        {
-            let mut guard = SCHED.lock().unwrap();
-            let s = guard.as_mut().unwrap();
-            let t = &mut s.threads[me];
-            if t.signaled {
-                t.signaled = false;
-                t.timed = false;
-                return true;
-            }
-            if t.timed_out {
-                t.timed = false;
-                t.timed_out = false;
-                if let Some((_, q)) = s.cond_waiters.iter_mut().find(|(a, _)| *a == c) {
-                    q.retain(|&w| w != me);
-                }
-                return false;
-            }
+        let signaled = sched::with(|s, _| std::mem::take(&mut s.threads[me].signaled));
+        if signaled == Some(true) {
+            return true;
         }
-        sched::yield_baton(State::Blocked(c), c as u64);
+        if sched::block_until(c as u64, deadline) {
+            // A signal that raced the deadline still counts
+            return sched::with(|s, _| {
+                let t = &mut s.threads[me];
+                t.cond_key = 0;
+                std::mem::take(&mut t.signaled)
+            }) == Some(true);
+        }
     }
 }
 
@@ -243,9 +258,9 @@ extern "C" fn my_pthread_cond_wait(
         return unsafe { libc::pthread_cond_wait(c, m) };
     };
     count(C_COND);
-    cond_enqueue(c as usize, me, false);
+    cond_enqueue(c as usize, me);
     my_pthread_mutex_unlock(m);
-    cond_block(c as usize, me);
+    cond_block(c as usize, me, None);
     my_pthread_mutex_lock(m)
 }
 
@@ -258,9 +273,16 @@ extern "C" fn my_pthread_cond_timedwait(
         return unsafe { libc::pthread_cond_timedwait(c, m, ts) };
     };
     count(C_COND);
-    cond_enqueue(c as usize, me, true);
+    // The deadline is absolute on the (virtual) realtime clock
+    let abs = unsafe {
+        ((*ts).tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((*ts).tv_nsec as u64)
+    };
+    let deadline = abs.saturating_sub(crate::determinism::REALTIME_BASE_NS);
+    cond_enqueue(c as usize, me);
     my_pthread_mutex_unlock(m);
-    let signaled = cond_block(c as usize, me);
+    let signaled = cond_block(c as usize, me, Some(deadline));
     let rc = my_pthread_mutex_lock(m);
     if rc != 0 {
         return rc;
@@ -273,36 +295,20 @@ extern "C" fn my_pthread_cond_timedwait(
 }
 
 fn cond_wake(c: usize, all: bool) {
-    let mut guard = SCHED.lock().unwrap();
-    let s = guard.as_mut().unwrap();
-    let Some(pos) = s.cond_waiters.iter().position(|(a, _)| *a == c) else {
-        return;
-    };
-    let ids: Vec<usize> = if all {
-        s.cond_waiters[pos].1.drain(..).collect()
-    } else {
-        s.cond_waiters[pos].1.pop_front().into_iter().collect()
-    };
-    for id in ids {
-        s.threads[id].signaled = true;
-        s.wake_thread(id);
-    }
+    sched::with(|s, pid| s.cond_wake(pid, c as u64, all));
 }
 
+// Wakes go to both worlds: a scheduled waiter is parked in the scheduler,
+// a GCD worker sleeps in the kernel, and the waker cannot know which it has.
+
 extern "C" fn my_pthread_cond_signal(c: *mut libc::pthread_cond_t) -> c_int {
-    if my_id().is_none() {
-        return unsafe { libc::pthread_cond_signal(c) };
-    }
     cond_wake(c as usize, false);
-    0
+    unsafe { libc::pthread_cond_signal(c) }
 }
 
 extern "C" fn my_pthread_cond_broadcast(c: *mut libc::pthread_cond_t) -> c_int {
-    if my_id().is_none() {
-        return unsafe { libc::pthread_cond_broadcast(c) };
-    }
     cond_wake(c as usize, true);
-    0
+    unsafe { libc::pthread_cond_broadcast(c) }
 }
 
 /// Compare `*addr` with `value` at the width the ulock or `os_sync` op implies
@@ -316,20 +322,17 @@ fn value_matches(addr: *mut c_void, value: u64, wide: bool) -> bool {
     }
 }
 
-/// Block on `addr` once. Returns false if the wait timed out.
-fn futex_block(addr: *mut c_void, timed: bool) -> bool {
-    let me = my_id().unwrap();
-    {
-        let mut guard = SCHED.lock().unwrap();
-        let s = guard.as_mut().unwrap();
-        s.threads[me].timed = timed;
-        s.threads[me].timed_out = false;
-    }
-    sched::yield_baton(State::Blocked(addr as usize), addr as usize as u64);
-    let mut guard = SCHED.lock().unwrap();
-    let t = &mut guard.as_mut().unwrap().threads[me];
-    t.timed = false;
-    !std::mem::take(&mut t.timed_out)
+/// Block on `addr` once, for at most `timeout_ns` of virtual time (0:
+/// forever). Returns false if the wait timed out.
+fn futex_block(addr: *mut c_void, timeout_ns: u64) -> bool {
+    let deadline = (timeout_ns != 0).then(|| sched::now().saturating_add(timeout_ns));
+    !sched::block_until(addr as usize as u64, deadline)
+}
+
+/// Sleep for `ns` of virtual time: a wait nothing but the deadline ends.
+fn sleep_ns(ns: u64) {
+    let deadline = sched::now().saturating_add(ns);
+    while !sched::block_until(shared::SLEEP_KEY, Some(deadline)) {}
 }
 
 fn ulock_is_wide(op: u32) -> bool {
@@ -344,9 +347,14 @@ fn ulock_is_unfair(op: u32) -> bool {
     matches!(op & 0xFF, 2 | 4)
 }
 
-fn timed_out_errno() -> c_int {
-    unsafe { *libc::__error() = libc::ETIMEDOUT };
-    -1
+/// The lock word of an unfair lock (and of libdispatch's `dispatch_once`
+/// gate) holds its owner's Mach thread port above two flag bits. When the
+/// owner is a thread the scheduler does not run, yielding gets nowhere and
+/// burns virtual time at a rate that depends on real time: the wait has to
+/// be the real one, which that thread's unlock will end.
+fn unfair_owner_is_outside(value: u64) -> bool {
+    let owner = (value as u32) & !3;
+    owner != 0 && !sched::is_scheduled_thread(owner) && !sched::is_scheduled_thread(owner | 3)
 }
 
 extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int {
@@ -358,13 +366,16 @@ extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: 
         return 0;
     }
     if ulock_is_unfair(op) {
+        if unfair_owner_is_outside(value) {
+            return unsafe { __ulock_wait(op, addr, value, timeout_us) };
+        }
         sched::yield_baton(State::Runnable, 0);
         return 0;
     }
-    if futex_block(addr, timeout_us != 0) {
+    if futex_block(addr, u64::from(timeout_us) * 1000) {
         0
     } else {
-        timed_out_errno()
+        crate::errno::fail(libc::ETIMEDOUT)
     }
 }
 
@@ -383,24 +394,28 @@ extern "C" fn my_ulock_wait2(
         return 0;
     }
     if ulock_is_unfair(op) {
+        if unfair_owner_is_outside(value) {
+            return unsafe { __ulock_wait2(op, addr, value, timeout_ns, value2) };
+        }
         sched::yield_baton(State::Runnable, 0);
         return 0;
     }
-    if futex_block(addr, timeout_ns != 0) {
+    if futex_block(addr, timeout_ns) {
         0
     } else {
-        timed_out_errno()
+        crate::errno::fail(libc::ETIMEDOUT)
     }
 }
 
 extern "C" fn my_ulock_wake(op: u32, addr: *mut c_void, wake_value: u64) -> c_int {
-    if my_id().is_none() {
-        return unsafe { __ulock_wake(op, addr, wake_value) };
+    let ours = sched::wake_all(addr as usize);
+    let rc = unsafe { __ulock_wake(op, addr, wake_value) };
+    // "Nobody was waiting" is only true if neither world had a waiter
+    if ours > 0 {
+        0
+    } else {
+        rc
     }
-    if let Some(s) = SCHED.lock().unwrap().as_mut() {
-        s.wake_all(addr as usize);
-    }
-    0
 }
 
 extern "C" fn my_os_sync_wait_on_address(
@@ -416,7 +431,7 @@ extern "C" fn my_os_sync_wait_on_address(
     if !value_matches(addr, value, size == 8) {
         return 0;
     }
-    futex_block(addr, false);
+    futex_block(addr, 0);
     0
 }
 
@@ -437,31 +452,75 @@ extern "C" fn my_os_sync_wait_on_address_with_timeout(
     if !value_matches(addr, value, size == 8) {
         return 0;
     }
-    if futex_block(addr, true) {
+    if futex_block(addr, timeout_ns.max(1)) {
         0
     } else {
-        timed_out_errno()
+        crate::errno::fail(libc::ETIMEDOUT)
     }
 }
 
 extern "C" fn my_os_sync_wake_by_address_any(addr: *mut c_void, size: usize, flags: u32) -> c_int {
-    if my_id().is_none() {
-        return unsafe { os_sync_wake_by_address_any(addr, size, flags) };
+    let ours = sched::wake_all(addr as usize);
+    let rc = sched::with_passthrough(|| unsafe { os_sync_wake_by_address_any(addr, size, flags) });
+    if ours > 0 {
+        0
+    } else {
+        rc
     }
-    if let Some(s) = SCHED.lock().unwrap().as_mut() {
-        s.wake_all(addr as usize);
-    }
-    0
 }
 
 extern "C" fn my_os_sync_wake_by_address_all(addr: *mut c_void, size: usize, flags: u32) -> c_int {
-    if my_id().is_none() {
-        return unsafe { os_sync_wake_by_address_all(addr, size, flags) };
+    let ours = sched::wake_all(addr as usize);
+    let rc = sched::with_passthrough(|| unsafe { os_sync_wake_by_address_all(addr, size, flags) });
+    if ours > 0 {
+        0
+    } else {
+        rc
     }
-    if let Some(s) = SCHED.lock().unwrap().as_mut() {
-        s.wake_all(addr as usize);
+}
+
+/// How long a `dispatch_time_t` deadline is from now, in nanoseconds (0:
+/// forever). libdispatch computed it from a clock read of its own: through
+/// our interposers (the virtual clock) or inline from the commpage (the
+/// real one), depending on the path. The two clocks are far apart, so the
+/// distance is taken on both and the smaller one that is not in the past
+/// names the clock it came from. A real-clock distance is rounded to a
+/// millisecond, which absorbs the time since libdispatch's read.
+fn dispatch_timeout_ns(timeout: u64) -> u64 {
+    const MS: i64 = 1_000_000;
+    if timeout == DISPATCH_TIME_FOREVER {
+        return 0;
     }
-    0
+    let virtual_now = sched::now() as i64;
+    let (deadline, real_now, virtual_now) = if (timeout as i64) < 0 {
+        // Wall time, encoded as minus nanoseconds since the epoch
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut ts) };
+        (
+            (timeout as i64).wrapping_neg(),
+            ts.tv_sec * 1_000_000_000 + ts.tv_nsec,
+            crate::determinism::REALTIME_BASE_NS as i64 + virtual_now,
+        )
+    } else {
+        // Mach absolute ticks; 125/3 ns each on Apple Silicon
+        (
+            (timeout as i64).saturating_mul(125) / 3,
+            (unsafe { mach_absolute_time() } as i64).saturating_mul(125) / 3,
+            crate::determinism::MONOTONIC_BASE_NS as i64 + virtual_now,
+        )
+    };
+    let on_real = deadline.saturating_sub(real_now);
+    let on_virtual = deadline.saturating_sub(virtual_now);
+    let ns = match (on_real >= -MS, on_virtual >= -MS) {
+        (true, true) if on_virtual <= on_real => on_virtual,
+        (true, _) => (on_real + MS / 2) / MS * MS,
+        (false, true) => on_virtual,
+        (false, false) => 0,
+    };
+    ns.max(1) as u64
 }
 
 /// Rust's `Thread::park` sits on one of these. A zero timeout is a
@@ -476,7 +535,7 @@ extern "C" fn my_dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isi
             return 0;
         }
         count(C_DISPATCH);
-        if !futex_block(sema, timeout != DISPATCH_TIME_FOREVER) {
+        if !futex_block(sema, dispatch_timeout_ns(timeout)) {
             return 1;
         }
     }
@@ -484,11 +543,7 @@ extern "C" fn my_dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isi
 
 extern "C" fn my_dispatch_semaphore_signal(sema: *mut c_void) -> isize {
     let rc = unsafe { dispatch_semaphore_signal(sema) };
-    if my_id().is_some() {
-        if let Some(s) = SCHED.lock().unwrap().as_mut() {
-            s.wake_all(sema as usize);
-        }
-    }
+    sched::wake_all(sema as usize);
     rc
 }
 
@@ -514,7 +569,18 @@ extern "C" fn my_nanosleep(req: *const libc::timespec, rem: *mut libc::timespec)
         return unsafe { libc::nanosleep(req, rem) };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable, 0);
+    let ns = unsafe {
+        ((*req).tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((*req).tv_nsec as u64)
+    };
+    sleep_ns(ns);
+    if !rem.is_null() {
+        unsafe {
+            (*rem).tv_sec = 0;
+            (*rem).tv_nsec = 0;
+        }
+    }
     0
 }
 
@@ -523,7 +589,7 @@ extern "C" fn my_usleep(us: u32) -> c_int {
         return unsafe { libc::usleep(us) };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable, 0);
+    sleep_ns(u64::from(us) * 1000);
     0
 }
 
@@ -532,7 +598,7 @@ extern "C" fn my_sleep(s: u32) -> u32 {
         return unsafe { libc::sleep(s) };
     }
     count(C_YIELD);
-    sched::yield_baton(State::Runnable, 0);
+    sleep_ns(u64::from(s) * 1_000_000_000);
     0
 }
 
@@ -559,6 +625,109 @@ interposers! {
     my_nanosleep => libc::nanosleep,
     my_usleep => libc::usleep,
     my_sleep => libc::sleep,
+    my_posix_spawn => libc::posix_spawn,
+    my_posix_spawnp => libc::posix_spawnp,
+    my_fork => libc::fork,
+    my_execve => libc::execve,
+    my_waitpid => libc::waitpid,
+    my_wait4 => libc::wait4,
+    my_wait => libc::wait,
+    rewrite_getpid_shim => libc::getpid,
+    rewrite_getppid_shim => libc::getppid,
+    my_kill => libc::kill,
+    my_read => libc::read,
+    my_read_nocancel => read_nocancel,
+    my_readv => libc::readv,
+    my_readv_nocancel => readv_nocancel,
+    my_write => libc::write,
+    my_write_nocancel => write_nocancel,
+    my_writev => libc::writev,
+    my_writev_nocancel => writev_nocancel,
+    my_close => libc::close,
+    my_close_nocancel => close_nocancel,
+    my_socket => libc::socket,
+    my_bind => libc::bind,
+    my_listen => libc::listen,
+    my_connect => libc::connect,
+    my_accept => libc::accept,
+    my_send => libc::send,
+    my_recv => libc::recv,
+    my_sendto => libc::sendto,
+    my_recvfrom => libc::recvfrom,
+    my_shutdown => libc::shutdown,
+    my_getsockname => libc::getsockname,
+    my_getpeername => libc::getpeername,
+    my_setsockopt => libc::setsockopt,
+    my_getsockopt => libc::getsockopt,
+    my_dup => libc::dup,
+    my_dup2 => libc::dup2,
+    my_gethostname => libc::gethostname,
+    my_getaddrinfo => libc::getaddrinfo,
+    my_freeaddrinfo => libc::freeaddrinfo,
+    my_getifaddrs => libc::getifaddrs,
+    my_freeifaddrs => libc::freeifaddrs,
+    my_flock => libc::flock,
+    my_pread => libc::pread,
+    my_pwrite => libc::pwrite,
+    my_lseek => libc::lseek,
+    my_fsync => libc::fsync,
+    rewrite_open_shim => libc::open,
+    rewrite_open_nocancel_shim => open_nocancel,
+    rewrite_openat_shim => libc::openat,
+    my_stat => libc::stat,
+    my_lstat => libc::lstat,
+    my_fstatat => libc::fstatat,
+    my_access => libc::access,
+    my_mkdir => libc::mkdir,
+    my_mkdirat => libc::mkdirat,
+    my_rmdir => libc::rmdir,
+    my_unlink => libc::unlink,
+    my_unlinkat => libc::unlinkat,
+    my_rename => libc::rename,
+    my_link => libc::link,
+    my_symlink => libc::symlink,
+    my_readlink => libc::readlink,
+    my_chdir => libc::chdir,
+    my_truncate => libc::truncate,
+    my_chmod => libc::chmod,
+    my_chown => libc::chown,
+    my_utimes => libc::utimes,
+    my_mkfifo => libc::mkfifo,
+    my_creat => libc::creat,
+    my_opendir => libc::opendir,
+    my_renameat => libc::renameat,
+    my_faccessat => libc::faccessat,
+    my_readlinkat => libc::readlinkat,
+    my_fchmodat => libc::fchmodat,
+    my_utimensat => libc::utimensat,
+    my_clonefile => libc::clonefile,
+    my_statfs => libc::statfs,
+    my_lchown => libc::lchown,
+    my_vfork => vfork,
+    rewrite_dispatch_async_shim => gcd_real::dispatch_async,
+    rewrite_dispatch_async_f_shim => gcd_real::dispatch_async_f,
+    rewrite_dispatch_after_shim => gcd_real::dispatch_after,
+    rewrite_dispatch_after_f_shim => gcd_real::dispatch_after_f,
+    rewrite_dispatch_apply_shim => gcd_real::dispatch_apply,
+    rewrite_dispatch_apply_f_shim => gcd_real::dispatch_apply_f,
+    rewrite_dispatch_group_async_shim => gcd_real::dispatch_group_async,
+    rewrite_dispatch_group_async_f_shim => gcd_real::dispatch_group_async_f,
+    rewrite_dispatch_barrier_async_shim => gcd_real::dispatch_barrier_async,
+    rewrite_dispatch_barrier_async_f_shim => gcd_real::dispatch_barrier_async_f,
+    rewrite_dispatch_group_notify_shim => gcd_real::dispatch_group_notify,
+    rewrite_dispatch_group_notify_f_shim => gcd_real::dispatch_group_notify_f,
+    rewrite_dispatch_source_create_shim => gcd_real::dispatch_source_create,
+    rewrite_dispatch_main_shim => gcd_real::dispatch_main,
+    rewrite_dispatch_read_shim => gcd_real::dispatch_read,
+    rewrite_dispatch_write_shim => gcd_real::dispatch_write,
+    rewrite_dispatch_io_create_shim => gcd_real::dispatch_io_create,
+    my_kevent => libc::kevent,
+    my_poll => libc::poll,
+    my_select => libc::select,
+    my_sendmsg => libc::sendmsg,
+    my_recvmsg => libc::recvmsg,
+    rewrite_fcntl_shim => libc::fcntl,
+    rewrite_ioctl_shim => libc::ioctl,
     my_malloc => libc::malloc,
     my_calloc => libc::calloc,
     my_free => libc::free,

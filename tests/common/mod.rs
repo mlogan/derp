@@ -80,7 +80,14 @@ pub fn build_rust(name: &str, out_dir: &Path) -> PathBuf {
     let src = programs_dir().join(format!("{name}.rs"));
     let out = out_dir.join(name);
     let status = Command::new("rustc")
-        .args(["-O", "-C", "link-args=-Wl,-headerpad,0x1000", "-o"])
+        .args([
+            "--edition",
+            "2021",
+            "-O",
+            "-C",
+            "link-args=-Wl,-headerpad,0x1000",
+            "-o",
+        ])
         .arg(&out)
         .arg(&src)
         .status()
@@ -109,7 +116,22 @@ pub fn run(
     exe: &Path,
     args: &[&str],
     dylib: Option<PathBuf>,
-    env: Vec<(String, String)>,
+    seed: u64,
+) -> (rewrite::launch::Outcome, String) {
+    run_mode(exe, args, dylib, seed, false)
+}
+
+/// Run a rewritten binary with its stubs live but no scheduler.
+pub fn run_passive(exe: &Path, args: &[&str]) -> (rewrite::launch::Outcome, String) {
+    run_mode(exe, args, Some(supervisor_dylib()), 0, true)
+}
+
+fn run_mode(
+    exe: &Path,
+    args: &[&str],
+    dylib: Option<PathBuf>,
+    seed: u64,
+    passive: bool,
 ) -> (rewrite::launch::Outcome, String) {
     let tag = format!("{}-{:?}", std::process::id(), std::thread::current().id());
     let tag = tag.replace(|c: char| !c.is_ascii_alphanumeric(), "");
@@ -118,15 +140,14 @@ pub fn run(
         exe: exe.to_path_buf(),
         args: args.iter().map(std::convert::Into::into).collect(),
         dylib,
-        env,
         disable_aslr: true,
         stdout: Some(out_path.clone()),
+        seed,
+        quantum: rewrite::launch::DEFAULT_QUANTUM,
+        passive,
+        rewrite: None,
     };
     let outcome = rewrite::launch::launch(&cfg).expect("launch");
     let text = std::fs::read_to_string(&out_path).unwrap_or_default();
     (outcome, text)
-}
-
-pub fn seed_env(seed: u64) -> Vec<(String, String)> {
-    vec![("REWRITE_SEED".into(), seed.to_string())]
 }

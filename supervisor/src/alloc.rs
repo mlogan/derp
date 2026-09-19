@@ -11,7 +11,16 @@ use std::ffi::c_void;
 
 use crate::spin::SpinLock;
 
-const REGION_HINT: usize = 0x3_0000_0000;
+extern "C" {
+    fn valloc(size: usize) -> *mut c_void;
+    static mach_task_self_: u32;
+    fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: i32) -> i32;
+}
+
+/// Above the GPU carveout and below the scheduler's fixed region, where
+/// nothing else lands; low addresses are taken now and then by whatever
+/// the kernel maps first (see `shared::STUB_BASE`).
+const REGION_HINT: usize = 0x74_0000_0000;
 const REGION_SIZE: usize = 4 << 30;
 const HEADER: usize = 16;
 /// Small classes are multiples of 16 up to this size
@@ -51,6 +60,11 @@ static HEAP: SpinLock<Heap> = SpinLock::new(Heap {
     broken: false,
 });
 
+/// In the child of a `fork`: see `SpinLock::force_unlock`.
+pub fn forked() {
+    HEAP.force_unlock();
+}
+
 /// True when the region is in use at its fixed address
 pub fn region_fixed() -> bool {
     let h = HEAP.lock();
@@ -62,12 +76,19 @@ impl Heap {
         if self.base != 0 || self.broken {
             return;
         }
+        // A fixed Mach allocation fails instead of replacing what is there,
+        // so MAP_FIXED over it is safe; an mmap hint alone is ignored by
+        // the kernel now and then.
+        let mut addr = REGION_HINT as u64;
+        let reserved =
+            unsafe { mach_vm_allocate(mach_task_self_, &raw mut addr, REGION_SIZE as u64, 0) } == 0;
+        let fixed = if reserved { libc::MAP_FIXED } else { 0 };
         let p = unsafe {
             libc::mmap(
                 REGION_HINT as *mut c_void,
                 REGION_SIZE,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
+                libc::MAP_PRIVATE | libc::MAP_ANON | fixed,
                 -1,
                 0,
             )
@@ -183,7 +204,10 @@ impl Heap {
             return std::ptr::null_mut();
         }
         let slack = if align > 16 { align } else { 0 };
-        let Some((raw, class_size)) = self.alloc_raw(size.max(1) + HEADER + slack) else {
+        let Some(wanted) = size.max(1).checked_add(HEADER + slack) else {
+            return std::ptr::null_mut();
+        };
+        let Some((raw, class_size)) = self.alloc_raw(wanted) else {
             return std::ptr::null_mut();
         };
         let payload = (raw + HEADER + align - 1) & !(align - 1);
@@ -213,11 +237,24 @@ fn in_region(p: *mut c_void) -> bool {
     HEAP.lock().contains(p as usize)
 }
 
+/// The deterministic heap is for the threads the scheduler runs. A GCD
+/// worker allocates whenever real time has it running; sharing the heap
+/// would make every address after that depend on the interleaving.
+fn deterministic() -> bool {
+    crate::sched::on_scheduled_thread()
+}
+
 pub extern "C" fn my_malloc(size: usize) -> *mut c_void {
+    if !deterministic() {
+        return unsafe { libc::malloc(size) };
+    }
     HEAP.lock().alloc(size, 16)
 }
 
 pub extern "C" fn my_calloc(n: usize, size: usize) -> *mut c_void {
+    if !deterministic() {
+        return unsafe { libc::calloc(n, size) };
+    }
     let Some(total) = n.checked_mul(size) else {
         return std::ptr::null_mut();
     };
@@ -265,6 +302,9 @@ pub extern "C" fn my_posix_memalign(
     align: usize,
     size: usize,
 ) -> libc::c_int {
+    if !deterministic() {
+        return unsafe { libc::posix_memalign(out, align, size) };
+    }
     if !align.is_power_of_two() || align < std::mem::size_of::<usize>() {
         return libc::EINVAL;
     }
@@ -277,6 +317,9 @@ pub extern "C" fn my_posix_memalign(
 }
 
 pub extern "C" fn my_aligned_alloc(align: usize, size: usize) -> *mut c_void {
+    if !deterministic() {
+        return unsafe { libc::aligned_alloc(align, size) };
+    }
     if !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
@@ -284,6 +327,9 @@ pub extern "C" fn my_aligned_alloc(align: usize, size: usize) -> *mut c_void {
 }
 
 pub extern "C" fn my_valloc(size: usize) -> *mut c_void {
+    if !deterministic() {
+        return unsafe { valloc(size) };
+    }
     HEAP.lock().alloc(size, PAGE)
 }
 

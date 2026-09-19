@@ -25,8 +25,37 @@ pub fn rewrite_file(input: &Path, output: &Path, opts: &Options) -> Fallible<rw:
     Ok(r.stats)
 }
 
-/// Rewrite into a cache file next to the program, keyed by options and
-/// the input's modification time.
+/// Where rewritten copies of `input` go: next to it, unless it lives where
+/// packages and the system install things. We do not write into Homebrew's
+/// Cellar; those copies go to a cache directory named after the program's
+/// full path.
+fn cache_dir_for(input: &Path) -> Fallible<PathBuf> {
+    const INSTALLED: [&str; 6] = [
+        "/opt/",
+        "/usr/",
+        "/bin/",
+        "/sbin/",
+        "/Applications/",
+        "/Library/",
+    ];
+    let full = std::fs::canonicalize(input)?;
+    let text = full.to_string_lossy();
+    if !INSTALLED.iter().any(|p| text.starts_with(p)) {
+        return Ok(full.parent().unwrap_or(Path::new("/")).to_path_buf());
+    }
+    let mut hash = 0xCBF2_9CE4_8422_2325u64;
+    for b in text.bytes() {
+        hash = (hash ^ u64::from(b)).wrapping_mul(0x0100_0000_01B3);
+    }
+    let dir = std::env::temp_dir()
+        .join("rewrite-cache")
+        .join(format!("{hash:016x}"));
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Rewrite into a cache file, keyed by options and the input's
+/// modification time.
 pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
     // A guest that starts another copy of itself names its own, already
     // rewritten, file.
@@ -47,10 +76,11 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
         opts.mem_rate.0,
         opts.mem_rate.1
     );
-    let out = input.with_file_name(name);
+    let dir = cache_dir_for(input)?;
+    let out = dir.join(name);
     if !out.exists() {
         // Rename into place: another run may be rewriting the same program.
-        let tmp = input.with_file_name(format!(
+        let tmp = dir.join(format!(
             ".{}.rw-tmp-{}",
             input.file_name().unwrap_or_default().to_string_lossy(),
             std::process::id()

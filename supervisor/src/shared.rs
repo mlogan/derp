@@ -362,13 +362,17 @@ impl State {
             .rposition(|t| t.pid == pid && t.pthread == pthread)
     }
 
-    /// Make every thread of `pid` blocked on `key` runnable.
-    pub fn wake_all(&mut self, pid: u32, key: u64) {
+    /// Make every thread of `pid` blocked on `key` runnable; returns how
+    /// many there were.
+    pub fn wake_all(&mut self, pid: u32, key: u64) -> usize {
+        let mut woken = 0;
         for t in self.live() {
             if t.state == T_BLOCKED && t.pid == pid && t.key == key {
                 t.state = T_RUNNABLE;
+                woken += 1;
             }
         }
+        woken
     }
 
     /// Let every thread parked for I/O readiness re-check. Kernel object
@@ -507,6 +511,13 @@ impl State {
         if me.is_some() {
             self.clock_ns += PER_YIELD_NS;
         }
+        self.choose(me, site)
+    }
+
+    /// The choosing half of `hand_off`, for a caller whose state is already
+    /// recorded: an idle scheduler looks again after threads it does not
+    /// schedule (GCD workers) have had time to wake someone.
+    pub fn choose(&mut self, me: Option<usize>, site: u64) -> Handoff {
         let Some(next) = self.pick() else {
             return Handoff::Idle;
         };

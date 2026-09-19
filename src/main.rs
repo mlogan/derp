@@ -290,6 +290,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
                 env,
                 stdout: capture.then(|| stdout_file(&scratch, i)),
                 cwd: Some(root.clone()),
+                daemon: p.daemon,
             }
         })
         .collect();
@@ -347,12 +348,13 @@ fn describe_status(o: &launch::Outcome) -> String {
 
 /// Exit status of a manifest run: the first of the manifest's own
 /// processes that did not exit 0. What their children return is their
-/// business.
+/// business, and daemons are killed by design.
 fn exit_from_run(o: &RunOutcome) -> ExitCode {
     o.guests[..o.initial]
         .iter()
-        .find(|g| g.exit_code() != Some(0))
-        .map_or(ExitCode::SUCCESS, exit_from)
+        .zip(&o.daemons)
+        .find(|(g, &daemon)| !daemon && g.exit_code() != Some(0))
+        .map_or(ExitCode::SUCCESS, |(g, _)| exit_from(g))
 }
 
 fn exit_from(outcome: &launch::Outcome) -> ExitCode {

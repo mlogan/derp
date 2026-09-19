@@ -102,6 +102,8 @@ pub struct Guest {
     pub stdout: Option<PathBuf>,
     /// Working directory: the guest's host directory in a manifest run
     pub cwd: Option<PathBuf>,
+    /// Killed when every guest that is not a daemon has exited
+    pub daemon: bool,
 }
 
 /// Several guests under one scheduler
@@ -134,6 +136,8 @@ pub struct RunOutcome {
     pub guests: Vec<Outcome>,
     /// How many of `guests` the launcher started itself
     pub initial: usize,
+    /// Which of the initial guests were daemons, killed at the end
+    pub daemons: Vec<bool>,
     pub totals: Totals,
     /// The survivors were killed because every thread was blocked
     pub deadlock: bool,
@@ -507,6 +511,7 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
     Ok(RunOutcome {
         guests,
         initial: run.guests.len(),
+        daemons: run.guests.iter().map(|g| g.daemon).collect(),
         totals,
         deadlock,
     })
@@ -652,6 +657,19 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
         }
         for index in std::mem::take(&mut gone) {
             let Some(coord) = coord else { continue };
+            // Only daemons (and what they spawned) are left: the run is
+            // over. Whoever just exited held the baton, so everything else
+            // is parked and dies where it stands, before the baton could
+            // be handed to it.
+            let daemon = |i: usize| run.guests.get(i).is_some_and(|g| g.daemon);
+            let work_left = (0..run.guests.len()).any(|i| !daemon(i) && procs[i].status.is_none());
+            if !work_left && run.guests.iter().any(|g| g.daemon) {
+                kill_all(procs);
+                for p in procs.iter_mut() {
+                    p.status.get_or_insert(libc::SIGKILL);
+                }
+                break;
+            }
             let status = procs[index].status.unwrap_or(0);
             if coord.process_died(index as u32, status) == Death::Deadlock {
                 deadlock = true;
@@ -714,6 +732,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
             env: Vec::new(),
             stdout: cfg.stdout.clone(),
             cwd: None,
+            daemon: false,
         }],
         hosts: vec!["h0".into()],
         dylib: cfg.dylib.clone(),

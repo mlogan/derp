@@ -16,6 +16,8 @@
 //!       - client alpha 8080             # or a line, split on whitespace
 //!       - argv: [worker, "two words"]   # or a map, with an environment
 //!         env: { MODE: fast }
+//!       - argv: [httpd, --port, 80]     # a server that never exits: killed
+//!         daemon: true                  # when all other processes are done
 //! ```
 //!
 //! Processes start in file order. `argv[0]` names the program, relative to
@@ -58,6 +60,8 @@ enum RawProcess {
         argv: Vec<Scalar>,
         #[serde(default)]
         env: BTreeMap<String, Scalar>,
+        #[serde(default)]
+        daemon: bool,
     },
 }
 
@@ -89,6 +93,9 @@ pub struct Process {
     pub host: u32,
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
+    /// A server that never exits by itself: the run ends, and it is
+    /// killed, when every process that is not a daemon has exited
+    pub daemon: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,15 +149,19 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         }
         let index = m.hosts.len() as u32;
         for p in host.processes {
-            let (argv, env): (Vec<String>, Vec<(String, String)>) = match p {
+            let (argv, env, daemon): (Vec<String>, Vec<(String, String)>, bool) = match p {
                 RawProcess::Line(line) => (
                     line.split_whitespace().map(str::to_string).collect(),
                     Vec::new(),
+                    false,
                 ),
-                RawProcess::Argv(argv) => (argv.iter().map(Scalar::text).collect(), Vec::new()),
-                RawProcess::Full { argv, env } => (
+                RawProcess::Argv(argv) => {
+                    (argv.iter().map(Scalar::text).collect(), Vec::new(), false)
+                }
+                RawProcess::Full { argv, env, daemon } => (
                     argv.iter().map(Scalar::text).collect(),
                     env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
+                    daemon,
                 ),
             };
             if argv.is_empty() {
@@ -163,6 +174,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                 host: index,
                 argv,
                 env,
+                daemon,
             });
         }
         m.hosts.push(Host {
@@ -214,6 +226,9 @@ hosts:
         assert_eq!(m.processes[1].host, 1);
         assert_eq!(m.processes[1].argv, ["./cli", "alpha", "80"]);
         assert_eq!(m.processes[2].argv, ["./cli", "--", "--seed", "3"]);
+        assert!(!m.processes[2].daemon);
+        let d = parse("hosts: [{name: a, processes: [{argv: [srv], daemon: true}, cli]}]").unwrap();
+        assert!(d.processes[0].daemon && !d.processes[1].daemon);
         assert_eq!(
             m.processes[2].env,
             [

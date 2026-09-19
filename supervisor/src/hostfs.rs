@@ -177,7 +177,11 @@ unsafe fn check(call: &str, path: *const c_char, ancestors: bool) -> bool {
     };
     let absolute = normalize(given, &here);
     let seen = unprivate(&absolute);
-    let ok = under(seen, &policy.root)
+    // CoreFoundation reads this from the real home directory (from the
+    // password database, not `HOME`) in every program that links it.
+    let ambient = seen.ends_with(b"/.CFUserTextEncoding");
+    let ok = ambient
+        || under(seen, &policy.root)
         || ancestors && under(&policy.root, seen)
         || SYSTEM.iter().any(|s| under(seen, s))
         || policy.allow.iter().any(|a| under(seen, a));

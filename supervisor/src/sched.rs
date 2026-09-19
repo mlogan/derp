@@ -9,6 +9,7 @@ use std::fmt::Write;
 use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use crate::shared::{self, Handoff, Shared};
+use crate::spin::SpinLock;
 use crate::stubdata::Info;
 
 pub struct Config {
@@ -54,7 +55,7 @@ pub enum State {
 static SHARED: AtomicPtr<Shared> = AtomicPtr::new(std::ptr::null_mut());
 /// This process's index in the shared process table
 static PID: AtomicU32 = AtomicU32::new(0);
-static INFO: crate::spin::SpinLock<Option<Info>> = crate::spin::SpinLock::new(None);
+static INFO: SpinLock<Option<Info>> = SpinLock::new(None);
 /// Hooks are attributed to the process that consumed them:
 /// `LAST_QUANTUM` is what this process last saw in the counter and
 /// `HOOKS` what it consumed before that.
@@ -92,6 +93,46 @@ pub fn my_id() -> Option<usize> {
 pub fn set_my_id(id: usize) {
     let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
     unsafe { libc::pthread_setspecific(key, (id + 1) as *const c_void) };
+    let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
+    PORTS.lock().push(port);
+}
+
+/// Mach ports of the threads the scheduler runs in this process. The rest
+/// (GCD workers, which the kernel creates without `pthread_create`) run
+/// outside the baton; what they do is input, like the clock once was.
+static PORTS: SpinLock<Vec<u32>> = SpinLock::new(Vec::new());
+
+extern "C" {
+    fn pthread_mach_thread_np(t: libc::pthread_t) -> u32;
+    fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
+    fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+}
+
+/// Whether the thread with this Mach port is one the scheduler runs.
+pub fn is_scheduled_thread(port: u32) -> bool {
+    PORTS.lock().contains(&port)
+}
+
+pub fn forget_thread() {
+    let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
+    PORTS.lock().retain(|&p| p != port);
+}
+
+/// Whether this process has threads the scheduler does not run.
+fn has_outside_threads() -> bool {
+    let mut list: *mut u32 = std::ptr::null_mut();
+    let mut count = 0u32;
+    if unsafe { task_threads(mach_task_self_, &raw mut list, &raw mut count) } != 0 {
+        return false;
+    }
+    unsafe {
+        vm_deallocate(
+            mach_task_self_,
+            list as usize,
+            count as usize * std::mem::size_of::<u32>(),
+        );
+    }
+    count as usize > PORTS.lock().len()
 }
 
 pub fn pid() -> u32 {
@@ -109,9 +150,10 @@ pub fn with<R>(f: impl FnOnce(&mut shared::State, u32) -> R) -> Option<R> {
     Some(f(&mut s, pid()))
 }
 
-/// Make every thread of this process blocked on `addr` runnable.
-pub fn wake_all(addr: usize) {
-    with(|s, pid| s.wake_all(pid, addr as u64));
+/// Make every thread of this process blocked on `addr` runnable; returns
+/// how many there were. Safe from a thread the scheduler does not run.
+pub fn wake_all(addr: usize) -> usize {
+    with(|s, pid| s.wake_all(pid, addr as u64)).unwrap_or(0)
 }
 
 extern "C" {
@@ -325,6 +367,8 @@ pub fn become_forked_child(child: u32) {
         p.state = shared::P_LIVE;
     }
     PID.store(child, Ordering::Relaxed);
+    // Only the forking thread exists here, under a new port name
+    PORTS.lock().clear();
     HOOKS.store(0, Ordering::Relaxed);
     crate::io::IO_WAITS.store(0, Ordering::Relaxed);
     for c in &crate::interpose::COUNTS {
@@ -386,8 +430,39 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
         Handoff::Idle => {
             let stuck = state != State::Exited || s.any_alive();
             drop(s);
-            if stuck {
+            if !stuck {
+                return;
+            }
+            if state == State::Exited || !has_outside_threads() {
                 fatal("deadlock: every thread is blocked");
+            }
+            // A GCD worker may be about to wake one of us (a block finishing
+            // under dispatch_sync, a semaphore). Look again in real time;
+            // the virtual clock and the trace do not move meanwhile.
+            let began = std::time::Instant::now();
+            loop {
+                unsafe { libc::usleep(200) };
+                let mut s = sh.lock();
+                match s.choose(Some(me), site) {
+                    Handoff::Idle => {}
+                    Handoff::Stay => {
+                        let q = s.pending_quantum;
+                        drop(s);
+                        install_quantum(q);
+                        return;
+                    }
+                    Handoff::Switch { to, seen } => {
+                        drop(s);
+                        sh.unpark(to);
+                        sh.park(me, seen);
+                        install_quantum(sh.lock().pending_quantum);
+                        return;
+                    }
+                }
+                drop(s);
+                if began.elapsed() > std::time::Duration::from_secs(30) {
+                    fatal("deadlock: every thread is blocked, and no outside thread woke one");
+                }
             }
         }
         Handoff::Stay => {

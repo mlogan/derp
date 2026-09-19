@@ -485,29 +485,47 @@ extern "C" fn my_os_sync_wake_by_address_all(addr: *mut c_void, size: usize, fla
 }
 
 /// How long a `dispatch_time_t` deadline is from now, in nanoseconds (0:
-/// forever). libdispatch computed it from the real clock a moment ago, so
-/// the distance is taken on the real clock and rounded to a millisecond,
-/// which absorbs the microseconds since; callers ask for whole
-/// milliseconds far more often than not.
+/// forever). libdispatch computed it from a clock read of its own: through
+/// our interposers (the virtual clock) or inline from the commpage (the
+/// real one), depending on the path. The two clocks are far apart, so the
+/// distance is taken on both and the smaller one that is not in the past
+/// names the clock it came from. A real-clock distance is rounded to a
+/// millisecond, which absorbs the time since libdispatch's read.
 fn dispatch_timeout_ns(timeout: u64) -> u64 {
     const MS: i64 = 1_000_000;
     if timeout == DISPATCH_TIME_FOREVER {
         return 0;
     }
-    let real_now = if (timeout as i64) < 0 {
+    let virtual_now = sched::now() as i64;
+    let (deadline, real_now, virtual_now) = if (timeout as i64) < 0 {
         // Wall time, encoded as minus nanoseconds since the epoch
         let mut ts = libc::timespec {
             tv_sec: 0,
             tv_nsec: 0,
         };
         unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &raw mut ts) };
-        let now = ts.tv_sec * 1_000_000_000 + ts.tv_nsec;
-        (timeout as i64).wrapping_neg() - now
+        (
+            (timeout as i64).wrapping_neg(),
+            ts.tv_sec * 1_000_000_000 + ts.tv_nsec,
+            crate::determinism::REALTIME_BASE_NS as i64 + virtual_now,
+        )
     } else {
         // Mach absolute ticks; 125/3 ns each on Apple Silicon
-        (timeout as i64) * 125 / 3 - (unsafe { mach_absolute_time() } as i64) * 125 / 3
+        (
+            (timeout as i64).saturating_mul(125) / 3,
+            (unsafe { mach_absolute_time() } as i64).saturating_mul(125) / 3,
+            crate::determinism::MONOTONIC_BASE_NS as i64 + virtual_now,
+        )
     };
-    (((real_now + MS / 2) / MS).max(1) * MS) as u64
+    let on_real = deadline.saturating_sub(real_now);
+    let on_virtual = deadline.saturating_sub(virtual_now);
+    let ns = match (on_real >= -MS, on_virtual >= -MS) {
+        (true, true) if on_virtual <= on_real => on_virtual,
+        (true, _) => (on_real + MS / 2) / MS * MS,
+        (false, true) => on_virtual,
+        (false, false) => 0,
+    };
+    ns.max(1) as u64
 }
 
 /// Rust's `Thread::park` sits on one of these. A zero timeout is a

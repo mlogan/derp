@@ -51,7 +51,9 @@ impl Coordinator {
         // Fixed width: the guest's environment sits at the top of its stack,
         // so a name that is a digit longer in one run moves every stack
         // address the guest sees.
-        let path = std::env::temp_dir().join(format!(
+        // Not `temp_dir()`: its length differs between users and machines,
+        // and this path is in every guest's environment.
+        let path = Path::new("/tmp").join(format!(
             "rewrite-shm-{:010}-{:06}",
             std::process::id(),
             NEXT_FILE.fetch_add(1, Ordering::Relaxed)

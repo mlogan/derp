@@ -369,6 +369,23 @@ impl Events {
         self.add(fd as usize, libc::EVFILT_READ, 0, SOCKET_UDATA);
     }
 
+    fn unwatch_socket(&self, fd: libc::c_int) {
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        ev.ident = fd as usize;
+        ev.filter = libc::EVFILT_READ;
+        ev.flags = libc::EV_DELETE;
+        unsafe {
+            libc::kevent(
+                self.kq,
+                &raw const ev,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            );
+        }
+    }
+
     fn wait(&self) -> io::Result<Event> {
         loop {
             let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
@@ -412,6 +429,9 @@ impl Drop for Events {
 struct Channel {
     fd: libc::c_int,
     buf: Vec<u8>,
+    /// Every guest has closed its end; a level-triggered read filter would
+    /// fire forever
+    closed: bool,
 }
 
 struct Frame {
@@ -434,6 +454,7 @@ impl Channel {
             Channel {
                 fd: fds[0],
                 buf: Vec::new(),
+                closed: false,
             },
             fds[1],
         ))
@@ -451,6 +472,9 @@ impl Channel {
                     libc::MSG_DONTWAIT,
                 )
             };
+            if n == 0 {
+                self.closed = true;
+            }
             if n <= 0 {
                 break;
             }
@@ -529,6 +553,22 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
         totals,
         deadlock,
     })
+}
+
+/// Only daemons (and what they spawned) are left: the run is over. Whoever
+/// just exited held the baton, so everything else is parked and dies where
+/// it stands, before the baton could be handed to it.
+fn only_daemons_left(run: &Run, procs: &[Tracked]) -> bool {
+    let daemon = |i: usize| run.guests[i].daemon;
+    let work_left = (0..run.guests.len()).any(|i| !daemon(i) && procs[i].status.is_none());
+    !work_left && run.guests.iter().any(|g| g.daemon)
+}
+
+fn end_run(procs: &mut [Tracked]) {
+    kill_all(procs);
+    for p in procs.iter_mut() {
+        p.status.get_or_insert(libc::SIGKILL);
+    }
 }
 
 fn kill_all(procs: &mut [Tracked]) {
@@ -649,10 +689,14 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
         }
     }
     if let Some(coord) = coord {
-        for &i in &gone {
+        for i in std::mem::take(&mut gone) {
             coord.process_died(i as u32, procs[i].status.unwrap_or(0));
         }
         coord.start();
+    }
+    gone.clear();
+    if only_daemons_left(run, procs) {
+        end_run(procs);
     }
 
     let mut deadlock = false;
@@ -663,38 +707,29 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
             for frame in ch.drain() {
                 handle_frame(run, ch, &events, procs, &mut gone, &frame);
             }
+            if std::mem::take(&mut ch.closed) {
+                events.unwatch_socket(ch.fd);
+            }
         }
         if let Event::Exited { index, status } = event {
             gone.push(index);
+            // `waitpid` fails if SIGCHLD is ignored in our own environment;
+            // the event carries the status too
             let p = &mut procs[index];
-            if p.ours {
-                p.reap(true);
-            } else {
+            if !(p.ours && p.reap(true)) {
                 p.status = Some(status);
             }
         }
         for index in std::mem::take(&mut gone) {
-            let Some(coord) = coord else { continue };
-            // Only daemons (and what they spawned) are left: the run is
-            // over. Whoever just exited held the baton, so everything else
-            // is parked and dies where it stands, before the baton could
-            // be handed to it.
-            let daemon = |i: usize| run.guests.get(i).is_some_and(|g| g.daemon);
-            let work_left = (0..run.guests.len()).any(|i| !daemon(i) && procs[i].status.is_none());
-            if !work_left && run.guests.iter().any(|g| g.daemon) {
-                kill_all(procs);
-                for p in procs.iter_mut() {
-                    p.status.get_or_insert(libc::SIGKILL);
-                }
+            if only_daemons_left(run, procs) {
+                end_run(procs);
                 break;
             }
+            let Some(coord) = coord else { continue };
             let status = procs[index].status.unwrap_or(0);
             if coord.process_died(index as u32, status) == Death::Deadlock {
                 deadlock = true;
-                kill_all(procs);
-                for p in procs.iter_mut() {
-                    p.status.get_or_insert(libc::SIGKILL);
-                }
+                end_run(procs);
             }
         }
     }

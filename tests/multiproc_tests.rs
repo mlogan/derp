@@ -460,6 +460,8 @@ fn timed_waits_follow_the_virtual_clock() {
     )
     .unwrap();
     let scratch = dir.join("scratch");
+    // Builds and the first rewrite are not what is being timed
+    run_manifest(&manifest, &scratch, 1, 1);
     let started = std::time::Instant::now();
     for seed in 1..=4u64 {
         let r = run_manifest(&manifest, &scratch, seed, 1);
@@ -469,7 +471,7 @@ fn timed_waits_follow_the_virtual_clock() {
             "seed {seed}: {out}"
         );
         assert!(!out.contains("NO"), "seed {seed}: {out}");
-        assert_eq!(out.lines().count(), 19, "seed {seed}: {out}");
+        assert_eq!(out.lines().count(), 21, "seed {seed}: {out}");
     }
     // Virtual time: the waits add up to seconds of timeouts that nobody sat through
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
@@ -1161,6 +1163,34 @@ fn a_killed_child_can_be_reaped_at_once() {
         assert_eq!(
             again.fields["run.schedule_hash"],
             r.fields["run.schedule_hash"]
+        );
+    }
+}
+
+#[test]
+fn daemons_are_killed_in_runs_without_the_scheduler_too() {
+    let dir = common::scratch_dir("multiproc_native_daemon");
+    common::build_c("lifecycle", &dir, &[]);
+    common::build_c("envprobe", &dir, &[]);
+    let manifest = dir.join("daemon.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - argv: [lifecycle, forever]\n        daemon: true\n      - envprobe\n",
+    )
+    .unwrap();
+    for mode in ["--native", "--no-supervisor"] {
+        let out = Command::new(common::rewrite_bin())
+            .args(["run", "--capture", mode, "--scratch"])
+            .arg(dir.join("scratch"))
+            .arg("--manifest")
+            .arg(&manifest)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{mode}: {err}");
+        assert!(
+            err.contains("p0.status=signal 9") && err.contains("p1.status=exit 0"),
+            "{err}"
         );
     }
 }

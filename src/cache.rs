@@ -65,10 +65,13 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
     {
         return Ok(input.to_path_buf());
     }
-    let mtime = std::fs::metadata(input)?
+    // Seconds alone would reuse the rewrite of a program rebuilt within one
+    let meta = std::fs::metadata(input)?;
+    let mtime = meta
         .modified()?
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+        .map_or(0, |d| d.as_nanos());
+    let mtime = format!("{mtime}-{}", meta.len());
     let name = format!(
         "{}.rw2-{}-{}of{}-{mtime}",
         input.file_name().unwrap_or_default().to_string_lossy(),
@@ -80,10 +83,12 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
     let out = dir.join(name);
     if !out.exists() {
         // Rename into place: another run may be rewriting the same program.
+        static NEXT_TMP: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let tmp = dir.join(format!(
-            ".{}.rw-tmp-{}",
+            ".{}.rw-tmp-{}-{}",
             input.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id()
+            std::process::id(),
+            NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let stats = rewrite_file(input, &tmp, opts)?;
         std::fs::rename(&tmp, &out)?;

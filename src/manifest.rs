@@ -58,13 +58,19 @@ enum RawProcess {
     /// Split on whitespace; use the list form for arguments with spaces
     Line(String),
     Argv(Vec<Scalar>),
-    Full {
-        argv: Vec<Scalar>,
-        #[serde(default)]
-        env: BTreeMap<String, Scalar>,
-        #[serde(default)]
-        daemon: bool,
-    },
+    Full(RawFull),
+}
+
+/// Its own struct so that a mistyped key is an error: `deamon: true` must
+/// not quietly mean "not a daemon".
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawFull {
+    argv: Vec<Scalar>,
+    #[serde(default)]
+    env: BTreeMap<String, Scalar>,
+    #[serde(default)]
+    daemon: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,11 +135,28 @@ pub struct Manifest {
     pub pass_env: Vec<String>,
 }
 
-/// A host's name is also the name of its directory.
+/// The supervisor's own variables: a guest told otherwise would attach as
+/// another process, or not at all.
+fn check_names<'a>(names: impl Iterator<Item = &'a String>) -> Result<(), String> {
+    for name in names {
+        if name.starts_with("REWRITE_") || name.starts_with("DYLD_") {
+            return Err(format!("run file: {name} is reserved for the supervisor"));
+        }
+    }
+    Ok(())
+}
+
+/// As many as the shared state has room for
+const MAX_HOSTS: usize = 32;
+const MAX_PROCESSES: usize = 256;
+
+/// A host's name is also the name of its directory in the scratch
+/// directory, next to the launcher's own `stdout.<n>` files.
 fn valid_host_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 63
         && !name.starts_with('.')
+        && !name.starts_with("stdout.")
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
@@ -141,6 +164,11 @@ fn valid_host_name(name: &str) -> bool {
 
 pub fn parse(text: &str) -> Result<Manifest, String> {
     let raw: RawRun = serde_yaml::from_str(text).map_err(|e| format!("run file: {e}"))?;
+    check_names(raw.env.keys())?;
+    check_names(raw.pass_env.iter())?;
+    if raw.hosts.len() > MAX_HOSTS {
+        return Err(format!("run file: more than {MAX_HOSTS} hosts"));
+    }
     let mut m = Manifest {
         seed: raw.seed,
         quantum: raw.quantum,
@@ -158,7 +186,11 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                 host.name
             ));
         }
-        if m.hosts.iter().any(|h| h.name == host.name) {
+        // Directories: the file system may not tell `A` from `a`
+        if m.hosts
+            .iter()
+            .any(|h| h.name.eq_ignore_ascii_case(&host.name))
+        {
             return Err(format!("run file: host {} declared twice", host.name));
         }
         let index = m.hosts.len() as u32;
@@ -172,11 +204,17 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                 RawProcess::Argv(argv) => {
                     (argv.iter().map(Scalar::text).collect(), Vec::new(), false)
                 }
-                RawProcess::Full { argv, env, daemon } => (
-                    argv.iter().map(Scalar::text).collect(),
-                    env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
-                    daemon,
-                ),
+                RawProcess::Full(full) => {
+                    check_names(full.env.keys())?;
+                    (
+                        full.argv.iter().map(Scalar::text).collect(),
+                        full.env
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.text()))
+                            .collect(),
+                        full.daemon,
+                    )
+                }
             };
             if argv.is_empty() {
                 return Err(format!(
@@ -198,6 +236,9 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     }
     if m.processes.is_empty() {
         return Err("run file: no processes".into());
+    }
+    if m.processes.len() > MAX_PROCESSES {
+        return Err(format!("run file: more than {MAX_PROCESSES} processes"));
     }
     Ok(m)
 }
@@ -292,5 +333,24 @@ hosts:
         assert!(err("sed: 1\nhosts: [{name: a, processes: [p]}]").contains("sed"));
         assert!(err("processes: [p]").contains("hosts"));
         assert!(err("hosts: [{name: a, processes: [p]").contains("run file"));
+        assert!(
+            err("hosts: [{name: a, processes: [{argv: [p], deamon: true}]}]").contains("run file")
+        );
+        assert!(
+            err("env: {REWRITE_PROC: 3}\nhosts: [{name: a, processes: [p]}]").contains("reserved")
+        );
+        assert!(
+            err("pass-env: [DYLD_INSERT_LIBRARIES]\nhosts: [{name: a, processes: [p]}]")
+                .contains("reserved")
+        );
+        assert!(
+            err("hosts: [{name: a, processes: [{argv: [p], env: {REWRITE_SEED: 1}}]}]")
+                .contains("reserved")
+        );
+        assert!(err("hosts: [{name: stdout.0, processes: [p]}]").contains("host name"));
+        assert!(
+            err("hosts: [{name: Web, processes: [p]}, {name: web, processes: [p]}]")
+                .contains("declared twice")
+        );
     }
 }

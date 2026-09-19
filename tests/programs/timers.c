@@ -2,6 +2,7 @@
 // take at least as long as asked, and poll/select see virtual sockets.
 // Prints only what must hold on every seed.
 #include <arpa/inet.h>
+#include <dispatch/dispatch.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -65,6 +66,15 @@ int main(void) {
     pthread_mutex_unlock(&lock);
     check("cond_timedwait timed out", rc == ETIMEDOUT);
     check("after at least 49 ms", now_ms() - start >= 49);
+
+    // libdispatch computes these deadlines itself, through the virtual clock
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    start = now_ms();
+    long late = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 200 * NSEC_PER_MSEC));
+    check("dispatch semaphore timed out after 200 ms", late != 0 && now_ms() - start >= 200 && now_ms() - start < 260);
+    start = now_ms();
+    late = dispatch_semaphore_wait(sem, dispatch_walltime(NULL, 300 * NSEC_PER_MSEC));
+    check("and after 300 ms of wall time", late != 0 && now_ms() - start >= 300 && now_ms() - start < 360);
 
     start = now_ms();
     check("poll with no descriptors returns 0", poll(NULL, 0, 25) == 0);

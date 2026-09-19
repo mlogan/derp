@@ -52,6 +52,10 @@ pub const IO_KEY: u64 = 0x7FFF_FFFF_0001;
 /// Pipes and sockets the launcher itself was given (as `dev:ino` pairs):
 /// their other end is outside the run, so guests block on them for real.
 pub const EXTERNAL_VAR: &str = "REWRITE_EXTERNAL";
+/// The directory of the guest's virtual host, which its path names are
+/// held to, and extra locations every host may touch (`:`-separated)
+pub const HOST_ROOT_VAR: &str = "REWRITE_HOST_ROOT";
+pub const ALLOW_VAR: &str = "REWRITE_ALLOW";
 /// `ProcRec::parent` of the processes the launcher started
 pub const NO_PROC: u32 = u32::MAX;
 /// First virtual pid; process `i` of the run is `VPID_BASE + i`. The

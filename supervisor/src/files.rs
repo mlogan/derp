@@ -1,17 +1,17 @@
-//! Files are not virtualized, but three things about them matter to the
-//! schedule: file I/O calls are hook events, a blocking lock request must
-//! not hold the baton, and paths outside the run's scratch directory are
-//! input worth knowing about.
+//! Files are not virtualized, but two things about them matter to the
+//! schedule: file I/O calls are hook events, and a blocking lock request
+//! must not hold the baton. Which paths a guest may name is `hostfs`'s.
 
-use std::ffi::{c_char, c_int, c_void, CStr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::ffi::{c_char, c_int, c_void};
+use std::sync::atomic::Ordering;
 
 use crate::sched::{self, my_id};
 use crate::shared;
-use crate::spin::SpinLock;
 
 extern "C" {
     fn open(path: *const c_char, flags: c_int, ...) -> c_int;
+    #[link_name = "open$NOCANCEL"]
+    pub fn open_nocancel(path: *const c_char, flags: c_int, ...) -> c_int;
 }
 
 fn park_for_lock() {
@@ -81,53 +81,6 @@ pub unsafe extern "C" fn my_fsync(fd: c_int) -> c_int {
     libc::fsync(fd)
 }
 
-/// Set by the launcher for manifest runs
-const SCRATCH_VAR: &str = "REWRITE_SCRATCH";
-static SCRATCH: SpinLock<Option<Vec<u8>>> = SpinLock::new(None);
-static OUTSIDE_LOGGED: AtomicBool = AtomicBool::new(false);
-
-pub fn init() {
-    if let Ok(dir) = std::env::var(SCRATCH_VAR) {
-        *SCRATCH.lock() = Some(dir.into_bytes());
-    }
-}
-
-/// System locations every program touches through libSystem
-fn ambient(path: &[u8]) -> bool {
-    [
-        &b"/dev/"[..],
-        b"/usr/",
-        b"/System/",
-        b"/Library/",
-        b"/private/etc/",
-        b"/etc/",
-        b"/var/db/",
-    ]
-    .iter()
-    .any(|p| path.starts_with(p))
-}
-
-unsafe fn note_path(path: *const c_char) {
-    if path.is_null() || OUTSIDE_LOGGED.load(Ordering::Relaxed) || my_id().is_none() {
-        return;
-    }
-    let bytes = CStr::from_ptr(path).to_bytes();
-    // Relative paths resolve against the scratch directory the run started in
-    if !bytes.starts_with(b"/") || ambient(bytes) {
-        return;
-    }
-    let inside = match SCRATCH.lock().as_ref() {
-        Some(dir) => bytes.starts_with(dir),
-        None => return,
-    };
-    if !inside && !OUTSIDE_LOGGED.swap(true, Ordering::Relaxed) {
-        let mut line =
-            String::from("file outside the scratch directory (its contents are input): ");
-        line.push_str(&String::from_utf8_lossy(bytes));
-        crate::report::log(&line);
-    }
-}
-
 /// `open` is variadic (the mode); see the `fcntl` shim.
 #[no_mangle]
 pub unsafe extern "C" fn rewrite_open_impl(
@@ -136,12 +89,46 @@ pub unsafe extern "C" fn rewrite_open_impl(
     mode: usize,
 ) -> c_int {
     sched::hook_event(sched::SITE_FILE);
-    note_path(path);
+    if !crate::hostfs::permits("open", path) {
+        return -1;
+    }
     open(path, flags, mode as c_int)
+}
+
+/// What stdio and the rest of libSystem call instead of `open`
+#[no_mangle]
+pub unsafe extern "C" fn rewrite_open_nocancel_impl(
+    path: *const c_char,
+    flags: c_int,
+    mode: usize,
+) -> c_int {
+    sched::hook_event(sched::SITE_FILE);
+    if !crate::hostfs::permits("open", path) {
+        return -1;
+    }
+    open_nocancel(path, flags, mode as c_int)
+}
+
+/// `openat(dirfd, path, flags, mode)`: the variadic mode is the fourth
+/// argument, so the shim loads it into x3.
+#[no_mangle]
+pub unsafe extern "C" fn rewrite_openat_impl(
+    dirfd: c_int,
+    path: *const c_char,
+    flags: c_int,
+    mode: usize,
+) -> c_int {
+    sched::hook_event(sched::SITE_FILE);
+    if !crate::hostfs::permits_at("openat", dirfd, path) {
+        return -1;
+    }
+    libc::openat(dirfd, path, flags, mode as c_int)
 }
 
 extern "C" {
     pub fn rewrite_open_shim();
+    pub fn rewrite_open_nocancel_shim();
+    pub fn rewrite_openat_shim();
 }
 
 std::arch::global_asm!(
@@ -150,4 +137,14 @@ std::arch::global_asm!(
     "_rewrite_open_shim:",
     "ldr x2, [sp]",
     "b _rewrite_open_impl",
+    ".globl _rewrite_open_nocancel_shim",
+    ".p2align 2",
+    "_rewrite_open_nocancel_shim:",
+    "ldr x2, [sp]",
+    "b _rewrite_open_nocancel_impl",
+    ".globl _rewrite_openat_shim",
+    ".p2align 2",
+    "_rewrite_openat_shim:",
+    "ldr x3, [sp]",
+    "b _rewrite_openat_impl",
 );

@@ -9,6 +9,7 @@ mod alloc;
 mod coord;
 mod determinism;
 mod files;
+mod hostfs;
 mod interpose;
 mod io;
 mod kq;

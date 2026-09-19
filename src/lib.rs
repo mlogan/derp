@@ -5,6 +5,7 @@
 pub mod cache;
 pub mod coord;
 pub mod decode;
+pub mod hostdir;
 pub mod launch;
 pub mod macho;
 pub mod manifest;

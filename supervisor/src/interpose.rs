@@ -18,7 +18,15 @@ use crate::determinism::{
     my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_gettimeofday,
     my_mach_absolute_time, my_mach_continuous_time, my_time,
 };
-use crate::files::{my_flock, my_fsync, my_lseek, my_pread, my_pwrite, rewrite_open_shim};
+use crate::files::{
+    my_flock, my_fsync, my_lseek, my_pread, my_pwrite, open_nocancel, rewrite_open_nocancel_shim,
+    rewrite_open_shim, rewrite_openat_shim,
+};
+use crate::hostfs::{
+    my_access, my_chdir, my_chmod, my_chown, my_creat, my_fstatat, my_link, my_lstat, my_mkdir,
+    my_mkdirat, my_mkfifo, my_opendir, my_readlink, my_rename, my_rmdir, my_stat, my_symlink,
+    my_truncate, my_unlink, my_unlinkat, my_utimes,
+};
 use crate::io::{
     close_nocancel, my_close, my_close_nocancel, my_read, my_read_nocancel, my_readv,
     my_readv_nocancel, my_write, my_write_nocancel, my_writev, my_writev_nocancel, read_nocancel,
@@ -612,6 +620,29 @@ interposers! {
     my_lseek => libc::lseek,
     my_fsync => libc::fsync,
     rewrite_open_shim => libc::open,
+    rewrite_open_nocancel_shim => open_nocancel,
+    rewrite_openat_shim => libc::openat,
+    my_stat => libc::stat,
+    my_lstat => libc::lstat,
+    my_fstatat => libc::fstatat,
+    my_access => libc::access,
+    my_mkdir => libc::mkdir,
+    my_mkdirat => libc::mkdirat,
+    my_rmdir => libc::rmdir,
+    my_unlink => libc::unlink,
+    my_unlinkat => libc::unlinkat,
+    my_rename => libc::rename,
+    my_link => libc::link,
+    my_symlink => libc::symlink,
+    my_readlink => libc::readlink,
+    my_chdir => libc::chdir,
+    my_truncate => libc::truncate,
+    my_chmod => libc::chmod,
+    my_chown => libc::chown,
+    my_utimes => libc::utimes,
+    my_mkfifo => libc::mkfifo,
+    my_creat => libc::creat,
+    my_opendir => libc::opendir,
     my_kevent => libc::kevent,
     my_poll => libc::poll,
     my_select => libc::select,

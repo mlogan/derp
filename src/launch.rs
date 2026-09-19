@@ -100,6 +100,8 @@ pub struct Guest {
     pub env: Vec<(String, String)>,
     /// Redirect the guest's stdout to this file (created or truncated)
     pub stdout: Option<PathBuf>,
+    /// Working directory: the guest's host directory in a manifest run
+    pub cwd: Option<PathBuf>,
 }
 
 /// Several guests under one scheduler
@@ -114,8 +116,6 @@ pub struct Run {
     pub disable_aslr: bool,
     pub seed: u64,
     pub quantum: (u32, u32),
-    /// Working directory for every guest
-    pub cwd: Option<PathBuf>,
     /// Rewritten binaries need the dylib for the region their stubs
     /// address. Passive runs get that and no scheduler, which measures the
     /// stubs alone.
@@ -170,8 +170,18 @@ fn spawn(
         shared::SHARED_VAR,
         shared::PROC_VAR,
     ];
+    // What the run sets replaces what we inherited: `getenv` returns the
+    // first match, so a second `HOME` further down would never be seen.
+    let set: Vec<&String> = run
+        .env
+        .iter()
+        .chain(&guest.env)
+        .chain(extra_env)
+        .map(|(k, _)| k)
+        .collect();
     let mut env: Vec<CString> = std::env::vars_os()
         .filter(|(k, _)| !ours.iter().any(|o| k == o))
+        .filter(|(k, _)| !set.iter().any(|s| k == s.as_str()))
         .map(|(k, v)| {
             let mut s = k.into_vec();
             s.push(b'=');
@@ -228,7 +238,7 @@ fn spawn(
                 0o644,
             );
         }
-        let cwd_c = run.cwd.as_deref().map(cstring);
+        let cwd_c = guest.cwd.as_deref().map(cstring);
         if let Some(p) = &cwd_c {
             posix_spawn_file_actions_addchdir_np(&raw mut actions, p.as_ptr());
         }
@@ -703,6 +713,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
             host: 0,
             env: Vec::new(),
             stdout: cfg.stdout.clone(),
+            cwd: None,
         }],
         hosts: vec!["h0".into()],
         dylib: cfg.dylib.clone(),
@@ -710,7 +721,6 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         disable_aslr: cfg.disable_aslr,
         seed: cfg.seed,
         quantum: cfg.quantum,
-        cwd: None,
         passive: cfg.passive,
         rewrite: cfg.rewrite.clone(),
         net_latency_ns: 0,

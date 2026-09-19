@@ -249,41 +249,58 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
     let m = manifest::parse(&std::fs::read_to_string(path)?)?;
     let cli = &with_run_file_settings(cli, &m)?;
     let base = path.parent().unwrap_or(Path::new("."));
-    let mut guests = Vec::new();
-    for (i, p) in m.processes.iter().enumerate() {
+    // Programs first: a run file that names a missing one should fail
+    // before anything is created.
+    let mut programs = Vec::new();
+    for p in &m.processes {
         let prog = std::fs::canonicalize(base.join(&p.argv[0]))
             .map_err(|e| format!("{}: {e}", p.argv[0]))?;
-        let exe = if cli.native {
+        programs.push(if cli.native {
             prog
         } else {
             cached_rewrite(&prog, &cli.opts)?
-        };
-        guests.push(Guest {
-            exe,
-            argv0: Some(p.argv[0].clone().into()),
-            args: p.argv[1..].iter().map(Into::into).collect(),
-            host: p.host,
-            env: p.env.clone(),
-            stdout: capture.then(|| stdout_file(scratch, i)),
         });
     }
     prepare_scratch(scratch)?;
     let scratch = std::fs::canonicalize(scratch)?;
+    let roots = rewrite::hostdir::prepare(&scratch, base, &m.hosts)?;
+    let text = |p: &Path| p.to_string_lossy().into_owned();
+    let guests = m
+        .processes
+        .iter()
+        .zip(programs)
+        .enumerate()
+        .map(|(i, (p, exe))| {
+            let root = &roots[p.host as usize];
+            // The host's directory is home: where the process starts and
+            // what its path names are held to
+            let mut env = vec![
+                ("PWD".to_string(), text(root)),
+                ("HOME".to_string(), text(root)),
+                ("TMPDIR".to_string(), text(&root.join("tmp"))),
+                (rewrite::shared::HOST_ROOT_VAR.to_string(), text(root)),
+                (rewrite::shared::ALLOW_VAR.to_string(), m.allow.join(":")),
+            ];
+            env.extend(p.env.iter().cloned());
+            Guest {
+                exe,
+                argv0: Some(p.argv[0].clone().into()),
+                args: p.argv[1..].iter().map(Into::into).collect(),
+                host: p.host,
+                env,
+                stdout: capture.then(|| stdout_file(&scratch, i)),
+                cwd: Some(root.clone()),
+            }
+        })
+        .collect();
     let run = Run {
         guests,
         hosts: m.hosts.iter().map(|h| h.name.clone()).collect(),
         dylib: dylib_for(cli)?,
-        env: vec![
-            ("TMPDIR".into(), scratch.to_string_lossy().into_owned()),
-            (
-                "REWRITE_SCRATCH".into(),
-                scratch.to_string_lossy().into_owned(),
-            ),
-        ],
+        env: Vec::new(),
         disable_aslr: cli.disable_aslr,
         seed: cli.opts.seed,
         quantum: cli.quantum,
-        cwd: Some(scratch),
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,

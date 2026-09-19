@@ -50,6 +50,33 @@ run file, and reaches the guest exactly as written. Numbers and booleans in
 an argument list are taken as their text; quote one whose spelling matters
 (`"007"`). Unknown keys are errors.
 
+## A directory per host
+
+Every run the launcher makes a fresh directory for each host, under the
+scratch directory and named after the host. The run file never names it. A
+host's `files:` (paths relative to the run file) are copied in first:
+
+```yaml
+hosts:
+  - name: web
+    files: [site]        # becomes <host directory>/site/...
+    processes:
+      - [server, --root, site]
+```
+
+Processes start in their host's directory, with `PWD`, `HOME` and `TMPDIR`
+inside it, and the supervisor holds their path names to it. A path must be
+under the host's directory, under a system location (`/usr`, `/etc`, `/dev`,
+`/opt/homebrew`, ...), or under one of the run file's top-level `allow:`
+entries; anything else fails with `EACCES` and is logged with the host, the
+call and the path. Asking about the directories above the host's (`stat`,
+`access`) is allowed; opening them is not.
+
+This guards against configurations that would let hosts share files by
+accident, such as an absolute path into another host's directory or a
+`../other/data`. It is not a sandbox: paths are checked as text, so a
+symlink gets out. Program images are not checked.
+
 Plans and progress: `IMPLEMENTATION_PLAN_REWRITE.md`,
 `IMPLEMENTATION_PLAN_MULTIPROC.md`, `TASKS_REWRITE.md`,
 `TASKS_MULTIPROC.md`. Results: `docs/REWRITE_RESULTS.md` (single process)

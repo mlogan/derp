@@ -291,7 +291,7 @@ pub fn init(info: Option<Info>, cfg: &Config) {
             crate::coord::connect();
             crate::process::init();
             crate::io::init();
-            crate::files::init();
+            crate::hostfs::init();
             join_run(&path)
         }
         Err(_) => start_private_run(cfg),
@@ -471,6 +471,7 @@ pub fn report(out: &mut String) {
     let _ = writeln!(out, "expiries={expiries}");
     let _ = writeln!(out, "switches={switches}");
     let _ = writeln!(out, "schedule_hash={hash:016x}");
+    let _ = writeln!(out, "paths_refused={}", crate::hostfs::refused());
     let _ = writeln!(
         out,
         "io_waits={}",

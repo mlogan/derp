@@ -24,11 +24,15 @@ struct Inherit {
     shared: String,
     seed: String,
     external: String,
+    host_root: String,
+    allow: String,
 }
 
 static INHERIT: SpinLock<Option<Inherit>> = SpinLock::new(None);
 
-const OUR_VARS: [&str; 5] = [
+const OUR_VARS: [&str; 7] = [
+    shared::HOST_ROOT_VAR,
+    shared::ALLOW_VAR,
     "DYLD_INSERT_LIBRARIES",
     shared::SHARED_VAR,
     shared::PROC_VAR,
@@ -43,6 +47,8 @@ pub fn init() {
         shared: get(shared::SHARED_VAR),
         seed: get("REWRITE_SEED"),
         external: get(shared::EXTERNAL_VAR),
+        host_root: get(shared::HOST_ROOT_VAR),
+        allow: get(shared::ALLOW_VAR),
     });
 }
 
@@ -86,6 +92,8 @@ fn child_env(envp: *const *mut c_char, proc_index: u32) -> Vec<CString> {
             (shared::SHARED_VAR, i.shared.as_str()),
             ("REWRITE_SEED", i.seed.as_str()),
             (shared::EXTERNAL_VAR, i.external.as_str()),
+            (shared::HOST_ROOT_VAR, i.host_root.as_str()),
+            (shared::ALLOW_VAR, i.allow.as_str()),
         ] {
             out.push(CString::new(format!("{k}={v}")).unwrap());
         }
@@ -103,7 +111,9 @@ fn pointers(v: &[CString]) -> Vec<*mut c_char> {
 /// Absolute path of the rewritten form of `path`, or an errno.
 fn rewritten(path: *const c_char) -> Result<CString, c_int> {
     let mut buf = [0 as c_char; libc::PATH_MAX as usize];
-    if unsafe { libc::realpath(path, buf.as_mut_ptr()) }.is_null() {
+    // Program images live outside every host's directory
+    let resolved = crate::hostfs::exempt(|| unsafe { libc::realpath(path, buf.as_mut_ptr()) });
+    if resolved.is_null() {
         return Err(unsafe { *libc::__error() });
     }
     let abs = unsafe { CStr::from_ptr(buf.as_ptr()) };
@@ -123,7 +133,8 @@ fn search_path(file: &CStr) -> Option<CString> {
         full.push(b'/');
         full.extend(file.to_bytes());
         let c = CString::new(full).ok()?;
-        (unsafe { libc::access(c.as_ptr(), libc::X_OK) } == 0).then_some(c)
+        let found = crate::hostfs::exempt(|| unsafe { libc::access(c.as_ptr(), libc::X_OK) });
+        (found == 0).then_some(c)
     })
 }
 

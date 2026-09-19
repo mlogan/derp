@@ -842,3 +842,69 @@ hosts:
         assert!(err.contains(complaint), "{complaint}: {err}");
     }
 }
+
+#[test]
+fn each_host_is_held_to_its_own_directory() {
+    let dir = common::scratch_dir("multiproc_hostfs");
+    common::build_c("hostfs", &dir, &[]);
+    std::fs::write(dir.join("seed.txt"), "copied in for red\n").unwrap();
+    let manifest = dir.join("hostfs.yaml");
+    std::fs::write(
+        &manifest,
+        r"hosts:
+  - name: red
+    files: [seed.txt]
+    processes:
+      - hostfs blue
+  - name: blue
+    processes:
+      - hostfs red
+",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    // A leftover from an earlier run must not survive into the next one
+    let r = run_manifest(&manifest, &scratch, 1, 2);
+    std::fs::write(scratch.join("red/stale.txt"), "old").unwrap();
+    let r2 = run_manifest(&manifest, &scratch, 1, 2);
+    assert_eq!(r.stdout, r2.stdout);
+    assert!(!scratch.join("red/stale.txt").exists());
+
+    let expect = |me: &str, seed: &str| {
+        format!(
+            "{me} starts in a directory named {me}\n\
+             HOME and PWD agree with it: yes\n\
+             TMPDIR is inside it: yes\n\
+             write data.txt: ok\n\
+             seed.txt from the run file: {seed}\n\
+             mkdir sub and a file by absolute path: ok\n\
+             absolute path inside: ok\n\
+             /etc/hosts: ok\n\
+             /dev/null for writing: ok\n\
+             stat /: ok\n\
+             stat the directory above: ok\n\
+             but not open it: refused\n\
+             other host by relative path: refused\n\
+             other host by absolute path: refused\n\
+             stat the other host's file: refused\n\
+             rename into the other host: refused\n\
+             chdir to the other host: refused\n\
+             a file in the real /tmp: refused\n\
+             {me} starts in a directory named {me}\n\
+             HOME and PWD agree with it: yes\n\
+             TMPDIR is inside it: yes\n\
+             child reads the other host's file: refused\n\
+             child reads its own host's file: ok\n"
+        )
+    };
+    assert_eq!(r.stdout[0], expect("red", "copied in for red"));
+    assert_eq!(r.stdout[1], expect("blue", "(not copied)"));
+    // The same relative name is a different file on each host
+    let read = |host: &str| std::fs::read_to_string(scratch.join(host).join("data.txt")).unwrap();
+    assert_eq!(read("red"), "written on red\n");
+    assert_eq!(read("blue"), "written on blue\n");
+    assert!(scratch.join("red/sub/inner.txt").exists());
+    assert!(!Path::new("/tmp/rewrite-hostfs-escape").exists());
+    assert_eq!(r.u64("p0.paths_refused"), 7);
+    assert_eq!(r.u64("p2.paths_refused"), 1);
+}

@@ -1,16 +1,16 @@
-//! Baton scheduler. Every guest thread is a real pthread parked on a mach
-//! semaphore; exactly one holds the baton and runs guest code. Switches
-//! happen only at quantum expiry (from the stubs) and at the interposed
-//! blocking primitives, so the interleaving is a function of the seed.
+//! Baton scheduler. Every guest thread in every process of the run is a
+//! real pthread parked on its word in the shared state; exactly one holds
+//! the baton and runs guest code. Switches happen only at quantum expiry
+//! (from the stubs) and at the interposed blocking primitives, so the
+//! interleaving is a function of the seed.
 
-use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
-use crate::rng::Rng;
-use crate::stubdata::Page;
+use crate::shared::{self, Handoff, Shared};
+use crate::spin::SpinLock;
+use crate::stubdata::Info;
 
 pub struct Config {
     pub seed: u64,
@@ -42,42 +42,25 @@ impl Config {
     }
 }
 
+/// What the calling thread becomes when it gives up the baton
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
-    Running,
     Runnable,
+    /// Waiting for a wake on this key (an address or pseudo address in
+    /// this process)
     Blocked(usize),
     Exited,
 }
 
-pub struct Thread {
-    pub sem: u32,
-    pub state: State,
-    pub pthread: libc::pthread_t,
-    /// Set by `cond_signal`; consumed by the waiter
-    pub signaled: bool,
-    /// Waiting with a timeout: may be released with ETIMEDOUT when nothing
-    /// else can run
-    pub timed: bool,
-    pub timed_out: bool,
-}
-
-pub struct Sched {
-    page: Option<Page>,
-    rng: Rng,
-    quantum_lo: u32,
-    quantum_hi: u32,
-    pub threads: Vec<Thread>,
-    current: usize,
-    issued: u64,
-    switches: u64,
-    expiries: u64,
-    trace_hash: u64,
-    /// FIFO of waiters per condition variable address
-    pub cond_waiters: Vec<(usize, VecDeque<usize>)>,
-}
-
-pub static SCHED: Mutex<Option<Sched>> = Mutex::new(None);
+static SHARED: AtomicPtr<Shared> = AtomicPtr::new(std::ptr::null_mut());
+/// This process's index in the shared process table
+static PID: AtomicU32 = AtomicU32::new(0);
+static INFO: SpinLock<Option<Info>> = SpinLock::new(None);
+/// Hooks are attributed to the process that consumed them:
+/// `LAST_QUANTUM` is what this process last saw in the counter and
+/// `HOOKS` what it consumed before that.
+static LAST_QUANTUM: AtomicI64 = AtomicI64::new(0);
+static HOOKS: AtomicI64 = AtomicI64::new(0);
 
 /// The thread's scheduler id lives in a pthread key (value `id + 1`) rather
 /// than a Rust thread-local: the key's destructor is the thread's teardown
@@ -107,146 +90,344 @@ pub fn my_id() -> Option<usize> {
     (v != 0).then(|| v - 1)
 }
 
+/// `my_id().is_some()` for the allocator, which must not touch a Rust
+/// thread-local: dyld allocates those with `malloc`.
+pub fn on_scheduled_thread() -> bool {
+    let key = ID_KEY.load(Ordering::Relaxed);
+    key != usize::MAX && !unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) }.is_null()
+}
+
 pub fn set_my_id(id: usize) {
     let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
     unsafe { libc::pthread_setspecific(key, (id + 1) as *const c_void) };
+    let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
+    PORTS.lock().push(port);
+}
+
+/// Mach ports of the threads the scheduler runs in this process. The rest
+/// (GCD workers, which the kernel creates without `pthread_create`) run
+/// outside the baton; what they do is input, like the clock once was.
+static PORTS: SpinLock<Vec<u32>> = SpinLock::new(Vec::new());
+
+extern "C" {
+    fn pthread_mach_thread_np(t: libc::pthread_t) -> u32;
+    fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
+    fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
+    fn mach_port_deallocate(task: u32, name: u32) -> i32;
+}
+
+/// Whether the thread with this Mach port is one the scheduler runs.
+pub fn is_scheduled_thread(port: u32) -> bool {
+    PORTS.lock().contains(&port)
+}
+
+pub fn forget_thread() {
+    let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
+    PORTS.lock().retain(|&p| p != port);
+}
+
+/// Whether this process has threads the scheduler does not run.
+fn has_outside_threads() -> bool {
+    let mut list: *mut u32 = std::ptr::null_mut();
+    let mut count = 0u32;
+    if unsafe { task_threads(mach_task_self_, &raw mut list, &raw mut count) } != 0 {
+        return false;
+    }
+    unsafe {
+        // `task_threads` hands out a send right per thread
+        for i in 0..count as usize {
+            mach_port_deallocate(mach_task_self_, *list.add(i));
+        }
+        vm_deallocate(
+            mach_task_self_,
+            list as usize,
+            count as usize * std::mem::size_of::<u32>(),
+        );
+    }
+    count as usize > PORTS.lock().len()
+}
+
+pub fn pid() -> u32 {
+    PID.load(Ordering::Relaxed)
+}
+
+fn shared() -> Option<&'static Shared> {
+    unsafe { SHARED.load(Ordering::Relaxed).as_ref() }
+}
+
+/// Run `f` on the locked scheduler state. `f` must not block or allocate.
+pub fn with<R>(f: impl FnOnce(&mut shared::State, u32) -> R) -> Option<R> {
+    let sh = shared()?;
+    let mut s = sh.lock();
+    Some(f(&mut s, pid()))
+}
+
+/// Make every thread of this process blocked on `addr` runnable; returns
+/// how many there were. Safe from a thread the scheduler does not run.
+pub fn wake_all(addr: usize) -> usize {
+    let outside = !on_scheduled_thread();
+    let woken = with(|s, pid| {
+        if outside {
+            note_outside_wake(s, pid);
+        }
+        s.wake_all(pid, addr as u64)
+    })
+    .unwrap_or(0);
+    if woken > 0 && outside {
+        OUTSIDE_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
+    }
+    woken
+}
+
+/// A wake from a thread the scheduler does not run: see
+/// `ProcRec::outside_wakes`.
+pub fn note_outside_wake(s: &mut shared::State, pid: u32) {
+    let p = &mut s.procs[pid as usize];
+    p.outside_wakes += 1;
+    p.has_outside_threads = true;
+}
+
+/// Scheduled threads made runnable by a thread the scheduler does not run.
+/// When that happens depends on real time, so a run where this is not zero
+/// had its schedule influenced from outside.
+pub static OUTSIDE_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+extern "C" {
+    fn rewrite_scheduler_yield();
+}
+
+/// Fold the hooks consumed from the current quantum into `HOOKS`.
+fn settle_hooks() {
+    if let Some(sh) = shared() {
+        let remaining = unsafe { sh.counter().read() };
+        let last = LAST_QUANTUM.swap(remaining, Ordering::Relaxed);
+        HOOKS.fetch_add(last - remaining, Ordering::Relaxed);
+    }
+}
+
+fn install_quantum(q: i64) {
+    if let Some(sh) = shared() {
+        unsafe { sh.counter().write(q) };
+        LAST_QUANTUM.store(q, Ordering::Relaxed);
+    }
 }
 
 extern "C" {
     static mach_task_self_: u32;
-    fn semaphore_create(task: u32, sem: *mut u32, policy: i32, value: i32) -> i32;
-    fn semaphore_wait(sem: u32) -> i32;
-    fn semaphore_signal(sem: u32) -> i32;
-    fn rewrite_scheduler_yield();
+    fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: i32) -> i32;
 }
 
-fn new_semaphore() -> u32 {
-    let mut sem = 0;
-    let rc = unsafe { semaphore_create(mach_task_self_, &raw mut sem, 0, 0) };
-    assert_eq!(rc, 0, "semaphore_create failed");
-    sem
-}
-
-fn park(sem: u32) {
-    // KERN_ABORTED (14) after a signal: just wait again
-    while unsafe { semaphore_wait(sem) } == 14 {}
-}
-
-fn fnv(mut h: u64, v: u64) -> u64 {
-    for b in v.to_le_bytes() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01B3);
+/// Set up the fixed region the stubs address: this process's private page
+/// at `STUB_BASE`, then `len` bytes of `fd` (or of anonymous memory for -1).
+/// The stubs hard-code the address, so nothing else will do. An `mmap` hint
+/// is not enough: the kernel ignores it now and then. A fixed
+/// `mach_vm_allocate` fails instead of replacing what is there, so mapping
+/// over that reservation with `MAP_FIXED` cannot clobber anything.
+fn map_region(fd: i32, len: usize) -> *mut Shared {
+    let mut addr = shared::STUB_BASE as u64;
+    let total = (shared::PRIVATE_SIZE + len) as u64;
+    if unsafe { mach_vm_allocate(mach_task_self_, &raw mut addr, total, 0) } != 0 {
+        fatal("the fixed scheduler region is occupied in this process");
     }
-    h
+    let map = |at: usize, len: usize, flags: i32, fd: i32| {
+        let p = unsafe {
+            libc::mmap(
+                at as *mut c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags | libc::MAP_FIXED,
+                fd,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            fatal("mapping the fixed scheduler region failed");
+        }
+    };
+    map(
+        shared::STUB_BASE,
+        shared::PRIVATE_SIZE,
+        libc::MAP_PRIVATE | libc::MAP_ANON,
+        -1,
+    );
+    let state_flags = if fd < 0 {
+        libc::MAP_SHARED | libc::MAP_ANON
+    } else {
+        libc::MAP_SHARED
+    };
+    map(shared::MAP_ADDR, len, state_flags, fd);
+    shared::MAP_ADDR as *mut Shared
 }
 
-pub fn init(page: Option<Page>, cfg: &Config) {
+fn map_shared_file(path: &str) -> Option<(*mut Shared, usize)> {
+    let cpath = std::ffi::CString::new(path).ok()?;
+    unsafe {
+        let fd = libc::open(cpath.as_ptr(), libc::O_RDWR);
+        if fd < 0 {
+            return None;
+        }
+        let mut st: libc::stat = std::mem::zeroed();
+        let mapped = (libc::fstat(fd, &raw mut st) == 0).then(|| {
+            let len = st.st_size as usize;
+            (map_region(fd, len), len)
+        });
+        libc::close(fd);
+        mapped
+    }
+}
+
+fn scheduler_slot() -> *mut usize {
+    (shared::STUB_BASE + shared::SLOT_OFFSET as usize) as *mut usize
+}
+
+fn fatal(msg: &str) -> ! {
+    crate::report::log(msg);
+    std::process::abort();
+}
+
+/// Attach to the state the launcher prepared; it registered this process
+/// and its main thread before spawning us.
+fn join_run(path: &str) -> (&'static Shared, usize) {
+    let Some((mem, len)) = map_shared_file(path) else {
+        fatal("cannot map the run's shared scheduler state");
+    };
+    let Some(sh) = (unsafe { Shared::attach(mem, len) }) else {
+        fatal("shared scheduler state has the wrong layout");
+    };
+    let pid: u32 = std::env::var(shared::PROC_VAR)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| fatal("REWRITE_PROC missing"));
+    let mut s = sh.lock();
+    let n = s.nthreads as usize;
+    // After an `execve` the process has older, retired threads: take the
+    // one that is still alive.
+    let Some(me) = s.threads[..n]
+        .iter()
+        .position(|t| t.pid == pid && t.state != shared::T_EXITED)
+    else {
+        drop(s);
+        fatal("launcher did not register this process");
+    };
+    s.threads[me].pthread = unsafe { libc::pthread_self() } as u64;
+    drop(s);
+    // Whoever started us waits for `P_LIVE`, so inherited sockets are
+    // counted before it can close its own copies.
+    crate::net::adopt_inherited(sh, pid);
+    let mut s = sh.lock();
+    let p = &mut s.procs[pid as usize];
+    p.real_pid = unsafe { libc::getpid() };
+    p.state = shared::P_LIVE;
+    drop(s);
+    PID.store(pid, Ordering::Relaxed);
+    (sh, me)
+}
+
+/// No launcher: a run of this one process, with the baton already ours.
+fn start_private_run(cfg: &Config) -> (&'static Shared, usize) {
+    let mem = map_region(-1, Shared::SIZE);
+    let sh = unsafe { Shared::init(mem, cfg.seed, cfg.quantum_lo, cfg.quantum_hi) };
+    let mut s = sh.lock();
+    let pid = s.add_proc(0, shared::NO_PROC);
+    s.procs[pid as usize].state = shared::P_LIVE;
+    s.procs[pid as usize].real_pid = unsafe { libc::getpid() };
+    let me = s.add_thread(pid);
+    s.threads[me].pthread = unsafe { libc::pthread_self() } as u64;
+    s.hand_off(None, 0);
+    drop(s);
+    (sh, me)
+}
+
+/// Environment variable for runs without scheduling: the stubs get their
+/// region but no scheduler, and no thread is registered, so every
+/// interposer passes through. Measures the cost of the stubs alone.
+const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
+
+/// Join the run's scheduler (or start a private one when there is no
+/// launcher), then park the main thread until it is handed the baton.
+pub fn init(info: Option<Info>, cfg: &Config) {
+    *INFO.lock() = info;
+    open_trace();
+    if let Some(spins) = std::env::var("REWRITE_PARK_SPINS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        shared::PARK_SPINS.store(spins, Ordering::Relaxed);
+    }
+    if std::env::var_os(PASSIVE_VAR).is_some() {
+        map_region(-1, Shared::SIZE);
+        return;
+    }
     let mut key: libc::pthread_key_t = 0;
     let rc =
         unsafe { libc::pthread_key_create(&raw mut key, Some(crate::interpose::thread_teardown)) };
     assert_eq!(rc, 0, "pthread_key_create failed");
     ID_KEY.store(key as usize, Ordering::Relaxed);
-    let mut rng = Rng::seed_from_u64(cfg.seed);
-    let first = u64::from(rng.range_inclusive(cfg.quantum_lo, cfg.quantum_hi));
-    if let Some(page) = page {
-        unsafe {
-            page.counter().write(first as i64);
-            page.slot()
-                .write(rewrite_scheduler_yield as *const () as usize);
+
+    let (sh, me) = match std::env::var(shared::SHARED_VAR) {
+        Ok(path) => {
+            crate::coord::connect();
+            crate::process::init();
+            crate::io::init();
+            crate::hostfs::init();
+            join_run(&path)
         }
-    }
-    let main = Thread {
-        sem: new_semaphore(),
-        state: State::Running,
-        pthread: unsafe { libc::pthread_self() },
-        signaled: false,
-        timed: false,
-        timed_out: false,
+        Err(_) => start_private_run(cfg),
     };
-    *SCHED.lock().unwrap() = Some(Sched {
-        page,
-        rng,
-        quantum_lo: cfg.quantum_lo,
-        quantum_hi: cfg.quantum_hi,
-        threads: vec![main],
-        current: 0,
-        issued: first,
-        switches: 0,
-        expiries: 0,
-        trace_hash: 0xCBF2_9CE4_8422_2325,
-        cond_waiters: Vec::new(),
-    });
-    set_my_id(0);
+    unsafe { scheduler_slot().write(rewrite_scheduler_yield as *const () as usize) };
+    SHARED.store(std::ptr::from_ref(sh).cast_mut(), Ordering::Relaxed);
+    set_my_id(me);
+    wait_for_baton(me);
 }
 
-impl Sched {
-    /// Register a thread created by the baton holder; it starts parked.
-    pub fn add_thread(&mut self) -> usize {
-        self.threads.push(Thread {
-            sem: new_semaphore(),
-            state: State::Runnable,
-            pthread: 0,
-            signaled: false,
-            timed: false,
-            timed_out: false,
-        });
-        self.threads.len() - 1
-    }
-
-    pub fn find_pthread(&self, t: libc::pthread_t) -> Option<usize> {
-        self.threads.iter().position(|th| th.pthread == t)
-    }
-
-    /// Make every thread blocked on `addr` runnable.
-    pub fn wake_all(&mut self, addr: usize) {
-        for t in &mut self.threads {
-            if t.state == State::Blocked(addr) {
-                t.state = State::Runnable;
-            }
-        }
-    }
-
-    pub fn wake_thread(&mut self, id: usize) {
-        if matches!(self.threads[id].state, State::Blocked(_)) {
-            self.threads[id].state = State::Runnable;
-        }
-    }
-
-    fn next_quantum(&mut self) -> i64 {
-        let q = u64::from(self.rng.range_inclusive(self.quantum_lo, self.quantum_hi));
-        self.issued += q;
-        q as i64
-    }
-
-    fn reset_counter(&mut self) {
-        let q = self.next_quantum();
-        if let Some(page) = self.page {
-            unsafe { page.counter().write(q) };
-        }
-    }
-
-    /// Choose the next baton holder. Returns None when nothing can run.
-    fn pick(&mut self) -> Option<usize> {
-        let runnable: Vec<usize> = self
-            .threads
+/// In the child of a `fork`: become process `child`, whose main thread the
+/// parent registered, and park until that thread is given the baton.
+pub fn become_forked_child(child: u32) {
+    let Some(sh) = shared() else { return };
+    let me = {
+        let mut s = sh.lock();
+        let n = s.nthreads as usize;
+        let me = s.threads[..n]
             .iter()
-            .enumerate()
-            .filter(|(_, t)| t.state == State::Runnable)
-            .map(|(i, _)| i)
-            .collect();
-        if runnable.is_empty() {
-            // Idle: let a timed waiter time out, lowest id first
-            let timed = self
-                .threads
-                .iter()
-                .position(|t| t.timed && matches!(t.state, State::Blocked(_)))?;
-            self.threads[timed].timed_out = true;
-            self.threads[timed].state = State::Runnable;
-            return Some(timed);
-        }
-        let i = self.rng.below(runnable.len() as u64) as usize;
-        Some(runnable[i])
+            .position(|t| t.pid == child)
+            .expect("forked child has no thread record");
+        s.threads[me].pthread = unsafe { libc::pthread_self() } as u64;
+        me
+    };
+    crate::net::adopt_inherited(sh, child);
+    {
+        let mut s = sh.lock();
+        let p = &mut s.procs[child as usize];
+        p.real_pid = unsafe { libc::getpid() };
+        p.state = shared::P_LIVE;
     }
+    PID.store(child, Ordering::Relaxed);
+    // Only the forking thread exists here, under a new port name. A thread
+    // of the parent may have been inside `set_my_id` at the fork.
+    PORTS.force_unlock();
+    PORTS.lock().clear();
+    crate::alloc::forked();
+    crate::hostfs::forked();
+    crate::io::forked();
+    crate::process::forked();
+    crate::kq::forked();
+    crate::determinism::forked(
+        Config::from_env()
+            .seed
+            .wrapping_add(u64::from(child).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+    );
+    HOOKS.store(0, Ordering::Relaxed);
+    crate::io::IO_WAITS.store(0, Ordering::Relaxed);
+    for c in &crate::interpose::COUNTS {
+        c.store(0, Ordering::Relaxed);
+    }
+    set_my_id(me);
+    wait_for_baton(me);
+}
+
+/// Register a thread created by the baton holder; it starts parked.
+pub fn add_thread() -> usize {
+    with(shared::State::add_thread).expect("scheduler not initialized")
 }
 
 /// Give up the baton with `state` recorded for the calling thread, and
@@ -256,81 +437,243 @@ impl Sched {
 /// on quantum expiry, the blocked-on address for blocking calls.
 pub fn yield_baton(state: State, site: u64) {
     let Some(me) = my_id() else { return };
-    yield_baton_as(me, state, site);
+    yield_baton_as(me, state, site, None);
+}
+
+/// Block on `key` until woken or until the virtual clock reaches
+/// `deadline`. Returns true when the deadline ended the wait.
+pub fn block_until(key: u64, deadline: Option<u64>) -> bool {
+    let Some(me) = my_id() else { return false };
+    yield_baton_as(me, State::Blocked(key as usize), key, deadline);
+    with(|s, _| std::mem::take(&mut s.threads[me].timed_out)) == Some(true)
+}
+
+/// The virtual clock without advancing it, for computing deadlines
+pub fn now() -> u64 {
+    with(|s, _| s.clock_ns).unwrap_or(0)
+}
+
+/// The virtual clock as it stands, or None outside a run.
+pub fn peek_clock() -> Option<u64> {
+    with(|s, _| s.clock_ns)
+}
+
+/// A read of the virtual clock by the guest, or None outside a run.
+pub fn clock_read() -> Option<u64> {
+    with(|s, _| s.clock_read())
 }
 
 /// `yield_baton` for a caller that already knows its id (the teardown hook
 /// runs after libpthread has cleared the key value).
-pub fn yield_baton_as(me: usize, state: State, site: u64) {
-    let mut guard = SCHED.lock().unwrap();
-    let Some(s) = guard.as_mut() else { return };
-    debug_assert_eq!(s.current, me);
-    s.threads[me].state = state;
-    let Some(next) = s.pick() else {
-        if state == State::Exited {
-            return;
-        }
-        drop(guard);
-        crate::report::log("deadlock: every thread is blocked");
-        std::process::abort();
+pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>) {
+    let Some(sh) = shared() else { return };
+    settle_hooks();
+    let (st, key) = match state {
+        State::Runnable => (shared::T_RUNNABLE, 0),
+        State::Blocked(k) => (shared::T_BLOCKED, k as u64),
+        State::Exited => (shared::T_EXITED, 0),
     };
-    s.reset_counter();
-    if next == me {
-        s.threads[me].state = State::Running;
+    let mut s = sh.lock();
+    if s.current as usize != me {
+        // Guest code on a thread that does not hold the baton: a signal
+        // handler on a parked thread. It must not hand over what it lacks.
+        drop(s);
+        crate::report::log("a thread without the baton tried to yield (signal handler?); ignored");
         return;
     }
-    s.switches += 1;
-    crate::determinism::on_switch();
-    s.trace_hash = fnv(
-        fnv(fnv(fnv(s.trace_hash, me as u64), next as u64), s.issued),
-        site,
-    );
-    s.threads[next].state = State::Running;
-    s.current = next;
-    let next_sem = s.threads[next].sem;
-    let my_sem = s.threads[me].sem;
-    drop(guard);
-    unsafe { semaphore_signal(next_sem) };
-    if state != State::Exited {
-        park(my_sem);
+    s.threads[me].timed_out = false;
+    if st == shared::T_BLOCKED {
+        // An outside thread's wake is not serialized by the baton and may
+        // have come since the caller decided to block: let it look again.
+        let wakes = s.procs[pid() as usize].outside_wakes;
+        if std::mem::replace(&mut s.threads[me].wakes_seen, wakes) != wakes {
+            return;
+        }
+    }
+    // A deadline of 0 would mean none; one in the past expires at once
+    s.threads[me].deadline = deadline.map_or(0, |d| d.max(1));
+    match s.hand_off(Some((me, st, key)), site) {
+        Handoff::Idle => {
+            let stuck = state != State::Exited || s.any_alive();
+            drop(s);
+            if !stuck {
+                return;
+            }
+            let outside = has_outside_threads();
+            let anywhere = with(|s, pid| {
+                s.procs[pid as usize].has_outside_threads |= outside;
+                s.any_outside_threads()
+            }) == Some(true);
+            if !anywhere {
+                fatal("deadlock: every thread is blocked");
+            }
+            // A GCD worker may be about to wake one of us (a block finishing
+            // under dispatch_sync, a semaphore). Look again in real time;
+            // the virtual clock and the trace do not move meanwhile.
+            let began = std::time::Instant::now();
+            loop {
+                unsafe { libc::usleep(200) };
+                let mut s = sh.lock();
+                match s.choose(Some(me), site) {
+                    Handoff::Idle => {}
+                    Handoff::Stay => {
+                        let q = s.pending_quantum;
+                        drop(s);
+                        install_quantum(q);
+                        return;
+                    }
+                    Handoff::Switch { to, seen } => {
+                        let (issued, clock) = (s.issued, s.clock_ns);
+                        drop(s);
+                        trace_switch(me, to, issued, site, clock);
+                        sh.unpark(to);
+                        if state != State::Exited {
+                            sh.park(me, seen);
+                            install_quantum(sh.lock().pending_quantum);
+                        }
+                        return;
+                    }
+                }
+                drop(s);
+                if began.elapsed() > std::time::Duration::from_secs(30) {
+                    fatal("deadlock: every thread is blocked, and no outside thread woke one");
+                }
+            }
+        }
+        Handoff::Stay => {
+            let q = s.pending_quantum;
+            drop(s);
+            install_quantum(q);
+        }
+        Handoff::Switch { to, seen } => {
+            let issued = s.issued;
+            let clock = s.clock_ns;
+            drop(s);
+            trace_switch(me, to, issued, site, clock);
+            sh.unpark(to);
+            if state != State::Exited {
+                sh.park(me, seen);
+                install_quantum(sh.lock().pending_quantum);
+            }
+        }
     }
 }
 
-/// Park a freshly created thread until it is handed the baton.
+/// Park a freshly registered thread until it is handed the baton for the
+/// first time. Its park word is still zero: slots are never reused.
 pub fn wait_for_baton(id: usize) {
-    let sem = SCHED.lock().unwrap().as_ref().unwrap().threads[id].sem;
-    park(sem);
+    let Some(sh) = shared() else { return };
+    sh.park(id, 0);
+    install_quantum(sh.lock().pending_quantum);
+}
+
+/// `REWRITE_TRACE=file`: one line per switch, appended by whoever gives the
+/// baton away, so two runs can be compared switch by switch. The hash in
+/// the report covers the same four values.
+static TRACE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn open_trace() {
+    let Ok(path) = std::env::var("REWRITE_TRACE") else {
+        return;
+    };
+    let Ok(cpath) = std::ffi::CString::new(path) else {
+        return;
+    };
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            0o644,
+        )
+    };
+    // Out of the way of the guest's descriptor numbers
+    let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 200) };
+    unsafe { libc::close(fd) };
+    TRACE_FD.store(high, Ordering::Relaxed);
+}
+
+fn trace_switch(from: usize, to: usize, issued: u64, site: u64, clock: u64) {
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let mut line = String::new();
+    let _ = writeln!(
+        line,
+        "p{} t{from} -> t{to} issued={issued} site={site:#x} clock={clock}",
+        pid()
+    );
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
+}
+
+/// Switch sites of interposed calls in the schedule trace: far above any
+/// stub address, tagged with the kind of call.
+pub const SITE_IO: u64 = 0xF100_0000_0000_0000;
+pub const SITE_NET: u64 = 0xF200_0000_0000_0000;
+pub const SITE_WAIT: u64 = 0xF300_0000_0000_0000;
+pub const SITE_FILE: u64 = 0xF400_0000_0000_0000;
+
+/// An interposed I/O call counts as one hook event, like a stub: the
+/// quantum can expire at an I/O boundary. That puts switch points inside
+/// a read-modify-write on a file even when only branches are hooked.
+pub fn hook_event(site: u64) {
+    if my_id().is_none() {
+        return;
+    }
+    let Some(sh) = shared() else { return };
+    let expired = unsafe {
+        let counter = sh.counter();
+        *counter -= 1;
+        *counter == 0
+    };
+    if expired {
+        rewrite_yield_impl(site);
+    }
 }
 
 /// Called from the stub's expired path through the register-saving
 /// trampoline, with the guest's registers already preserved.
 #[no_mangle]
 pub extern "C" fn rewrite_yield_impl(stub_pc: u64) {
-    if let Some(s) = SCHED.lock().unwrap().as_mut() {
-        s.expiries += 1;
-    }
+    with(|s, _| s.expiries += 1);
     if my_id().is_some() {
         yield_baton(State::Runnable, stub_pc);
-    } else if let Some(s) = SCHED.lock().unwrap().as_mut() {
-        s.reset_counter();
+    } else if let Some(q) = with(|s, _| s.renew_quantum()) {
+        settle_hooks();
+        install_quantum(q);
     }
 }
 
 pub fn report(out: &mut String) {
-    let guard = SCHED.lock().unwrap();
     let _ = writeln!(out, "supervisor=loaded");
-    let Some(st) = guard.as_ref() else { return };
-    if let Some(page) = st.page {
-        let remaining = unsafe { page.counter().read() };
-        let _ = writeln!(out, "seed={}", page.seed());
-        let _ = writeln!(out, "sites={}", page.sites());
-        let _ = writeln!(out, "mem_sites={}", page.mem_sites());
-        let _ = writeln!(out, "hooks={}", st.issued as i64 - remaining);
+    if shared().is_none() {
+        return;
     }
-    let _ = writeln!(out, "threads={}", st.threads.len());
-    let _ = writeln!(out, "expiries={}", st.expiries);
-    let _ = writeln!(out, "switches={}", st.switches);
-    let _ = writeln!(out, "schedule_hash={:016x}", st.trace_hash);
+    settle_hooks();
+    if let Some(info) = *INFO.lock() {
+        let _ = writeln!(out, "seed={}", info.seed);
+        let _ = writeln!(out, "sites={}", info.sites);
+        let _ = writeln!(out, "mem_sites={}", info.mem_sites);
+        let _ = writeln!(out, "hooks={}", HOOKS.load(Ordering::Relaxed));
+    }
+    let (threads, expiries, switches, hash) =
+        with(|s, pid| (s.threads_of(pid), s.expiries, s.switches, s.trace_hash)).unwrap();
+    let _ = writeln!(out, "proc={}", pid());
+    let _ = writeln!(out, "threads={threads}");
+    let _ = writeln!(out, "expiries={expiries}");
+    let _ = writeln!(out, "switches={switches}");
+    let _ = writeln!(out, "schedule_hash={hash:016x}");
+    let _ = writeln!(out, "paths_refused={}", crate::hostfs::refused());
+    let _ = writeln!(
+        out,
+        "outside_wakes={}",
+        OUTSIDE_WAKES.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "io_waits={}",
+        crate::io::IO_WAITS.load(Ordering::Relaxed)
+    );
     for (name, c) in crate::interpose::COUNT_NAMES
         .iter()
         .zip(crate::interpose::COUNTS.iter())

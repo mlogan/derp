@@ -21,6 +21,19 @@ pub fn init(seed: u64) {
     *ENTROPY.lock() = Some(Rng::seed_from_u64(seed ^ 0x5EED_5EED_5EED_5EED));
 }
 
+/// The seeded stream is for scheduled threads. A GCD worker draws at a
+/// moment real time picks, which would shift every later draw.
+fn outside() -> bool {
+    !crate::sched::on_scheduled_thread()
+}
+
+/// In the child of a `fork`: its own stream (the real `arc4random` reseeds
+/// on fork too), and see `SpinLock::force_unlock`.
+pub fn forked(seed: u64) {
+    ENTROPY.force_unlock();
+    init(seed);
+}
+
 fn fill(buf: *mut u8, n: usize) {
     let mut guard = ENTROPY.lock();
     let rng = guard.get_or_insert_with(|| Rng::seed_from_u64(0));
@@ -33,7 +46,15 @@ fn fill(buf: *mut u8, n: usize) {
     }
 }
 
+// Outside the scheduler each call goes to its own real counterpart, never
+// to another entropy function: corecrypto's initialization calls
+// `getentropy`, and answering that with `arc4random_buf` re-enters
+// corecrypto inside its once-gate, which aborts the process at startup.
+
 pub extern "C" fn my_arc4random() -> u32 {
+    if outside() {
+        return unsafe { libc::arc4random() };
+    }
     let mut v = [0u8; 4];
     fill(v.as_mut_ptr(), 4);
     u32::from_le_bytes(v)
@@ -43,6 +64,9 @@ pub extern "C" fn my_arc4random_uniform(bound: u32) -> u32 {
     if bound < 2 {
         return 0;
     }
+    if outside() {
+        return unsafe { libc::arc4random_uniform(bound) };
+    }
     ENTROPY
         .lock()
         .get_or_insert_with(|| Rng::seed_from_u64(0))
@@ -50,10 +74,16 @@ pub extern "C" fn my_arc4random_uniform(bound: u32) -> u32 {
 }
 
 pub extern "C" fn my_arc4random_buf(buf: *mut c_void, n: usize) {
+    if outside() {
+        return unsafe { libc::arc4random_buf(buf, n) };
+    }
     fill(buf.cast(), n);
 }
 
 pub extern "C" fn my_getentropy(buf: *mut c_void, n: usize) -> c_int {
+    if outside() {
+        return unsafe { libc::getentropy(buf, n) };
+    }
     if n > 256 {
         unsafe { *libc::__error() = libc::EIO };
         return -1;
@@ -62,29 +92,41 @@ pub extern "C" fn my_getentropy(buf: *mut c_void, n: usize) -> c_int {
     0
 }
 
+extern "C" {
+    fn CCRandomGenerateBytes(buf: *mut c_void, n: usize) -> c_int;
+}
+
 pub extern "C" fn my_cc_random_generate_bytes(buf: *mut c_void, n: usize) -> c_int {
+    if outside() {
+        return unsafe { CCRandomGenerateBytes(buf, n) };
+    }
     fill(buf.cast(), n);
     0
 }
 
 // ---- virtual clock --------------------------------------------------------
 
-/// Nanoseconds of virtual time since process start. Every read advances it
-/// a little so busy-waits on the clock make progress; every thread switch
-/// advances it more.
-static TICKS: AtomicU64 = AtomicU64::new(0);
-const PER_READ_NS: u64 = 1_000;
-const PER_SWITCH_NS: u64 = 1_000_000;
+/// The clock is the run's, in the shared scheduler state, so every process
+/// sees one timeline. This local one only serves a process that is not in
+/// a run (passive mode).
+static LOCAL_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Fixed wall-clock epoch offset so `CLOCK_REALTIME` is repeatable too
-const REALTIME_BASE_NS: u64 = 1_800_000_000 * 1_000_000_000;
-const MONOTONIC_BASE_NS: u64 = 1_000_000_000;
-
-pub fn on_switch() {
-    TICKS.fetch_add(PER_SWITCH_NS, Ordering::Relaxed);
-}
+pub const REALTIME_BASE_NS: u64 = 1_800_000_000 * 1_000_000_000;
+pub const MONOTONIC_BASE_NS: u64 = 1_000_000_000;
 
 fn now_ns() -> u64 {
-    TICKS.fetch_add(PER_READ_NS, Ordering::Relaxed) + PER_READ_NS
+    // A thread the scheduler does not run (a GCD worker) sees the time but
+    // does not move it: when, and whether, it reads the clock depends on
+    // real time, and every read is a tick for everyone.
+    if !crate::sched::on_scheduled_thread() {
+        if let Some(now) = crate::sched::peek_clock() {
+            return now;
+        }
+    }
+    crate::sched::clock_read().unwrap_or_else(|| {
+        LOCAL_TICKS.fetch_add(crate::shared::PER_READ_NS, Ordering::Relaxed)
+            + crate::shared::PER_READ_NS
+    })
 }
 
 fn monotonic_ns() -> u64 {

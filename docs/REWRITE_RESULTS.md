@@ -33,6 +33,10 @@ segment load commands, 304 bytes, do not fit in a default header), no
 hardened runtime or library validation (so `DYLD_INSERT_LIBRARIES` is
 honoured).
 
+*Superseded by the multi-process work (2026-09-18):* `-headerpad` is no
+longer required and rewritten binaries no longer run without the dylib.
+See `README.md` for the current guest requirements.
+
 ### 2. What does hook overhead cost?
 
 `loops.c` at scale 3 (sieve of 60M, 900×900 matmul, fib(33)), best of

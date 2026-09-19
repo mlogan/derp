@@ -424,7 +424,22 @@ See `TASKS_PHASE{N}.md`.
 `supervisor/` run native arm64 Mach-O binaries under a
 deterministic baton scheduler. Plan in `IMPLEMENTATION_PLAN_REWRITE.md`,
 progress in `TASKS_REWRITE.md`, results in `docs/REWRITE_RESULTS.md`.
-Guests must link with `-Wl,-headerpad,0x1000`.
+
+**Multi-process runs** (branch `mlogan-multiproc`, plan complete): one
+scheduler in shared memory for several guests on virtual hosts, with
+virtual pids, pipe and lock readiness waits, a virtual network (stream and
+datagram sockets, `poll`/`select`/`kevent`), one virtual clock, and a fixed
+`--net-latency` as the seam for a network simulator.
+`rewrite run --manifest FILE`. Plan in `IMPLEMENTATION_PLAN_MULTIPROC.md`,
+progress and deviations in `TASKS_MULTIPROC.md`, results in
+`docs/MULTIPROC_RESULTS.md`, usage in `README.md`. Rewritten
+binaries need the supervisor dylib; default-linked guests work.
+
+**Run files, host directories, real programs** (same branch, complete): run
+files are YAML, every host gets a fresh directory per run that its path
+names are held to, and Homebrew's curl fetches from Python's `http.server`
+repeatably. Plan in `IMPLEMENTATION_PLAN_RUNFILE.md`, progress and findings
+in `TASKS_RUNFILE.md`.
 
 **Next Phase**: Not yet planned
 

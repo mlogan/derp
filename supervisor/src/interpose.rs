@@ -22,6 +22,16 @@ use crate::files::{
     my_flock, my_fsync, my_lseek, my_pread, my_pwrite, open_nocancel, rewrite_open_nocancel_shim,
     rewrite_open_shim, rewrite_openat_shim,
 };
+use crate::gcd as gcd_real;
+use crate::gcd::{
+    rewrite_dispatch_after_f_shim, rewrite_dispatch_after_shim, rewrite_dispatch_apply_f_shim,
+    rewrite_dispatch_apply_shim, rewrite_dispatch_async_f_shim, rewrite_dispatch_async_shim,
+    rewrite_dispatch_barrier_async_f_shim, rewrite_dispatch_barrier_async_shim,
+    rewrite_dispatch_group_async_f_shim, rewrite_dispatch_group_async_shim,
+    rewrite_dispatch_group_notify_f_shim, rewrite_dispatch_group_notify_shim,
+    rewrite_dispatch_io_create_shim, rewrite_dispatch_main_shim, rewrite_dispatch_read_shim,
+    rewrite_dispatch_source_create_shim, rewrite_dispatch_write_shim,
+};
 use crate::hostfs::{
     my_access, my_chdir, my_chmod, my_chown, my_creat, my_fstatat, my_link, my_lstat, my_mkdir,
     my_mkdirat, my_mkfifo, my_opendir, my_readlink, my_rename, my_rmdir, my_stat, my_symlink,
@@ -59,14 +69,14 @@ unsafe impl Sync for Interpose {}
 
 macro_rules! interposers {
     ($($new:ident => $old:path),* $(,)?) => {
+        // Counted without recursion: the table is past the recursion limit
+        const INTERPOSER_COUNT: usize = [$(stringify!($new)),*].len();
         #[used]
         #[link_section = "__DATA,__interpose"]
-        static INTERPOSERS: [Interpose; interposers!(@count $($new)*)] = [
+        static INTERPOSERS: [Interpose; INTERPOSER_COUNT] = [
             $(Interpose { new: $new as *const (), old: $old as *const () },)*
         ];
     };
-    (@count) => { 0 };
-    (@count $x:ident $($rest:ident)*) => { 1 + interposers!(@count $($rest)*) };
 }
 
 extern "C" {
@@ -661,6 +671,23 @@ interposers! {
     my_mkfifo => libc::mkfifo,
     my_creat => libc::creat,
     my_opendir => libc::opendir,
+    rewrite_dispatch_async_shim => gcd_real::dispatch_async,
+    rewrite_dispatch_async_f_shim => gcd_real::dispatch_async_f,
+    rewrite_dispatch_after_shim => gcd_real::dispatch_after,
+    rewrite_dispatch_after_f_shim => gcd_real::dispatch_after_f,
+    rewrite_dispatch_apply_shim => gcd_real::dispatch_apply,
+    rewrite_dispatch_apply_f_shim => gcd_real::dispatch_apply_f,
+    rewrite_dispatch_group_async_shim => gcd_real::dispatch_group_async,
+    rewrite_dispatch_group_async_f_shim => gcd_real::dispatch_group_async_f,
+    rewrite_dispatch_barrier_async_shim => gcd_real::dispatch_barrier_async,
+    rewrite_dispatch_barrier_async_f_shim => gcd_real::dispatch_barrier_async_f,
+    rewrite_dispatch_group_notify_shim => gcd_real::dispatch_group_notify,
+    rewrite_dispatch_group_notify_f_shim => gcd_real::dispatch_group_notify_f,
+    rewrite_dispatch_source_create_shim => gcd_real::dispatch_source_create,
+    rewrite_dispatch_main_shim => gcd_real::dispatch_main,
+    rewrite_dispatch_read_shim => gcd_real::dispatch_read,
+    rewrite_dispatch_write_shim => gcd_real::dispatch_write,
+    rewrite_dispatch_io_create_shim => gcd_real::dispatch_io_create,
     my_kevent => libc::kevent,
     my_poll => libc::poll,
     my_select => libc::select,

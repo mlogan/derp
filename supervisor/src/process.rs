@@ -384,6 +384,11 @@ unsafe fn wait_for_child(
     rusage: *mut libc::rusage,
 ) -> libc::pid_t {
     // Process groups are not modelled: any negative pid or 0 means any child
+    // A real pid is a child the scheduler does not know (a system library
+    // waiting for a helper it started): the real call is the right one.
+    if vpid > 0 && !shared::is_virtual_pid(vpid) {
+        return libc::wait4(vpid, status, options, rusage);
+    }
     let which = if vpid > 0 {
         match proc_of(vpid) {
             Some(p) => Some(p),
@@ -463,7 +468,7 @@ extern "C" {
 /// hand `getpid()` to the kernel (unified logging asks `proc_pidinfo` about
 /// it while CoreFoundation initializes, and crashes on an error), so they
 /// must see the real one.
-fn in_system_library(address: usize) -> bool {
+pub fn in_system_library(address: usize) -> bool {
     static RANGE: SpinLock<Option<(usize, usize)>> = SpinLock::new(None);
     let mut range = RANGE.lock();
     let (start, len) = *range.get_or_insert_with(|| {
@@ -514,9 +519,11 @@ std::arch::global_asm!(
 );
 
 pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
-    let target = if in_run() { proc_of(vpid) } else { None };
-    let Some(target) = target else {
+    if !in_run() || !shared::is_virtual_pid(vpid) {
         return libc::kill(vpid, sig);
+    }
+    let Some(target) = proc_of(vpid) else {
+        return set_errno(libc::ESRCH);
     };
     let known = sched::with(|s, _| {
         let p = &s.procs[target as usize];

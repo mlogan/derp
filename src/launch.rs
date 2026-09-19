@@ -529,16 +529,20 @@ fn kill_all(procs: &mut [Tracked]) {
 /// `dev:ino` of the pipes and sockets among our own standard descriptors.
 /// Their other end is outside the run, so guests must block on them for
 /// real instead of waiting for another guest to make them ready.
+///
+/// Always three entries of the same width, whatever our descriptors are:
+/// the variable's length must not differ between runs (see the shared file's
+/// name in `coord.rs`). An entry of zeros matches nothing.
 fn external_objects() -> String {
     let mut out = Vec::new();
     for fd in 0..3 {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &raw mut st) } != 0 {
-            continue;
-        }
+        let known = unsafe { libc::fstat(fd, &raw mut st) } == 0;
         let kind = st.st_mode & libc::S_IFMT;
-        if kind == libc::S_IFIFO || kind == libc::S_IFSOCK {
-            out.push(format!("{}:{}", st.st_dev, st.st_ino));
+        if known && (kind == libc::S_IFIFO || kind == libc::S_IFSOCK) {
+            out.push(format!("{:011}:{:020}", st.st_dev, st.st_ino));
+        } else {
+            out.push(format!("{:011}:{:020}", 0, 0));
         }
     }
     out.join(",")

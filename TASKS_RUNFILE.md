@@ -106,9 +106,55 @@ Not needed, as it turned out: `EINPROGRESS` for non-blocking `connect`
 `--bind 0.0.0.0`; without it `http.server` asks the real resolver for a
 wildcard address and may bind a kernel IPv6 socket).
 
+## 4. Virtual pids from 100,000; GCD in guests is refused ✅ (2026-09-19)
+
+- **`VPID_BASE` is 100,000.** Real pids on macOS never exceed 99,999, so a
+  pid at or above the base is ours and anything below is the kernel's,
+  whoever asks. `kill` and the `wait` family pass real pids through to the
+  real calls (before, any pid in 1000..1255 was taken for a guest, a range
+  real processes live in). A virtual pid that leaks into an untranslated
+  kernel call now fails with "no such process" instead of naming a
+  stranger. `getpid`/`getppid` still need the caller test. Not closed: a
+  system API that returns the real pid to the guest
+  (`NSProcessInfo.processIdentifier`).
+- **`gcd.rs`: a guest that submits work to GCD exits with status 69** and
+  `dispatch_async_f: Grand Central Dispatch is not supported; its worker
+  threads run outside the scheduler`. Covered: `dispatch_async(_f)`,
+  `dispatch_after(_f)`, `dispatch_apply(_f)`, `dispatch_group_async(_f)`,
+  `dispatch_group_notify(_f)`, `dispatch_barrier_async(_f)`,
+  `dispatch_source_create`, `dispatch_main`, `dispatch_read`,
+  `dispatch_write`, `dispatch_io_create`. Only the guest's own code is
+  held to it (caller outside the dyld shared cache): system libraries use
+  GCD internally all the time, and refusing that would refuse curl.
+  `dispatch_sync` and the semaphore calls stay available. Not covered:
+  Swift concurrency, whose runtime is a system library.
+- Each entry point has an assembly shim that saves the argument registers,
+  hands the return address to the check, and branches into the real
+  function. The interposer table passed 128 entries, so its length is now
+  counted without macro recursion.
+
+Found while re-running the curl/Python test next to the others (1 run in
+15 to 30 differed, only under load):
+
+- **The guest's stack moved by 16 bytes between runs.** The kernel puts the
+  environment at the top of the stack, and two variables of ours had a
+  varying length: the shared-state path (launcher pid) and the list of the
+  launcher's own pipes (inode numbers). Both are fixed-width now. A switch
+  site that was a stack address made this visible in the hash; the
+  schedule itself was the same. The user's own environment has the same
+  effect if it differs between runs.
+- **Threads outside the scheduler no longer use the deterministic heap**
+  (their allocations interleave in real time) and **no longer advance the
+  virtual clock** when they read it (one run in sixty was one tick behind
+  from the first switch on).
+- `REWRITE_TRACE=file` writes one line per switch (from, to, issued, site,
+  clock); diffing two traces is how both of the above were found.
+  `p<i>.outside_wakes` counts scheduled threads woken by outside threads.
+- After these: 80 of 80 traces byte-identical under 8 busy-loop processes.
+
 ## Test summary
 
-`cargo test -p rewrite -p rewrite-supervisor`: all pass (25 + 4 + 19 + 3 + 4
+`cargo test -p rewrite -p rewrite-supervisor`: all pass (25 + 4 + 20 + 3 + 4
 in `rewrite`, 20 unit tests in the supervisor); clippy clean.
 
 ## Follow-ups
@@ -118,6 +164,4 @@ in `rewrite`, 20 unit tests in the supervisor); clippy clean.
   dispatch queues would not be deterministic. Interposing
   `dispatch_async` and friends to run blocks on scheduled threads is the
   way in.
-- `kill`, `waitpid` and other pid-taking calls from system libraries still
-  see virtual pids; only `getpid`/`getppid` look at their caller.
 - `allow:` is for the whole run; a per-host list would be easy.

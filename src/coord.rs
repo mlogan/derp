@@ -48,8 +48,11 @@ static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
 
 impl Coordinator {
     pub fn create(seed: u64, quantum: (u32, u32)) -> io::Result<Self> {
+        // Fixed width: the guest's environment sits at the top of its stack,
+        // so a name that is a digit longer in one run moves every stack
+        // address the guest sees.
         let path = std::env::temp_dir().join(format!(
-            "rewrite-shm-{}-{}",
+            "rewrite-shm-{:010}-{:06}",
             std::process::id(),
             NEXT_FILE.fetch_add(1, Ordering::Relaxed)
         ));

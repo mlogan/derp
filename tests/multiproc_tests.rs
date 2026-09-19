@@ -173,9 +173,9 @@ fn spawned_forked_and_execed_children_join_the_schedule() {
     let mut orders = Vec::new();
     for seed in 1..=4u64 {
         let (lines, hash) = run_spawn_tree(&manifest, &scratch, seed);
-        assert_eq!(lines[0], "parent pid=1000 ppid=1", "seed {seed}");
+        assert_eq!(lines[0], "parent pid=100000 ppid=1", "seed {seed}");
         assert!(
-            lines.contains(&"spawned 1001 1002 1003 1004".to_string()),
+            lines.contains(&"spawned 100001 100002 100003 100004".to_string()),
             "{lines:?}"
         );
         assert_eq!(
@@ -187,12 +187,12 @@ fn spawned_forked_and_execed_children_join_the_schedule() {
         let children: Vec<&String> = sorted.iter().filter(|l| l.starts_with("child")).collect();
         assert_eq!(children.len(), 4, "{lines:?}");
         for (i, line) in children.iter().enumerate() {
-            let expect = format!("child {i} pid={} ppid=1000 sum=", 1001 + i);
+            let expect = format!("child {i} pid={} ppid=100000 sum=", 100_001 + i);
             assert!(line.starts_with(&expect), "{line}");
         }
         let reaped: Vec<&String> = sorted.iter().filter(|l| l.starts_with("reaped")).collect();
         let expect: Vec<String> = (0..4)
-            .map(|i| format!("reaped {} exit={}", 1001 + i, 10 + i))
+            .map(|i| format!("reaped {} exit={}", 100_001 + i, 10 + i))
             .collect();
         assert_eq!(
             reaped.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
@@ -200,7 +200,7 @@ fn spawned_forked_and_execed_children_join_the_schedule() {
         );
         // The first reap names a pid, so it is child 1 whatever the schedule
         let first = lines.iter().find(|l| l.starts_with("reaped")).unwrap();
-        assert_eq!(first, "reaped 1002 exit=11");
+        assert_eq!(first, "reaped 100002 exit=11");
 
         let (again, hash2) = run_spawn_tree(&manifest, &scratch, seed);
         assert_eq!(
@@ -417,8 +417,8 @@ fn two_hosts_share_a_port_and_loopback_stays_home() {
     let scratch = dir.join("scratch");
     for seed in 1..=3u64 {
         let r = run_manifest(&manifest, &scratch, seed, 3);
-        assert_eq!(r.stdout[0], "child of 1000 runs on red\n", "seed {seed}");
-        assert_eq!(r.stdout[1], "child of 1001 runs on blue\n", "seed {seed}");
+        assert_eq!(r.stdout[0], "child of 100000 runs on red\n", "seed {seed}");
+        assert_eq!(r.stdout[1], "child of 100001 runs on blue\n", "seed {seed}");
         assert_eq!(
             r.stdout[2],
             "client on green\n\
@@ -980,4 +980,44 @@ fn curl_fetches_pages_from_python_web_servers_on_two_hosts() {
     }
     hashes.dedup();
     assert!(hashes.len() > 1, "every seed produced the same schedule");
+}
+
+#[test]
+fn a_guest_that_uses_gcd_is_turned_away() {
+    let dir = common::scratch_dir("multiproc_gcd");
+    common::build_c("gcd_user", &dir, &[]);
+    let scratch = dir.join("scratch");
+    common::supervisor_dylib();
+    let run = |mode: &str| {
+        let manifest = dir.join(format!("{mode}.yaml"));
+        std::fs::write(
+            &manifest,
+            format!("hosts:\n  - name: a\n    processes:\n      - gcd_user {mode}\n"),
+        )
+        .unwrap();
+        let out = Command::new(common::rewrite_bin())
+            .args(["run", "--capture", "--seed", "1", "--scratch"])
+            .arg(&scratch)
+            .arg("--manifest")
+            .arg(&manifest)
+            .output()
+            .unwrap();
+        let stdout = std::fs::read_to_string(scratch.join("stdout.0")).unwrap();
+        (
+            out.status.code(),
+            stdout,
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let (code, stdout, stderr) = run("async");
+    assert_eq!(code, Some(69), "{stderr}");
+    assert_eq!(stdout, "about to use dispatch_async_f\n");
+    assert!(
+        stderr.contains("dispatch_async_f: Grand Central Dispatch is not supported"),
+        "{stderr}"
+    );
+    // Work that stays on the calling thread is fine
+    let (code, stdout, stderr) = run("sync");
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stdout, "block ran: sync\ndone\n");
 }

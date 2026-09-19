@@ -154,7 +154,8 @@ Overhead on `loops 3` today (release build):
   launcher has seen a child die, then a real `wait4` on the zombie.
   `WNOHANG` works. Process groups are not modelled (pid 0 or negative
   means any child).
-- Virtual pids are `1000 + index`; the launcher is pid 1 to guests.
+- Virtual pids were `1000 + index`, later moved to `100000 + index`, above
+  any real pid (see `TASKS_RUNFILE.md`); the launcher is pid 1 to guests.
   `kill` with SIGTERM/SIGKILL retires the target's threads under the lock
   before sending, so the baton cannot go to a dead thread; other signals
   to other guests are logged and dropped.
@@ -164,7 +165,7 @@ Overhead on `loops 3` today (release build):
   through a rename.
 - A manifest run's exit status reflects the manifest's own processes only.
 - Test: `spawn_tree.c` (two `posix_spawn`, one `fork`+`execve`, one plain
-  `fork`, reaped by pid and with `wait`). Pids 1000-1004, line order
+  `fork`, reaped by pid and with `wait`). Pids in spawn order, line order
   differs across seeds, 100 identical runs at seed 3.
 
 ## Day 4 — Readiness waits for pipes ✅

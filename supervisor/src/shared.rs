@@ -58,9 +58,13 @@ pub const HOST_ROOT_VAR: &str = "REWRITE_HOST_ROOT";
 pub const ALLOW_VAR: &str = "REWRITE_ALLOW";
 /// `ProcRec::parent` of the processes the launcher started
 pub const NO_PROC: u32 = u32::MAX;
-/// First virtual pid; process `i` of the run is `VPID_BASE + i`. The
-/// launcher appears to guests as pid 1.
-pub const VPID_BASE: i32 = 1000;
+/// First virtual pid; process `i` of the run is `VPID_BASE + i`. Real pids
+/// on macOS never exceed 99,999, so the two ranges cannot collide: a pid at
+/// or above this is ours and anything below is the kernel's, whoever asks.
+/// A virtual pid that leaks into an untranslated kernel call fails with
+/// "no such process" instead of naming a stranger. The launcher appears to
+/// guests as pid 1.
+pub const VPID_BASE: i32 = 100_000;
 
 /// The run's one launcher socket, inherited by every guest at this
 /// descriptor: high enough that guest code does not pick it for `dup2`,
@@ -77,8 +81,13 @@ pub fn vpid_of(proc_index: u32) -> i32 {
     VPID_BASE + proc_index as i32
 }
 
+/// The process a virtual pid names; None for a real pid.
 pub fn proc_of(vpid: i32) -> Option<u32> {
     (vpid >= VPID_BASE && vpid < VPID_BASE + MAX_PROCS as i32).then(|| (vpid - VPID_BASE) as u32)
+}
+
+pub fn is_virtual_pid(pid: i32) -> bool {
+    pid >= VPID_BASE
 }
 
 pub const PER_READ_NS: u64 = 1_000;

@@ -78,6 +78,14 @@ pub const REALTIME_BASE_NS: u64 = 1_800_000_000 * 1_000_000_000;
 pub const MONOTONIC_BASE_NS: u64 = 1_000_000_000;
 
 fn now_ns() -> u64 {
+    // A thread the scheduler does not run (a GCD worker) sees the time but
+    // does not move it: when, and whether, it reads the clock depends on
+    // real time, and every read is a tick for everyone.
+    if !crate::sched::on_scheduled_thread() {
+        if let Some(now) = crate::sched::peek_clock() {
+            return now;
+        }
+    }
     crate::sched::clock_read().unwrap_or_else(|| {
         LOCAL_TICKS.fetch_add(crate::shared::PER_READ_NS, Ordering::Relaxed)
             + crate::shared::PER_READ_NS

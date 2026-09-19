@@ -26,6 +26,9 @@ Options worth knowing:
 - `--capture` writes each guest's stdout to `stdout.<index>` in the
   `--scratch` directory. The report goes to stderr: `run.*` totals, then
   `p<index>.*` per process.
+- `REWRITE_TRACE=file` appends one line per baton switch (from, to, hook
+  events issued, site, virtual clock). Diff two of them to find where two
+  runs part ways; the schedule hash covers the same values.
 - `REWRITE_PARK_SPINS=N` makes a parking thread spin first. It only helps
   when the baton bounces back within microseconds; off by default.
 
@@ -98,7 +101,13 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   repeatably (see `TASKS_RUNFILE.md`). Rewritten copies of installed
   programs go to `$TMPDIR/rewrite-cache/`, not next to the program.
 - Threads the guest makes with `pthread_create` are scheduled. GCD worker
-  threads are not: what they do is outside the schedule.
+  threads are not, so **a guest may not submit work to Grand Central
+  Dispatch**: `dispatch_async`, `dispatch_after`, `dispatch_apply`, dispatch
+  groups, sources and I/O end the run with exit status 69 and a message
+  naming the call. `dispatch_sync` and dispatch semaphores are fine. System
+  libraries may use GCD internally; what they do there is input.
+- Guests see virtual pids from 100,000 up (above any real pid), in spawn
+  order; the launcher is pid 1.
 
 ## Rewritten binaries only run under the supervisor
 

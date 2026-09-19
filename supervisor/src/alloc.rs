@@ -12,6 +12,7 @@ use std::ffi::c_void;
 use crate::spin::SpinLock;
 
 extern "C" {
+    fn valloc(size: usize) -> *mut c_void;
     static mach_task_self_: u32;
     fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: i32) -> i32;
 }
@@ -228,11 +229,24 @@ fn in_region(p: *mut c_void) -> bool {
     HEAP.lock().contains(p as usize)
 }
 
+/// The deterministic heap is for the threads the scheduler runs. A GCD
+/// worker allocates whenever real time has it running; sharing the heap
+/// would make every address after that depend on the interleaving.
+fn deterministic() -> bool {
+    crate::sched::on_scheduled_thread()
+}
+
 pub extern "C" fn my_malloc(size: usize) -> *mut c_void {
+    if !deterministic() {
+        return unsafe { libc::malloc(size) };
+    }
     HEAP.lock().alloc(size, 16)
 }
 
 pub extern "C" fn my_calloc(n: usize, size: usize) -> *mut c_void {
+    if !deterministic() {
+        return unsafe { libc::calloc(n, size) };
+    }
     let Some(total) = n.checked_mul(size) else {
         return std::ptr::null_mut();
     };
@@ -280,6 +294,9 @@ pub extern "C" fn my_posix_memalign(
     align: usize,
     size: usize,
 ) -> libc::c_int {
+    if !deterministic() {
+        return unsafe { libc::posix_memalign(out, align, size) };
+    }
     if !align.is_power_of_two() || align < std::mem::size_of::<usize>() {
         return libc::EINVAL;
     }
@@ -292,6 +309,9 @@ pub extern "C" fn my_posix_memalign(
 }
 
 pub extern "C" fn my_aligned_alloc(align: usize, size: usize) -> *mut c_void {
+    if !deterministic() {
+        return unsafe { libc::aligned_alloc(align, size) };
+    }
     if !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
@@ -299,6 +319,9 @@ pub extern "C" fn my_aligned_alloc(align: usize, size: usize) -> *mut c_void {
 }
 
 pub extern "C" fn my_valloc(size: usize) -> *mut c_void {
+    if !deterministic() {
+        return unsafe { valloc(size) };
+    }
     HEAP.lock().alloc(size, PAGE)
 }
 

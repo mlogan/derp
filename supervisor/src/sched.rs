@@ -90,6 +90,13 @@ pub fn my_id() -> Option<usize> {
     (v != 0).then(|| v - 1)
 }
 
+/// `my_id().is_some()` for the allocator, which must not touch a Rust
+/// thread-local: dyld allocates those with `malloc`.
+pub fn on_scheduled_thread() -> bool {
+    let key = ID_KEY.load(Ordering::Relaxed);
+    key != usize::MAX && !unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) }.is_null()
+}
+
 pub fn set_my_id(id: usize) {
     let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
     unsafe { libc::pthread_setspecific(key, (id + 1) as *const c_void) };
@@ -153,8 +160,17 @@ pub fn with<R>(f: impl FnOnce(&mut shared::State, u32) -> R) -> Option<R> {
 /// Make every thread of this process blocked on `addr` runnable; returns
 /// how many there were. Safe from a thread the scheduler does not run.
 pub fn wake_all(addr: usize) -> usize {
-    with(|s, pid| s.wake_all(pid, addr as u64)).unwrap_or(0)
+    let woken = with(|s, pid| s.wake_all(pid, addr as u64)).unwrap_or(0);
+    if woken > 0 && my_id().is_none() {
+        OUTSIDE_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
+    }
+    woken
 }
+
+/// Scheduled threads made runnable by a thread the scheduler does not run.
+/// When that happens depends on real time, so a run where this is not zero
+/// had its schedule influenced from outside.
+pub static OUTSIDE_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 extern "C" {
     fn rewrite_scheduler_yield();
@@ -312,6 +328,7 @@ const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
 /// launcher), then park the main thread until it is handed the baton.
 pub fn init(info: Option<Info>, cfg: &Config) {
     *INFO.lock() = info;
+    open_trace();
     if let Some(spins) = std::env::var("REWRITE_PARK_SPINS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -406,6 +423,11 @@ pub fn now() -> u64 {
     with(|s, _| s.clock_ns).unwrap_or(0)
 }
 
+/// The virtual clock as it stands, or None outside a run.
+pub fn peek_clock() -> Option<u64> {
+    with(|s, _| s.clock_ns)
+}
+
 /// A read of the virtual clock by the guest, or None outside a run.
 pub fn clock_read() -> Option<u64> {
     with(|s, _| s.clock_read())
@@ -471,7 +493,10 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
             install_quantum(q);
         }
         Handoff::Switch { to, seen } => {
+            let issued = s.issued;
+            let clock = s.clock_ns;
             drop(s);
+            trace_switch(me, to, issued, site, clock);
             sh.unpark(to);
             if state != State::Exited {
                 sh.park(me, seen);
@@ -487,6 +512,45 @@ pub fn wait_for_baton(id: usize) {
     let Some(sh) = shared() else { return };
     sh.park(id, 0);
     install_quantum(sh.lock().pending_quantum);
+}
+
+/// `REWRITE_TRACE=file`: one line per switch, appended by whoever gives the
+/// baton away, so two runs can be compared switch by switch. The hash in
+/// the report covers the same four values.
+static TRACE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+fn open_trace() {
+    let Ok(path) = std::env::var("REWRITE_TRACE") else {
+        return;
+    };
+    let Ok(cpath) = std::ffi::CString::new(path) else {
+        return;
+    };
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            0o644,
+        )
+    };
+    // Out of the way of the guest's descriptor numbers
+    let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 200) };
+    unsafe { libc::close(fd) };
+    TRACE_FD.store(high, Ordering::Relaxed);
+}
+
+fn trace_switch(from: usize, to: usize, issued: u64, site: u64, clock: u64) {
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let mut line = String::new();
+    let _ = writeln!(
+        line,
+        "p{} t{from} -> t{to} issued={issued} site={site:#x} clock={clock}",
+        pid()
+    );
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
 }
 
 /// Switch sites of interposed calls in the schedule trace: far above any
@@ -547,6 +611,11 @@ pub fn report(out: &mut String) {
     let _ = writeln!(out, "switches={switches}");
     let _ = writeln!(out, "schedule_hash={hash:016x}");
     let _ = writeln!(out, "paths_refused={}", crate::hostfs::refused());
+    let _ = writeln!(
+        out,
+        "outside_wakes={}",
+        OUTSIDE_WAKES.load(Ordering::Relaxed)
+    );
     let _ = writeln!(
         out,
         "io_waits={}",

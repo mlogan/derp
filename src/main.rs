@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use rewrite::cache::{cached_rewrite, read_macho, rewrite_file, write_exe, Fallible};
 use rewrite::launch::{self, Guest, Launch, Run, RunOutcome};
-use rewrite::manifest;
+use rewrite::manifest::{self, parse_duration_ns};
 use rewrite::rewrite::{self as rw, Options};
 
 const USAGE: &str = "\
@@ -71,19 +71,6 @@ struct Cli {
     native: bool,
     runs: u32,
     rest: Vec<OsString>,
-}
-
-/// `5ms`, `250us`, `10ns`, `1s`; a bare number is milliseconds.
-fn parse_duration_ns(s: &str) -> Option<u64> {
-    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
-    let scale = match &s[digits.len()..] {
-        "ns" => 1,
-        "us" => 1_000,
-        "" | "ms" => 1_000_000,
-        "s" => 1_000_000_000,
-        _ => return None,
-    };
-    digits.parse::<u64>().ok()?.checked_mul(scale)
 }
 
 fn parse_quantum(v: &str) -> Result<(u32, u32), String> {
@@ -330,6 +317,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
                 stdout: capture.then(|| stdout_file(&scratch, i)),
                 cwd: Some(root.clone()),
                 daemon: p.daemon,
+                faults: p.faults,
             }
         })
         .collect();
@@ -345,7 +333,21 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
     };
+    let has_faults = run
+        .guests
+        .iter()
+        .any(|g| g.faults.restart != rewrite::shared::RESTART_NEVER || g.faults.crash_hi_ns != 0);
+    if has_faults && (run.passive || run.dylib.is_none()) {
+        return Err("crash and restart settings need the supervisor".into());
+    }
     let outcome = launch::launch_run(&run)?;
+    if outcome.totals.restarts_refused > 0 {
+        return Err(format!(
+            "the run's process table is full: {} restarts were not made",
+            outcome.totals.restarts_refused
+        )
+        .into());
+    }
     if outcome.deadlock {
         return Err("deadlock: every guest thread was blocked; the run was killed".into());
     }
@@ -367,8 +369,14 @@ fn print_run_report(o: &RunOutcome) {
     eprintln!("run.net_dropped={}", o.totals.net_dropped);
     eprintln!("run.net_bytes={}", o.totals.net_bytes);
     eprintln!("run.net_passthrough={}", o.totals.net_passthrough);
+    eprintln!("run.crashes_injected={}", o.totals.crashes_injected);
+    eprintln!("run.restarts={}", o.totals.restarts);
     for (i, g) in o.guests.iter().enumerate() {
         eprintln!("p{i}.status={}", describe_status(g));
+        // Lives of one run-file entry share its number
+        if let Some(entry) = o.specs[i] {
+            eprintln!("p{i}.entry={entry}");
+        }
         for (k, v) in &g.report.fields {
             if !RUN_WIDE.contains(&k.as_str()) {
                 eprintln!("p{i}.{k}={v}");
@@ -385,15 +393,19 @@ fn describe_status(o: &launch::Outcome) -> String {
     }
 }
 
-/// Exit status of a manifest run: the first of the manifest's own
-/// processes that did not exit 0. What their children return is their
-/// business, and daemons are killed by design.
+/// Exit status of a manifest run: the first of the run file's entries
+/// whose last life did not exit 0. Earlier lives that crashed and were
+/// restarted do not count, what children return is their parents' business,
+/// and daemons are killed by design.
 fn exit_from_run(o: &RunOutcome) -> ExitCode {
-    o.guests[..o.initial]
-        .iter()
-        .zip(&o.daemons)
-        .find(|(g, &daemon)| !daemon && g.exit_code() != Some(0))
-        .map_or(ExitCode::SUCCESS, |(g, _)| exit_from(g))
+    (0..o.initial)
+        .filter(|&entry| !o.daemons[entry])
+        .filter_map(|entry| {
+            let last = o.specs.iter().rposition(|&s| s == Some(entry))?;
+            Some(&o.guests[last])
+        })
+        .find(|g| g.exit_code() != Some(0))
+        .map_or(ExitCode::SUCCESS, exit_from)
 }
 
 fn exit_from(outcome: &launch::Outcome) -> ExitCode {

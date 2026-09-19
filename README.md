@@ -63,6 +63,35 @@ named variables on purpose. Otherwise a proxy setting or a locale would be
 an input nobody wrote down, and the environment's length even decides where
 a guest's stack starts. Single-program `rewrite run prog` still inherits.
 
+A process written as a map can be crashed on purpose and restarted:
+
+```yaml
+      - argv: [server, --port, 7000]
+        daemon: true
+        restart: on-failure      # never (default) | on-failure | always
+        restart-delay: 50ms..150ms   # how long it stays down (default 100ms)
+        max-restarts: 10         # default: no limit
+        crash:
+          every: 100ms..300ms    # into each life
+          times: 3               # default: no limit
+```
+
+All times are virtual and drawn from the seed, so a seed crashes the same
+process at the same point of the same schedule every time. A crashed
+process is down for its restart delay (connections to it are refused),
+then comes back as a new process on the same host, with a new pid and the
+same host directory; what it needs to remember it has to have written
+there. Its captured stdout continues in the same file. `on-failure` means a
+signal or a non-zero exit. The run's exit status is that of each entry's
+last life. The report counts `run.crashes_injected` and `run.restarts`,
+and `p<i>.entry` says which run-file entry process `i` was a life of.
+
+`restart-delay` may not be zero, and it and `max-restarts` need a restart
+policy. Only run-file entries are restarted, not a guest's own children. A
+guest that `kill`s a restartable process causes a restart like any other
+death. These keys need the supervisor (no `--native`, `--no-supervisor`),
+and a run holds 1024 processes, each life counting as one.
+
 A process written as a map may also say `daemon: true`: a server that never
 exits. When every other process of the run file has exited, the launcher
 kills what is left and the run is over.

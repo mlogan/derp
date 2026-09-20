@@ -60,6 +60,7 @@ use crate::process::{
 use crate::process::{rewrite_getpid_shim, rewrite_getppid_shim};
 use crate::sched::{self, my_id, State};
 use crate::shared;
+use crate::signals::{my_sigaction, my_signal};
 
 #[repr(C)]
 struct Interpose {
@@ -167,8 +168,13 @@ extern "C" fn trampoline(p: *mut c_void) -> *mut c_void {
 pub extern "C" fn thread_teardown(value: *mut c_void) {
     let id = value as usize - 1;
     count(C_EXIT);
-    sched::forget_thread();
+    // libpthread cleared our key before calling us. The join wake is still
+    // this scheduled thread's, made with the baton: it must not count as a
+    // wake from outside the schedule. After it, the thread is outside.
+    sched::set_identity(Some(id));
     sched::wake_all(join_key(id));
+    sched::set_identity(None);
+    sched::forget_thread();
     sched::yield_baton_as(id, State::Exited, 0, None);
 }
 
@@ -422,9 +428,52 @@ fn ulock_is_unfair(op: u32) -> bool {
 /// owner is a thread the scheduler does not run, yielding gets nowhere and
 /// burns virtual time at a rate that depends on real time: the wait has to
 /// be the real one, which that thread's unlock will end.
-fn unfair_owner_is_outside(value: u64) -> bool {
+fn unfair_owner(value: u64) -> Option<usize> {
     let owner = (value as u32) & !3;
-    owner != 0 && !sched::is_scheduled_thread(owner) && !sched::is_scheduled_thread(owner | 3)
+    if owner == 0 {
+        return None;
+    }
+    sched::scheduled_thread(owner).or_else(|| sched::scheduled_thread(owner | 3))
+}
+
+/// A contended unfair lock. Who holds it decides what the wait is:
+/// - a thread outside the schedule: the kernel's wait, which its unlock ends;
+/// - one of ours that is parked: it holds the lock until it runs again, so
+///   the baton goes on;
+/// - one of ours that is running in real time without the baton (starting
+///   up, or between a hand-off and its park, inside the system libraries):
+///   it lets go by itself in a moment. Whether we caught it holding the
+///   lock is real-time luck and must not show in the schedule, so that is
+///   waited out in the kernel as well.
+fn unfair_wait(op: u32, addr: *mut c_void, value: u64, real: impl Fn() -> c_int) -> c_int {
+    const LOOK_AGAIN_NS: u64 = 1_000_000;
+    let wide = ulock_is_wide(op);
+    // Only the baton holder's waits are the schedule's business. Another of
+    // our threads gets here from the system libraries (the allocator's own
+    // lock, say) while it starts up or after it has handed the baton on.
+    if !sched::baton_is_mine() {
+        return real();
+    }
+    loop {
+        match unfair_owner(value) {
+            None => return real(),
+            Some(owner) if sched::is_parked(owner) => {
+                // Looked at in this order: it may have let go and parked
+                // since the caller read the lock word, but parked it cannot
+                // let go, so a word that still names it is a lock it holds
+                if value_matches(addr, value, wide) {
+                    sched::yield_baton(State::Runnable, 0);
+                }
+                return 0;
+            }
+            Some(_) => {
+                unsafe { __ulock_wait2(op, addr, value, LOOK_AGAIN_NS, 0) };
+                if !value_matches(addr, value, wide) {
+                    return 0;
+                }
+            }
+        }
+    }
 }
 
 extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int {
@@ -436,11 +485,9 @@ extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: 
         return 0;
     }
     if ulock_is_unfair(op) {
-        if unfair_owner_is_outside(value) {
-            return unsafe { __ulock_wait(op, addr, value, timeout_us) };
-        }
-        sched::yield_baton(State::Runnable, 0);
-        return 0;
+        return unfair_wait(op, addr, value, || unsafe {
+            __ulock_wait(op, addr, value, timeout_us)
+        });
     }
     if futex_block(addr, u64::from(timeout_us) * 1000) {
         0
@@ -464,11 +511,9 @@ extern "C" fn my_ulock_wait2(
         return 0;
     }
     if ulock_is_unfair(op) {
-        if unfair_owner_is_outside(value) {
-            return unsafe { __ulock_wait2(op, addr, value, timeout_ns, value2) };
-        }
-        sched::yield_baton(State::Runnable, 0);
-        return 0;
+        return unfair_wait(op, addr, value, || unsafe {
+            __ulock_wait2(op, addr, value, timeout_ns, value2)
+        });
     }
     if futex_block(addr, timeout_ns) {
         0
@@ -709,6 +754,8 @@ interposers! {
     rewrite_getpid_shim => libc::getpid,
     rewrite_getppid_shim => libc::getppid,
     my_kill => libc::kill,
+    my_sigaction => libc::sigaction,
+    my_signal => libc::signal,
     my_read => libc::read,
     my_read_nocancel => read_nocancel,
     my_readv => libc::readv,

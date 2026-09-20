@@ -101,13 +101,13 @@ pub fn set_my_id(id: usize) {
     let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
     unsafe { libc::pthread_setspecific(key, (id + 1) as *const c_void) };
     let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
-    PORTS.lock().push(port);
+    PORTS.lock().push((port, id));
 }
 
 /// Mach ports of the threads the scheduler runs in this process. The rest
 /// (GCD workers, which the kernel creates without `pthread_create`) run
 /// outside the baton; what they do is input, like the clock once was.
-static PORTS: SpinLock<Vec<u32>> = SpinLock::new(Vec::new());
+static PORTS: SpinLock<Vec<(u32, usize)>> = SpinLock::new(Vec::new());
 
 extern "C" {
     fn pthread_mach_thread_np(t: libc::pthread_t) -> u32;
@@ -117,13 +117,32 @@ extern "C" {
 }
 
 /// Whether the thread with this Mach port is one the scheduler runs.
-pub fn is_scheduled_thread(port: u32) -> bool {
-    PORTS.lock().contains(&port)
+/// The scheduler's id of the thread with this Mach port, if it runs it.
+pub fn scheduled_thread(port: u32) -> Option<usize> {
+    PORTS
+        .lock()
+        .iter()
+        .find(|&&(p, _)| p == port)
+        .map(|&(_, id)| id)
+}
+
+/// Whether thread `id` is parked, as opposed to running in real time
+/// without the baton (starting up, or between a hand-off and its park).
+pub fn is_parked(id: usize) -> bool {
+    shared().is_some_and(|sh| sh.is_parked(id))
+}
+
+/// Set or clear this thread's scheduler id without touching the port list.
+/// A value left set when a key destructor returns would run it again.
+pub fn set_identity(id: Option<usize>) {
+    let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
+    let value = id.map_or(std::ptr::null(), |id| (id + 1) as *const c_void);
+    unsafe { libc::pthread_setspecific(key, value) };
 }
 
 pub fn forget_thread() {
     let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
-    PORTS.lock().retain(|&p| p != port);
+    PORTS.lock().retain(|&(p, _)| p != port);
 }
 
 /// Whether this process has threads the scheduler does not run.
@@ -418,6 +437,7 @@ pub fn become_forked_child(child: u32) {
     PORTS.lock().clear();
     crate::alloc::forked();
     crate::hostfs::forked();
+    crate::signals::forked();
     crate::io::forked();
     crate::process::forked();
     crate::kq::forked();
@@ -456,6 +476,11 @@ pub fn block_until(key: u64, deadline: Option<u64>) -> bool {
     let Some(me) = my_id() else { return false };
     yield_baton_as(me, State::Blocked(key as usize), key, deadline);
     with(|s, _| std::mem::take(&mut s.threads[me].timed_out)) == Some(true)
+}
+
+pub fn baton_is_mine() -> bool {
+    let Some(me) = my_id() else { return false };
+    with(|s, _| s.current as usize == me) == Some(true)
 }
 
 /// The virtual clock without advancing it, for computing deadlines
@@ -580,6 +605,8 @@ struct After {
     clock: u64,
     /// The hand-off crashed this process
     crashed_self: bool,
+    /// Something is due when the baton is next taken up: a crashed process
+    /// to wait out, a `SIGCHLD` to deliver
     unsettled: bool,
 }
 
@@ -591,7 +618,7 @@ impl After {
             issued: s.issued,
             clock: s.clock_ns,
             crashed_self: s.procs[pid() as usize].killed,
-            unsettled: signal_crashed(s),
+            unsettled: signal_crashed(s) || s.procs[pid() as usize].child_deaths > 0,
         }
     }
 
@@ -664,6 +691,11 @@ fn wait_out_deaths(sh: &Shared, new_quantum: bool) {
         if s.settle_deaths() {
             if new_quantum {
                 install_quantum(s.pending_quantum);
+            }
+            let child_died = std::mem::take(&mut s.procs[pid() as usize].child_deaths) > 0;
+            drop(s);
+            if child_died {
+                crate::signals::deliver_sigchld();
             }
             return;
         }

@@ -236,8 +236,9 @@ Recorded, not fixed:
 - Wake keys are per process: process-shared mutexes and condition variables
   across `fork` never wake. `sem_wait` is not interposed (`pthread_rwlock`
   and `pthread_cond_timedwait_relative_np` since are: `TASKS_TOKIO.md`).
-- An outside thread freeing a block of the deterministic heap perturbs its
-  free lists at a real-time moment.
+- ~~An outside thread freeing a block of the deterministic heap perturbs its
+  free lists at a real-time moment.~~ Such blocks are leaked now
+  (`TASKS_TOKIO.md`, second round).
 - Unguarded path calls that remain: `getattrlist`, `getxattr`/`setxattr`,
   `chflags`, `renamex_np`, `fclonefileat`, `shm_open`/`sem_open` names.
 - A reply left in the launcher socket by a guest killed mid-request would

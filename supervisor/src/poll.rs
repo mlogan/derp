@@ -2,7 +2,8 @@
 //! descriptors. Readiness of a virtual socket comes from the shared state,
 //! of the rest from a real `poll` with a zero timeout. If nothing is ready
 //! the thread parks as an I/O waiter with the timeout as a virtual-time
-//! deadline and looks again when woken.
+//! deadline and looks again when woken. Descriptors of the outside world
+//! in such a set are polled but never wake it: unsupported, and logged.
 
 use std::ffi::c_int;
 
@@ -61,10 +62,17 @@ unsafe fn scan(fds: &mut [libc::pollfd], socks: &[Option<u32>]) -> c_int {
 unsafe fn wait(fds: &mut [libc::pollfd], timeout_ns: Option<u64>) -> c_int {
     let socks: Vec<Option<u32>> = fds.iter().map(|p| crate::net::lookup(p.fd)).collect();
     let deadline = timeout_ns.map(|t| sched::now().saturating_add(t));
+    let outside = fds
+        .iter()
+        .zip(&socks)
+        .any(|(p, sock)| p.fd >= 0 && sock.is_none() && !crate::io::is_guest_object(p.fd));
     loop {
         let ready = scan(fds, &socks);
         if ready != 0 || timeout_ns == Some(0) {
             return ready;
+        }
+        if outside {
+            crate::io::note_outside_in_wait();
         }
         if crate::io::park_for_io(deadline) {
             return scan(fds, &socks);

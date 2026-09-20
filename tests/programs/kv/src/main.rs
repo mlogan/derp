@@ -1,6 +1,10 @@
 //! A test guest on tokio.
 //!
-//!   kv sync                           the sync primitives, in one process
+//!   kv sync [current]                 the sync primitives, in one process
+//!                                     (`current`: on a current-thread runtime)
+//!   kv extras [fs|signal|process]     tokio's fs, process and signal
+//!   kv addrs                          `extras`, printing where the heap would
+//!                                     put a block of each size at every step
 //!   kv server PORT CLIENTS [LOG]      key-value server; exits after CLIENTS
 //!                                     clients have said DONE
 //!   kv client HOST PORT ID N          three connections doing N rounds each
@@ -9,6 +13,7 @@
 //! (`id` makes a resent request harmless), `HASH k`, `STATS`, `SUBSCRIBE`
 //! (streams `CHANGE k` until the server shuts down), `DONE id`.
 
+mod extras;
 mod server;
 mod sync_demo;
 
@@ -20,7 +25,13 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let arg = |i: usize| args.get(i).map(String::as_str);
     match arg(1) {
-        Some("sync") => sync_demo::run(),
+        Some("sync") => sync_demo::run(arg(2) == Some("current")),
+        Some("extras") => extras::run(arg(2)),
+        Some("addrs") => extras::run_probing(),
+        Some("child") => {
+            println!("child {} says hi", arg(2).unwrap_or("?"));
+            std::process::exit(3);
+        }
         Some("server") => {
             let port = arg(2).and_then(|p| p.parse().ok()).expect("PORT");
             let clients = arg(3).and_then(|c| c.parse().ok()).expect("CLIENTS");
@@ -37,7 +48,9 @@ fn main() {
             rt.block_on(client(format!("{host}:{port}"), id, rounds));
         }
         _ => {
-            eprintln!("usage: kv sync | server PORT CLIENTS [LOG] | client HOST PORT ID N");
+            eprintln!(
+                "usage: kv sync [current] | extras | server PORT CLIENTS [LOG] | client HOST PORT ID N"
+            );
             std::process::exit(2);
         }
     }

@@ -405,6 +405,12 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     };
     unsafe { scheduler_slot().write(rewrite_scheduler_yield as *const () as usize) };
     SHARED.store(std::ptr::from_ref(sh).cast_mut(), Ordering::Relaxed);
+    // Its own stream, per process; a `fork` child carries its parent's on
+    crate::alloc::seed_layout(
+        cfg.seed
+            .wrapping_add(u64::from(pid()).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            ^ 0x4845_4150_4845_4150,
+    );
     set_my_id(me);
     wait_for_baton(me);
 }

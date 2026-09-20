@@ -265,18 +265,26 @@ pub extern "C" fn my_calloc(n: usize, size: usize) -> *mut c_void {
     p
 }
 
+/// Blocks given up because a thread outside the schedule freed them
+pub static LEAKED_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LEAKED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub extern "C" fn my_free(p: *mut c_void) {
     if p.is_null() {
         return;
     }
     let mut h = HEAP.lock();
     if h.contains(p as usize) {
-        // A thread outside the schedule (a GCD worker, or one of ours in
-        // its last exit cleanup) frees whenever real time has it running.
+        // A thread outside the schedule (a GCD worker) frees whenever real
+        // time has it running.
         // Putting the block back would reorder the free lists at that
         // moment, and with them every later address: it is leaked.
         if deterministic() {
             h.free(p as usize);
+        } else {
+            let size = Heap::usable(p as usize);
+            LEAKED_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            LEAKED_BYTES.fetch_add(size as u64, std::sync::atomic::Ordering::Relaxed);
         }
     } else {
         drop(h);

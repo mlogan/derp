@@ -23,6 +23,17 @@ fn write_report() {
     let mut text = String::new();
     crate::sched::report(&mut text);
     let _ = writeln!(text, "heap_fixed={}", crate::alloc::region_fixed());
+    let leaked = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = writeln!(
+        text,
+        "heap_leaked_blocks={}",
+        leaked(&crate::alloc::LEAKED_BLOCKS)
+    );
+    let _ = writeln!(
+        text,
+        "heap_leaked_bytes={}",
+        leaked(&crate::alloc::LEAKED_BYTES)
+    );
     crate::coord::report(&text);
 }
 

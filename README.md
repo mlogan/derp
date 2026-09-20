@@ -169,6 +169,10 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
 - `SIGCHLD` handlers run at a point of the schedule (the parent's next
   thread to run after the death), not when the kernel sends the signal. A
   signal a guest sends itself is delivered to the calling thread.
+- Heap addresses are a function of the seed, and differ between seeds:
+  how two blocks compare, and whether `free` then `malloc` returns the
+  same block, goes both ways across seeds. A bug that depends on pointer
+  order shows on some seeds and replays on those.
 - Guests see virtual pids from 100,000 up (above any real pid), in spawn
   order; the launcher is pid 1.
 

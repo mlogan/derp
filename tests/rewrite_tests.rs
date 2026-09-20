@@ -145,3 +145,55 @@ fn a_rewritten_binary_keeps_its_debug_symbols_reachable() {
     assert_eq!(resolve(&out), Some(original.clone()), "rewritten");
     assert_eq!(resolve(&cached), Some(original), "cached");
 }
+
+/// Where heap blocks land is the seed's to decide, like the schedule: how
+/// two blocks compare, and whether a freed block comes straight back, must
+/// go both ways across seeds and the same way for a seed.
+#[test]
+fn heap_layout_is_a_function_of_the_seed_and_not_predictable() {
+    let dir = common::scratch_dir("ptr_order");
+    let exe = common::build_c("ptr_order", &dir, &[]);
+    let rw = dir.join("ptr_order.rw");
+    rewrite_to(&exe, &rw, &Options::default());
+    let dylib = common::supervisor_dylib();
+
+    let mut answers: Vec<std::collections::BTreeSet<String>> = Vec::new();
+    for seed in 1..=16u64 {
+        let (o, text) = run(&rw, &[], Some(dylib.clone()), seed);
+        assert_eq!(o.exit_code(), Some(0), "seed {seed}: {text}");
+        let (_, again) = run(&rw, &[], Some(dylib.clone()), seed);
+        assert_eq!(again, text, "seed {seed} not repeatable");
+        for (i, line) in text.lines().enumerate() {
+            if answers.len() <= i {
+                answers.push(std::collections::BTreeSet::new());
+            }
+            answers[i].insert(line.to_string());
+        }
+    }
+    // Four comparisons, each seen as a<b and as a>b
+    assert_eq!(answers.len(), 5, "{answers:?}");
+    for seen in &answers[..4] {
+        assert_eq!(seen.len(), 2, "one way on all 16 seeds: {seen:?}");
+    }
+    assert!(
+        answers[4].iter().all(|l| l.ends_with("sometimes")),
+        "{:?}",
+        answers[4]
+    );
+
+    // The bug that needs a < b is found by some seeds, and found again
+    let crashed: Vec<u64> = (1..=16)
+        .filter(|&seed| {
+            run(&rw, &["crash"], Some(dylib.clone()), seed)
+                .0
+                .exit_code()
+                != Some(0)
+        })
+        .collect();
+    assert!(
+        crashed.len() >= 3 && crashed.len() <= 13,
+        "crashing seeds: {crashed:?}"
+    );
+    let (o, _) = run(&rw, &["crash"], Some(dylib.clone()), crashed[0]);
+    assert_eq!(o.signal(), Some(libc::SIGABRT), "seed {} again", crashed[0]);
+}

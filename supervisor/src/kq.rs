@@ -2,9 +2,13 @@
 //! those, so `EVFILT_READ` and `EVFILT_WRITE` registrations on them are
 //! kept here, per kqueue, and their events are synthesized from socket
 //! state. Every other registration stays on the real kqueue, which is
-//! polled with a zero timeout alongside. Level-triggered, `EV_CLEAR` and
-//! `EV_ONESHOT` registrations are modelled; `EV_DISPATCH` and the rest are
-//! logged and treated as level-triggered.
+//! polled with a zero timeout alongside: the wait itself is the
+//! scheduler's, in virtual time, because what ends it (socket traffic, a
+//! user event another thread triggers) comes from scheduled threads. Only a
+//! kqueue whose every registration belongs to the outside world waits in
+//! the kernel. Level-triggered, `EV_CLEAR` and
+//! `EV_ONESHOT` registrations and `EV_RECEIPT` are modelled; `EV_DISPATCH` and
+//! the rest are logged and treated as level-triggered.
 //!
 //! A kqueue is not inherited by `fork`, so the child starts with an empty
 //! registry (`forked`).
@@ -32,6 +36,9 @@ struct Kq {
     /// Pipes and kernel sockets between guests registered on the real
     /// kqueue: their readiness also only changes when a guest acts
     guest_objects: Vec<c_int>,
+    /// Registrations only the world outside the run can fire (a descriptor
+    /// that is no guest's, a signal, a kernel timer), as (ident, filter)
+    external: Vec<(usize, i16)>,
 }
 
 struct Registry(Vec<Kq>);
@@ -53,6 +60,8 @@ pub fn closed(fd: c_int) {
     let mut kqs = KQS.lock();
     kqs.0.retain(|k| k.fd != fd);
     for k in &mut kqs.0 {
+        k.external
+            .retain(|&(ident, filter)| ident != fd as usize || filter == libc::EVFILT_SIGNAL);
         k.regs.retain(|r| r.fd != fd);
         k.guest_objects.retain(|&o| o != fd);
     }
@@ -92,7 +101,7 @@ fn snapshot(sock: u32, filter: i16) -> Option<Snapshot> {
     })
 }
 
-const UNMODELLED: u16 = libc::EV_DISPATCH | libc::EV_RECEIPT;
+const UNMODELLED: u16 = libc::EV_DISPATCH;
 
 /// Apply one change to a virtual registration.
 fn change(kq: &mut Kq, ev: &libc::kevent, sock: u32) {
@@ -108,9 +117,7 @@ fn change(kq: &mut Kq, ev: &libc::kevent, sock: u32) {
         return;
     }
     if ev.flags & UNMODELLED != 0 {
-        crate::report::log(
-            "kevent: EV_DISPATCH and EV_RECEIPT are not modelled on virtual sockets",
-        );
+        crate::report::log("kevent: EV_DISPATCH is not modelled on virtual sockets");
     }
     let reg = match at {
         Some(at) => &mut kq.regs[at],
@@ -204,6 +211,9 @@ pub unsafe extern "C" fn my_kevent(
     };
     // Split the changes: ours, and the kernel's
     let mut real_changes: Vec<libc::kevent> = Vec::new();
+    // What the kernel would answer to our share of `EV_RECEIPT` changes
+    let mut receipts: Vec<libc::kevent> = Vec::new();
+    let wants_receipts = changes.iter().any(|ev| ev.flags & libc::EV_RECEIPT != 0);
     let ours = {
         let mut kqs = KQS.lock();
         let at = kqs.0.iter().position(|k| k.fd == kq).unwrap_or_else(|| {
@@ -211,6 +221,7 @@ pub unsafe extern "C" fn my_kevent(
                 fd: kq,
                 regs: Vec::new(),
                 guest_objects: Vec::new(),
+                external: Vec::new(),
             });
             kqs.0.len() - 1
         });
@@ -219,25 +230,76 @@ pub unsafe extern "C" fn my_kevent(
             let io = ev.filter == libc::EVFILT_READ || ev.filter == libc::EVFILT_WRITE;
             let fd = ev.ident as c_int;
             match crate::net::lookup(fd) {
-                Some(sock) if io => change(k, ev, sock),
+                Some(sock) if io => {
+                    change(k, ev, sock);
+                    if ev.flags & libc::EV_RECEIPT != 0 {
+                        receipts.push(libc::kevent {
+                            flags: ev.flags | libc::EV_ERROR,
+                            data: 0,
+                            ..*ev
+                        });
+                    }
+                }
                 _ => {
-                    if io && crate::io::is_guest_object(fd) && !k.guest_objects.contains(&fd) {
+                    let guest_object = io && crate::io::is_guest_object(fd);
+                    if guest_object && !k.guest_objects.contains(&fd) {
                         k.guest_objects.push(fd);
+                    }
+                    // A user event is triggered by a `kevent` call, which
+                    // in a run only a scheduled thread makes
+                    if !guest_object && ev.filter != libc::EVFILT_USER {
+                        let key = (ev.ident, ev.filter);
+                        k.external.retain(|&e| e != key);
+                        if ev.flags & libc::EV_DELETE == 0 {
+                            k.external.push(key);
+                        }
                     }
                     real_changes.push(*ev);
                 }
             }
         }
-        !k.regs.is_empty() || !k.guest_objects.is_empty()
+        !k.regs.is_empty() || !k.guest_objects.is_empty() || k.external.is_empty()
     };
-    if !ours {
-        // Nothing here depends on another guest: a real wait is right
+    if !ours && !wants_receipts {
+        // Only the outside world can end this wait: a real wait is right
         return libc::kevent(kq, changes.as_ptr(), nchanges, events, nevents, timeout);
     }
     let zero = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
+    if wants_receipts {
+        // A call with receipts reports on its changes and never waits
+        let room = if events.is_null() {
+            0
+        } else {
+            nevents.max(0) as usize
+        };
+        let out = std::slice::from_raw_parts_mut(events, room);
+        let mut n = 0;
+        if !real_changes.is_empty() {
+            let rc = libc::kevent(
+                kq,
+                real_changes.as_ptr(),
+                real_changes.len() as c_int,
+                out.as_mut_ptr(),
+                room as c_int,
+                &raw const zero,
+            );
+            if rc < 0 {
+                return rc;
+            }
+            n = rc as usize;
+            crate::io::wake_io();
+        }
+        for r in receipts {
+            if n < room {
+                out[n] = r;
+                n += 1;
+            }
+        }
+        return n as c_int;
+    }
     if !real_changes.is_empty() {
         let rc = libc::kevent(
             kq,

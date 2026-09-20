@@ -84,25 +84,47 @@ Found and fixed:
    (`signals.rs`, `sigaction`/`signal` interposed for this signal only),
    the kernel's delivery is dropped, and the handler runs on the parent's
    next thread to take up the baton after the death is recorded.
-10. **Unexplained, not reproduced since:** after fix 9, seed 2 of
-    `kv extras` gave a second hash in 3 of 52 runs under load. The two
-    traces had the same switches, issue counts and clock; only a lock's
-    heap address differed (0x70 apart), so an allocation had landed
-    differently. I blamed frees of deterministic-heap blocks by threads
-    outside the schedule and made such frees leak the block. Measurement
-    says that was wrong for tokio: the report now counts such frees
-    (`heap_leaked_blocks`, `heap_leaked_bytes`) and every tokio mode shows
-    0, and with the old behaviour switched back on, 460 further runs under
-    load (with and without tracing, with freshly copied binaries) gave one
-    hash. The cause of the 3 divergent runs is unknown.
-    The leak rule stays because the hazard is real elsewhere: the curl
-    scenario, which has a GCD thread, frees one 144-byte block this way
-    per run (`TASKS_RUNFILE.md` §6 had recorded it).
+10. **A contended lock inside the supervisor showed in the guest's
+    schedule** (found with `kv addrs`, below). The supervisor's own
+    allocations use libmalloc, whose internal lock is an `os_unfair_lock`.
+    When two of our threads collide on it in real time (the path checker
+    growing a vector while a new thread allocates during start-up; the
+    trace writer freeing its line after it has handed the baton on), the
+    loser's `__ulock_wait2` reaches our interposer. That treated any
+    registered owner as "parked with the lock, pass the baton on" and
+    yielded: an extra switch, or a changed order of threads, from a
+    collision that has nothing to do with the guest. Now (`unfair_wait`):
+    only the baton holder's waits count; an owner that is one of ours but
+    not parked (`ThreadRec::in_park`) is running in real time and is
+    waited out in the kernel; an owner seen parked only counts if the lock
+    word still names it afterwards. Measured on seed 2 of `kv addrs` under
+    32 spinning processes with tracing on: before, about 1 run in 40
+    diverged; after, 15 in 3,000, all of the kind under "Open".
+    My first explanation (frees by threads outside the schedule) was wrong
+    for tokio: the report counts such frees (`heap_leaked_blocks`) and
+    every tokio mode shows 0. The leak rule stays for the curl scenario,
+    where a GCD thread frees one 144-byte block per run.
 11. `EV_DISPATCH` is modelled (checked against the kernel's answers).
 
 Decided with Mark: **waits on descriptors from outside the run stay
 unsupported**; they could not be repeated. Such a wait now says so once in
 the log instead of failing silently.
+
+## Open
+
+- **One 96-byte block of the deterministic heap is sometimes placed
+  differently**: same switches, same hook counts, same clock, every later
+  fresh address 0x70 off, so a different hash (the hash covers lock
+  addresses). About 1 run in 200 with tracing on and 1 in 1,000 without,
+  under heavy load, and only in runs that had a contended `__ulock_wait2`
+  (`interposed_ulock_wait` > 0); most such runs are fine. Not yet
+  explained. `kv addrs` prints where the heap would put a block of each
+  size at every step, so the first differing line names the phase; the
+  ignored test `tokio_heap_addresses_are_a_function_of_the_seed` repeats
+  it under load. Per-allocation logging hides it; an in-memory ring with
+  stacks for that size class is the way in.
+- One real hang (no debug code involved) in 2,000 such runs, at the first
+  hand-off to a new thread. Not reproduced since.
 
 ## Limits
 

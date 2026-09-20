@@ -150,3 +150,32 @@ fn tokio_kv_server_survives_crashes() {
         assert!(reconnects >= 3, "seed {seed}: {reconnects} reconnects");
     }
 }
+
+/// The same primitives with every task on one thread, and the parts of
+/// tokio that lean on the operating system: files through the blocking
+/// pool, signals through the self-pipe, child processes through SIGCHLD.
+#[test]
+fn tokio_current_thread_runtime_and_os_facing_parts() {
+    let dir = common::scratch_dir("tokio_extras");
+    let kv = common::build_kv(&dir);
+    for mode in ["sync current", "extras"] {
+        let native = Command::new(&kv)
+            .args(mode.split(' '))
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(native.status.success(), "{mode}: {:?}", native.status);
+        let expected = String::from_utf8(native.stdout).unwrap();
+        let manifest = dir.join("mode.yaml");
+        std::fs::write(
+            &manifest,
+            format!("hosts:\n  - name: a\n    processes:\n      - kv {mode}\n"),
+        )
+        .unwrap();
+        for seed in 1..=3 {
+            // `extras` starts three children
+            let r = twice(&manifest, &dir.join("scratch"), seed, 1);
+            assert_eq!(r.stdout[0], expected, "{mode}, seed {seed}");
+        }
+    }
+}

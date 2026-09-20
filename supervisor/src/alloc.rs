@@ -271,7 +271,13 @@ pub extern "C" fn my_free(p: *mut c_void) {
     }
     let mut h = HEAP.lock();
     if h.contains(p as usize) {
-        h.free(p as usize);
+        // A thread outside the schedule (a GCD worker, or one of ours in
+        // its last exit cleanup) frees whenever real time has it running.
+        // Putting the block back would reorder the free lists at that
+        // moment, and with them every later address: it is leaked.
+        if deterministic() {
+            h.free(p as usize);
+        }
     } else {
         drop(h);
         unsafe { libc::free(p) };

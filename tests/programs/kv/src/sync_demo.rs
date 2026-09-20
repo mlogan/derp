@@ -11,12 +11,20 @@ use tokio::task::JoinSet;
 const WORKERS: u64 = 6;
 const ROUNDS: u64 = 40;
 
-pub fn run() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(3)
-        .enable_all()
-        .build()
-        .unwrap();
+pub fn run(current_thread: bool) {
+    // On one thread every task interleaves at its awaits only, and the
+    // plain threads (the squarer, the blocking pool) are the only others
+    let rt = if current_thread {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(3)
+            .enable_all()
+            .build()
+    }
+    .unwrap();
     rt.block_on(async {
         println!("mutex {}", mutex().await);
         println!("rwlock {}", rwlock().await);

@@ -1488,3 +1488,29 @@ fn kevent_dispatch_registrations_fire_once_until_enabled() {
         "first wait: 1\nwhile disabled: 0\nenabled again: 1\nafter accept: 0\n"
     );
 }
+
+/// The kernel's SIGCHLD comes at a moment of real time on a thread of its
+/// choosing; the guest's handler runs at a point of the schedule instead.
+#[test]
+fn sigchld_is_delivered_at_a_point_of_the_schedule() {
+    let dir = common::scratch_dir("sigchld");
+    common::build_c("sigchld", &dir, &[]);
+    let manifest = dir.join("sigchld.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - sigchld\n",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let r = run_manifest(&manifest, &scratch, 1, 1);
+    assert_eq!(
+        r.stdout[0],
+        "sigaction: exit 3, handler ran 1\nhandler reads back: yes\n\
+         signal: exit 4, handler ran 1\ndefault: exit 5, handler ran 0\n"
+    );
+    let again = run_manifest(&manifest, &scratch, 1, 1);
+    assert_eq!(
+        again.fields["run.schedule_hash"],
+        r.fields["run.schedule_hash"]
+    );
+}

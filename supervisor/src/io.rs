@@ -126,7 +126,7 @@ fn ready(fd: c_int, events: libc::c_short) -> bool {
 }
 
 /// Run `f` once `fd` is readable.
-fn when_readable(fd: c_int, f: impl Fn() -> isize) -> isize {
+pub fn when_readable(fd: c_int, f: impl Fn() -> isize) -> isize {
     if managed(fd) {
         while !ready(fd, libc::POLLIN) {
             park_for_io(None);
@@ -168,12 +168,24 @@ fn write_all(fd: c_int, buf: *const u8, len: usize) -> isize {
     done as isize
 }
 
+/// After a kernel-level send on `fd` returned `r`: a guest waiting for the
+/// other end of a socket pair must look again. Also from a thread we do
+/// not schedule, where a signal handler's self-pipe write may land.
+pub fn sent(fd: c_int, r: isize) -> isize {
+    if r > 0 && is_guest_object(fd) {
+        wake_io();
+    }
+    r
+}
+
 fn write_managed(fd: c_int, buf: *const c_void, n: usize, real: impl Fn() -> isize) -> isize {
     if managed(fd) {
         return write_all(fd, buf.cast(), n);
     }
     let r = real();
-    if r > 0 && my_id().is_some() && is_guest_object(fd) {
+    // Also from a thread we do not schedule (a signal handler's self-pipe
+    // write lands on whichever thread the kernel chose)
+    if r > 0 && is_guest_object(fd) {
         wake_io();
     }
     r
@@ -299,7 +311,7 @@ unsafe fn writev_managed(
     }
     if !managed(fd) {
         let r = real();
-        if r > 0 && my_id().is_some() && is_guest_object(fd) {
+        if r > 0 && is_guest_object(fd) {
             wake_io();
         }
         return r;

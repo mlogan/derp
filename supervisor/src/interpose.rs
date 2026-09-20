@@ -60,6 +60,7 @@ use crate::process::{
 use crate::process::{rewrite_getpid_shim, rewrite_getppid_shim};
 use crate::sched::{self, my_id, State};
 use crate::shared;
+use crate::signals::{my_sigaction, my_signal};
 
 #[repr(C)]
 struct Interpose {
@@ -709,6 +710,8 @@ interposers! {
     rewrite_getpid_shim => libc::getpid,
     rewrite_getppid_shim => libc::getppid,
     my_kill => libc::kill,
+    my_sigaction => libc::sigaction,
+    my_signal => libc::signal,
     my_read => libc::read,
     my_read_nocancel => read_nocancel,
     my_readv => libc::readv,

@@ -23,6 +23,7 @@ mod report;
 #[path = "../../src/rng.rs"]
 mod rng;
 mod sched;
+mod signals;
 // Also compiled into the launcher, which uses the parts that look dead here.
 #[allow(dead_code)]
 mod shared;

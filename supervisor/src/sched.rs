@@ -418,6 +418,7 @@ pub fn become_forked_child(child: u32) {
     PORTS.lock().clear();
     crate::alloc::forked();
     crate::hostfs::forked();
+    crate::signals::forked();
     crate::io::forked();
     crate::process::forked();
     crate::kq::forked();
@@ -580,6 +581,8 @@ struct After {
     clock: u64,
     /// The hand-off crashed this process
     crashed_self: bool,
+    /// Something is due when the baton is next taken up: a crashed process
+    /// to wait out, a `SIGCHLD` to deliver
     unsettled: bool,
 }
 
@@ -591,7 +594,7 @@ impl After {
             issued: s.issued,
             clock: s.clock_ns,
             crashed_self: s.procs[pid() as usize].killed,
-            unsettled: signal_crashed(s),
+            unsettled: signal_crashed(s) || s.procs[pid() as usize].child_deaths > 0,
         }
     }
 
@@ -664,6 +667,11 @@ fn wait_out_deaths(sh: &Shared, new_quantum: bool) {
         if s.settle_deaths() {
             if new_quantum {
                 install_quantum(s.pending_quantum);
+            }
+            let child_died = std::mem::take(&mut s.procs[pid() as usize].child_deaths) > 0;
+            drop(s);
+            if child_died {
+                crate::signals::deliver_sigchld();
             }
             return;
         }

@@ -184,6 +184,9 @@ pub struct ProcRec {
     /// Another guest sent it a fatal signal: it is as good as dead, though
     /// the launcher has not seen the exit yet
     pub killed: bool,
+    /// Children that died since a thread of this process last took up the
+    /// baton: its `SIGCHLD` is due
+    pub child_deaths: u32,
     /// Bumped by every wake that comes from a thread the scheduler does not
     /// run. Such a wake is not serialized by the baton, so it can land
     /// between a thread's "would I block?" check and its blocking; a thread
@@ -498,6 +501,7 @@ impl State {
         self.net.process_died(victim);
         self.wake_io();
         if parent != NO_PROC {
+            self.procs[parent as usize].child_deaths += 1;
             self.wake_all(parent, WAIT_KEY);
         }
         self.register_restart(victim, KILLED_STATUS);
@@ -855,6 +859,7 @@ impl State {
             self.wake_io();
             let parent = self.procs[pid as usize].parent;
             if parent != NO_PROC {
+                self.procs[parent as usize].child_deaths += 1;
                 self.wake_all(parent, WAIT_KEY);
             }
         }

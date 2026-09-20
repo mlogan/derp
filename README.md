@@ -161,7 +161,14 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   calls, dispatch semaphores, sleeps, `poll`/`select`/`kevent`, socket and
   pipe I/O, `waitpid`. An async runtime works: tokio's multi-thread
   runtime, reactor, blocking pool, timers and `tokio::sync` are tested
-  (`tests/programs/kv`). A deadlock report lists what each thread waits for.
+  (`tests/programs/kv`), as are `tokio::fs`, `process` and `signal`. A
+  deadlock report lists what each thread waits for.
+- A wait (`poll`, `select`, `kevent`) may not depend on a descriptor whose
+  other end is outside the run: nothing could repeat it. Such a wait is
+  logged, and only the guests' side ever ends it.
+- `SIGCHLD` handlers run at a point of the schedule (the parent's next
+  thread to run after the death), not when the kernel sends the signal. A
+  signal a guest sends itself is delivered to the calling thread.
 - Guests see virtual pids from 100,000 up (above any real pid), in spawn
   order; the launcher is pid 1.
 

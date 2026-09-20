@@ -183,7 +183,7 @@ counter and the scheduler entry point in a fixed region at
 `0x78_0000_0000` that the supervisor dylib maps at startup (one private
 page per process, then the run's shared scheduler state). A default-linked
 binary has header room for one new segment, which holds the stub code;
-there is nowhere to put a writable word. Running `prog.rw2-…` directly
+there is nowhere to put a writable word. Running `prog.rw3-…` directly
 faults at the first hooked branch.
 
 `--no-supervisor` and `bench` still inject the dylib, in a passive mode
@@ -206,6 +206,23 @@ in which the failure became certain, and the failing run's thread switches
 inside it. `--reseed-at T --reseed N` on `rewrite run` replays one such
 future. The heap layout and the entropy a guest reads are not yet part of
 what is reseeded.
+
+## Which lines does a failing run need?
+
+```
+rewrite suspects --seed 1 --mem-hook-rate 1 --manifest run.yaml
+```
+
+With memory hooks on, a failing seed switched threads at some loads and
+stores. `suspects` asks which of them the failure needs: it forbids
+switches at all but a subset (every stub still counts, so nothing else
+moves), and shrinks the subset by delta debugging until no site can be
+dropped. It prints those sites with function, file and line from the
+original binary's debug symbols (build with `-g`). If the failure needs no
+switch at any load or store it asks the same of branches and calls; a
+suspect of that kind is where the thread was switched out, and the shared
+access is near its caller. `REWRITE_MASK` is the file of forbidden sites it
+gives each run.
 
 ## Debugging a guest
 

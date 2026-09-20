@@ -201,7 +201,7 @@ fn spawn(
     // The supervisor's own debugging switches, which a guest that does not
     // inherit our environment would otherwise never see
     if !run.inherit_env {
-        for name in ["REWRITE_TRACE", "REWRITE_PARK_SPINS"] {
+        for name in ["REWRITE_TRACE", "REWRITE_PARK_SPINS", "REWRITE_MASK"] {
             if let Ok(value) = std::env::var(name) {
                 env.push(CString::new(format!("{name}={value}")).unwrap());
             }

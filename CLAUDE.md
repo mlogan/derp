@@ -451,6 +451,11 @@ a key-value server and clients on tokio using most of `tokio::sync`, runs
 repeatably, also under fault injection. Plan in
 `IMPLEMENTATION_PLAN_TOKIO.md`, findings in `TASKS_TOKIO.md`.
 
+**Seed bisection** (branch `mlogan-seed-bisect`, complete): `rewrite
+bisect` replays a failing seed with the scheduler reseeded at a virtual
+time and binary-searches for when the failure was decided. Plan in
+`IMPLEMENTATION_PLAN_BISECT.md`, results and limits in `TASKS_BISECT.md`.
+
 **Next Phase**: Not yet planned
 
 ---

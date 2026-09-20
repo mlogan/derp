@@ -169,6 +169,9 @@ pub struct ThreadRec {
     pub deadline: u64,
     /// Bumped by whoever hands this thread the baton
     pub park: AtomicU32,
+    /// Set while the thread is in `Shared::park`: it is not running, so a
+    /// lock it holds stays held until the scheduler picks it again
+    pub in_park: AtomicU32,
 }
 
 #[repr(C)]
@@ -424,7 +427,20 @@ impl Shared {
     }
 
     /// Sleep until thread `id`'s park word differs from `seen`.
+    pub fn is_parked(&self, id: usize) -> bool {
+        let state = self.state.get();
+        unsafe { (*state).threads[id].in_park.load(Ordering::Acquire) != 0 }
+    }
+
     pub fn park(&self, id: usize, seen: u32) {
+        let state = self.state.get();
+        let in_park = unsafe { &(*state).threads[id].in_park };
+        in_park.store(1, Ordering::Release);
+        self.park_inner(id, seen);
+        in_park.store(0, Ordering::Release);
+    }
+
+    fn park_inner(&self, id: usize, seen: u32) {
         let word = self.park_word(id);
         let atomic = unsafe { &*word.cast::<AtomicU32>() };
         // Optionally spin first: a baton that comes straight back saves the

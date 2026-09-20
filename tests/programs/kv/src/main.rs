@@ -3,6 +3,8 @@
 //!   kv sync [current]                 the sync primitives, in one process
 //!                                     (`current`: on a current-thread runtime)
 //!   kv extras [fs|signal|process]     tokio's fs, process and signal
+//!   kv addrs                          `extras`, printing where the heap would
+//!                                     put a block of each size at every step
 //!   kv server PORT CLIENTS [LOG]      key-value server; exits after CLIENTS
 //!                                     clients have said DONE
 //!   kv client HOST PORT ID N          three connections doing N rounds each
@@ -25,6 +27,7 @@ fn main() {
     match arg(1) {
         Some("sync") => sync_demo::run(arg(2) == Some("current")),
         Some("extras") => extras::run(arg(2)),
+        Some("addrs") => extras::run_probing(),
         Some("child") => {
             println!("child {} says hi", arg(2).unwrap_or("?"));
             std::process::exit(3);

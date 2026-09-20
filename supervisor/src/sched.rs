@@ -101,13 +101,13 @@ pub fn set_my_id(id: usize) {
     let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
     unsafe { libc::pthread_setspecific(key, (id + 1) as *const c_void) };
     let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
-    PORTS.lock().push(port);
+    PORTS.lock().push((port, id));
 }
 
 /// Mach ports of the threads the scheduler runs in this process. The rest
 /// (GCD workers, which the kernel creates without `pthread_create`) run
 /// outside the baton; what they do is input, like the clock once was.
-static PORTS: SpinLock<Vec<u32>> = SpinLock::new(Vec::new());
+static PORTS: SpinLock<Vec<(u32, usize)>> = SpinLock::new(Vec::new());
 
 extern "C" {
     fn pthread_mach_thread_np(t: libc::pthread_t) -> u32;
@@ -117,13 +117,24 @@ extern "C" {
 }
 
 /// Whether the thread with this Mach port is one the scheduler runs.
-pub fn is_scheduled_thread(port: u32) -> bool {
-    PORTS.lock().contains(&port)
+/// The scheduler's id of the thread with this Mach port, if it runs it.
+pub fn scheduled_thread(port: u32) -> Option<usize> {
+    PORTS
+        .lock()
+        .iter()
+        .find(|&&(p, _)| p == port)
+        .map(|&(_, id)| id)
+}
+
+/// Whether thread `id` is parked, as opposed to running in real time
+/// without the baton (starting up, or between a hand-off and its park).
+pub fn is_parked(id: usize) -> bool {
+    shared().is_some_and(|sh| sh.is_parked(id))
 }
 
 pub fn forget_thread() {
     let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
-    PORTS.lock().retain(|&p| p != port);
+    PORTS.lock().retain(|&(p, _)| p != port);
 }
 
 /// Whether this process has threads the scheduler does not run.
@@ -457,6 +468,11 @@ pub fn block_until(key: u64, deadline: Option<u64>) -> bool {
     let Some(me) = my_id() else { return false };
     yield_baton_as(me, State::Blocked(key as usize), key, deadline);
     with(|s, _| std::mem::take(&mut s.threads[me].timed_out)) == Some(true)
+}
+
+pub fn baton_is_mine() -> bool {
+    let Some(me) = my_id() else { return false };
+    with(|s, _| s.current as usize == me) == Some(true)
 }
 
 /// The virtual clock without advancing it, for computing deadlines

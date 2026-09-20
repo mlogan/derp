@@ -31,7 +31,9 @@ struct Reg {
 }
 
 struct Kq {
-    fd: c_int,
+    /// Every descriptor of this kqueue: a runtime may register through one
+    /// duplicate and wait on another
+    fds: Vec<c_int>,
     regs: Vec<Reg>,
     /// Pipes and kernel sockets between guests registered on the real
     /// kqueue: their readiness also only changes when a guest acts
@@ -58,12 +60,44 @@ pub fn forked() {
 /// any other descriptor drops out of every kqueue, as in the kernel.
 pub fn closed(fd: c_int) {
     let mut kqs = KQS.lock();
-    kqs.0.retain(|k| k.fd != fd);
+    for k in &mut kqs.0 {
+        k.fds.retain(|&f| f != fd);
+    }
+    kqs.0.retain(|k| !k.fds.is_empty());
     for k in &mut kqs.0 {
         k.external
             .retain(|&(ident, filter)| ident != fd as usize || filter == libc::EVFILT_SIGNAL);
         k.regs.retain(|r| r.fd != fd);
         k.guest_objects.retain(|&o| o != fd);
+    }
+}
+
+/// `new` is a duplicate of `fd`.
+pub fn duplicated(fd: c_int, new: c_int) {
+    let mut kqs = KQS.lock();
+    if let Some(k) = kqs.0.iter_mut().find(|k| k.fds.contains(&fd)) {
+        k.fds.push(new);
+    }
+}
+
+pub unsafe extern "C" fn my_kqueue() -> c_int {
+    let fd = libc::kqueue();
+    if fd >= 0 && my_id().is_some() {
+        // Known from birth, so that duplicates made before its first
+        // `kevent` are known too
+        KQS.lock().0.push(Kq::new(fd));
+    }
+    fd
+}
+
+impl Kq {
+    fn new(fd: c_int) -> Kq {
+        Kq {
+            fds: vec![fd],
+            regs: Vec::new(),
+            guest_objects: Vec::new(),
+            external: Vec::new(),
+        }
     }
 }
 
@@ -216,13 +250,9 @@ pub unsafe extern "C" fn my_kevent(
     let wants_receipts = changes.iter().any(|ev| ev.flags & libc::EV_RECEIPT != 0);
     let ours = {
         let mut kqs = KQS.lock();
-        let at = kqs.0.iter().position(|k| k.fd == kq).unwrap_or_else(|| {
-            kqs.0.push(Kq {
-                fd: kq,
-                regs: Vec::new(),
-                guest_objects: Vec::new(),
-                external: Vec::new(),
-            });
+        let known = kqs.0.iter().position(|k| k.fds.contains(&kq));
+        let at = known.unwrap_or_else(|| {
+            kqs.0.push(Kq::new(kq));
             kqs.0.len() - 1
         });
         let k = &mut kqs.0[at];
@@ -326,7 +356,7 @@ pub unsafe extern "C" fn my_kevent(
     loop {
         let mut n = {
             let mut kqs = KQS.lock();
-            match kqs.0.iter_mut().find(|k| k.fd == kq) {
+            match kqs.0.iter_mut().find(|k| k.fds.contains(&kq)) {
                 Some(k) => collect(k, out),
                 None => 0,
             }

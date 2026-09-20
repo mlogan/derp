@@ -59,13 +59,53 @@ any change had been broadcast and the client's subscriber, which ended at
 the first dropped connection, had seen none. It now resubscribes until the
 server ends the stream. The tests run memory-hook variants (1/16, 1/4, 1).
 
+## Second round (2026-09-20, branch `mlogan-tokio-more`)
+
+Added to the guest: `kv sync current` (the same primitives on a
+current-thread runtime) and `kv extras [fs|signal|process]` (`tokio::fs`,
+`tokio::signal`, `tokio::process`). Tests: both modes equal their native
+output on 3 seeds, twice each; `sigchld.c` and `kq_dispatch.c` cover the
+supervisor changes directly. 80 of 80 `kv extras` runs gave one schedule
+per seed under 8 busy-loop processes.
+
+Found and fixed:
+
+7. **`send` on a kernel socket pair woke nobody.** Only `write` told
+   scheduler waiters to look again. Tokio's signal self-pipe is a socket
+   pair written with `send`: signals were lost 3 rounds in. `send`,
+   `sendto`, `sendmsg` now wake, and `recv`/`recvfrom` on such a socket
+   wait in the scheduler.
+8. **A signal a guest sends itself** went to whichever thread the kernel
+   picked, whenever. `kill(getpid(), sig)` is now `pthread_kill` to the
+   calling thread: the handler runs there and then, with the baton.
+9. **`SIGCHLD` came at a moment of real time.** Its handler (tokio's wakes
+   the reaper) made the schedule depend on it: 2 schedules in 12 runs under
+   load. The guest's handler is now kept by the supervisor
+   (`signals.rs`, `sigaction`/`signal` interposed for this signal only),
+   the kernel's delivery is dropped, and the handler runs on the parent's
+   next thread to take up the baton after the death is recorded.
+10. **A thread in its last exit cleanup freed deterministic-heap blocks**
+    after giving up the baton, reordering the free lists at a real-time
+    moment (same switches, different lock addresses, so a different
+    hash; 2 in 40 under load). A block of the deterministic heap freed by a
+    thread outside the schedule is now leaked. This also closes the
+    "outside thread frees a block" item of `TASKS_RUNFILE.md` §6.
+11. `EV_DISPATCH` is modelled (checked against the kernel's answers).
+
+Decided with Mark: **waits on descriptors from outside the run stay
+unsupported**; they could not be repeated. Such a wait now says so once in
+the log instead of failing silently.
+
 ## Limits
 
-- A kqueue mixing virtual sockets with outside-world registrations is
-  still only woken by the virtual side (unchanged, `TASKS_RUNFILE.md` §6).
+- A kqueue or poll set mixing guest descriptors with outside-world ones is
+  only woken by the guests' side. Unsupported by decision; logged.
+- Other signals than `SIGCHLD` that the kernel raises on its own
+  (`SIGALRM`, `SIGPIPE` from a kernel pipe, `SIGIO`) still arrive in real
+  time. `tokio::signal` for signals sent from outside the run is input.
+- Blocks freed by threads outside the schedule are leaked.
 - Rwlock waiters have no writer preference; the next holder is the
   scheduler's draw.
-- `EV_DISPATCH` is still unmodelled.
 
 ## Test summary
 

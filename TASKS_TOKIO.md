@@ -53,6 +53,12 @@ Not a supervisor bug: macOS kills a process whose executable was
 overwritten in place (cached code signature); the test helper copies to a
 new file and renames.
 
+Found in the guest, not the supervisor: with memory hooks on, less work is
+done per virtual millisecond, so at one seed the first crash came before
+any change had been broadcast and the client's subscriber, which ended at
+the first dropped connection, had seen none. It now resubscribes until the
+server ends the stream. The tests run memory-hook variants (1/16, 1/4, 1).
+
 ## Limits
 
 - A kqueue mixing virtual sockets with outside-world registrations is

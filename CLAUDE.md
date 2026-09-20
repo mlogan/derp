@@ -462,6 +462,11 @@ bisect` replays a failing seed with the scheduler reseeded at a virtual
 time and binary-searches for when the failure was decided. Plan in
 `IMPLEMENTATION_PLAN_BISECT.md`, results and limits in `TASKS_BISECT.md`.
 
+**Site minimisation** (branch `mlogan-site-bisect`, complete): `rewrite
+suspects` masks switch points at hooked loads and stores (then branches
+and calls) until no site can be dropped, and names their source lines.
+Plan in `IMPLEMENTATION_PLAN_SUSPECTS.md`, results in `TASKS_SUSPECTS.md`.
+
 **Next Phase**: Not yet planned
 
 ---

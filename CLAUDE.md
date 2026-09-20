@@ -457,6 +457,11 @@ drawn from the seed, so bugs that depend on pointer order can be found and
 replayed. Plan in `IMPLEMENTATION_PLAN_HEAP.md`, progress in
 `TASKS_HEAP.md`.
 
+**Seed bisection** (branch `mlogan-seed-bisect`, complete): `rewrite
+bisect` replays a failing seed with the scheduler reseeded at a virtual
+time and binary-searches for when the failure was decided. Plan in
+`IMPLEMENTATION_PLAN_BISECT.md`, results and limits in `TASKS_BISECT.md`.
+
 **Next Phase**: Not yet planned
 
 ---

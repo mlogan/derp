@@ -16,6 +16,10 @@ usage:
   rewrite run [opts] <prog> [args…]    rewrite (cached), then launch under the supervisor
   rewrite bench [opts] <prog> [args…]  time native vs rewritten (no supervisor)
   rewrite repeat [opts] <prog> [args…] run N times; exit status, stdout and schedule hash must agree
+  rewrite bisect [opts] --manifest FILE  when was the failing seed's failure decided? Replays it
+                                       with the scheduler reseeded at a virtual time, --runs
+                                       futures per probe (default 20), --jobs at a time (4),
+                                       down to --resolution (2ms)
   rewrite run|repeat [opts] --manifest FILE
                                        several processes under one scheduler; see below
 options:
@@ -23,6 +27,8 @@ options:
   --seed S                             run seed (default 0)
   --mem-hook-rate R                    0, 1 or a fraction like 1/16 (default 0)
   --quantum LO..HI                     hook events per quantum (default 1000..10000)
+  --reseed-at T --reseed N             from virtual time T on, the scheduler's random streams
+                                       start over from N (what bisect does at each probe)
   --no-supervisor                      no scheduling: the dylib only provides the stubs' counter
   --aslr                               leave ASLR on
   --native                             run the original binary without the dylib
@@ -67,6 +73,10 @@ struct Cli {
     scratch: Option<PathBuf>,
     capture: bool,
     net_latency_ns: u64,
+    reseed_at: Option<u64>,
+    reseed: u64,
+    jobs: u32,
+    resolution_ns: u64,
     disable_aslr: bool,
     native: bool,
     runs: u32,
@@ -109,6 +119,10 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         scratch: None,
         capture: false,
         net_latency_ns: 0,
+        reseed_at: None,
+        reseed: 0,
+        jobs: 4,
+        resolution_ns: 2_000_000,
         disable_aslr: true,
         native: false,
         runs: 100,
@@ -144,11 +158,30 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
                 cli.given.push("net-latency");
             }
+            "--reseed-at" => {
+                let v = take_value(&mut args)?;
+                cli.reseed_at = Some(parse_duration_ns(&v).ok_or(format!("bad time {v}"))?);
+            }
+            "--jobs" => {
+                cli.jobs = take_value(&mut args)?
+                    .parse()
+                    .map_err(|_| "bad job count")?;
+            }
+            "--resolution" => {
+                let v = take_value(&mut args)?;
+                cli.resolution_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
+            }
+            "--reseed" => {
+                cli.reseed = take_value(&mut args)?
+                    .parse()
+                    .map_err(|_| "bad reseed value")?;
+            }
             "--no-supervisor" => cli.supervisor = false,
             "--aslr" => cli.disable_aslr = false,
             "--native" => cli.native = true,
             "--runs" => {
                 cli.runs = take_value(&mut args)?.parse().map_err(|_| "bad --runs")?;
+                cli.given.push("runs");
             }
             _ if a.starts_with("--") => return Err(format!("unknown option {a}")),
             _ => break,
@@ -332,6 +365,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
+        reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
     };
     let has_faults = run
         .guests
@@ -371,8 +405,20 @@ fn print_run_report(o: &RunOutcome) {
     eprintln!("run.net_passthrough={}", o.totals.net_passthrough);
     eprintln!("run.crashes_injected={}", o.totals.crashes_injected);
     eprintln!("run.restarts={}", o.totals.restarts);
+    eprintln!("run.clock_ns={}", o.totals.clock_ns);
+    if let Some((entry, life)) = failed_life(o) {
+        eprintln!(
+            "run.failure=entry {entry}: {}",
+            describe_status(&o.guests[life])
+        );
+        let at = o.totals.died_at.get(life).copied().unwrap_or(0);
+        eprintln!("run.failure_at={at}");
+    }
     for (i, g) in o.guests.iter().enumerate() {
         eprintln!("p{i}.status={}", describe_status(g));
+        if let Some(&at) = o.totals.died_at.get(i) {
+            eprintln!("p{i}.died_at={at}");
+        }
         // Lives of one run-file entry share its number
         if let Some(entry) = o.specs[i] {
             eprintln!("p{i}.entry={entry}");
@@ -398,14 +444,59 @@ fn describe_status(o: &launch::Outcome) -> String {
 /// restarted do not count, what children return is their parents' business,
 /// and daemons are killed by design.
 fn exit_from_run(o: &RunOutcome) -> ExitCode {
+    failed_life(o).map_or(ExitCode::SUCCESS, |(_, life)| exit_from(&o.guests[life]))
+}
+
+/// The run-file entry that failed the run, and the process that was its
+/// last life.
+fn failed_life(o: &RunOutcome) -> Option<(usize, usize)> {
     (0..o.initial)
         .filter(|&entry| !o.daemons[entry])
-        .filter_map(|entry| {
-            let last = o.specs.iter().rposition(|&s| s == Some(entry))?;
-            Some(&o.guests[last])
-        })
-        .find(|g| g.exit_code() != Some(0))
-        .map_or(ExitCode::SUCCESS, exit_from)
+        .filter_map(|entry| Some((entry, o.specs.iter().rposition(|&s| s == Some(entry))?)))
+        .find(|&(_, life)| o.guests[life].exit_code() != Some(0))
+}
+
+/// `rewrite bisect`: find when the failing seed's failure was decided.
+fn bisect(cli: &Cli) -> Fallible<()> {
+    let mut pass = vec![
+        "--quantum".to_string(),
+        format!("{}..{}", cli.quantum.0, cli.quantum.1),
+        "--mem-hook-rate".to_string(),
+        format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
+    ];
+    if cli.given.contains(&"net-latency") {
+        pass.extend([
+            "--net-latency".to_string(),
+            format!("{}ns", cli.net_latency_ns),
+        ]);
+    }
+    let cfg = rewrite::bisect::Config {
+        manifest: cli.manifest.clone().unwrap(),
+        scratch: scratch_dir(cli),
+        seed: cli.opts.seed,
+        // `--runs` defaults to what `repeat` wants
+        runs: if cli.given.contains(&"runs") {
+            cli.runs
+        } else {
+            20
+        },
+        jobs: cli.jobs,
+        resolution_ns: cli.resolution_ns,
+        pass,
+    };
+    let found = rewrite::bisect::bisect(&cfg, |line| println!("{line}"))?;
+    if !found.trace.is_empty() {
+        println!("switches of the failing run in that interval:");
+        for line in found.trace.iter().take(60) {
+            println!("  {line}");
+        }
+    }
+    println!("bisect.failure_at_ns={}", found.reference.failure_at);
+    println!("bisect.base={}/{}", found.base.failed, found.base.runs);
+    println!("bisect.probes={}", found.probes.len());
+    println!("bisect.lo_ns={}", found.lo_ns);
+    println!("bisect.hi_ns={}", found.hi_ns);
+    Ok(())
 }
 
 fn exit_from(outcome: &launch::Outcome) -> ExitCode {
@@ -569,6 +660,9 @@ fn main() -> ExitCode {
             };
             exe.and_then(|exe| run_guest(exe, &cli, rest[1..].to_vec(), false, None))
                 .map(|o| exit_from(&o))
+        }
+        Some("bisect") if rest.is_empty() && cli.manifest.is_some() => {
+            bisect(&cli).map(|()| ExitCode::SUCCESS)
         }
         Some("bench") if !rest.is_empty() => bench(cli, &rest).map(|()| ExitCode::SUCCESS),
         Some("repeat") if rest.is_empty() != cli.manifest.is_none() => {

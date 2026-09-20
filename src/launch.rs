@@ -126,6 +126,8 @@ pub struct Run {
     pub rewrite: Option<crate::rewrite::Options>,
     /// Virtual-time delay for traffic between different hosts
     pub net_latency_ns: u64,
+    /// Seed bisection: (virtual time, replacement seed)
+    pub reseed: Option<(u64, u64)>,
 }
 
 #[derive(Debug)]
@@ -695,6 +697,9 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     }
     if let Some(c) = coord {
         c.set_net_latency(run.net_latency_ns);
+        if let Some((at, with)) = run.reseed {
+            c.set_reseed(at, with);
+        }
         c.add_hosts(&run.hosts);
     }
     for (spec, guest) in run.guests.iter().enumerate() {
@@ -844,6 +849,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         passive: cfg.passive,
         rewrite: cfg.rewrite.clone(),
         net_latency_ns: 0,
+        reseed: None,
     };
     let mut out = launch_run(&run)?;
     Ok(out.guests.remove(0))

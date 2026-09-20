@@ -17,7 +17,7 @@ pub struct Coordinator {
     path: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Totals {
     pub switches: u64,
     pub expiries: u64,
@@ -34,6 +34,10 @@ pub struct Totals {
     pub crashes_injected: u64,
     pub restarts: u64,
     pub restarts_refused: u64,
+    /// The virtual clock at the end of the run
+    pub clock_ns: u64,
+    /// When each process died, in virtual time (0: it did not)
+    pub died_at: Vec<u64>,
 }
 
 static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
@@ -91,6 +95,13 @@ impl Coordinator {
     }
 
     /// Delay for traffic between different hosts, in virtual time.
+    /// Seed bisection: the streams start over from `with` at time `at`.
+    pub fn set_reseed(&self, at: u64, with: u64) {
+        let mut s = self.shared.lock();
+        s.reseed_at = at.max(1);
+        s.reseed_with = with;
+    }
+
     pub fn set_net_latency(&self, ns: u64) {
         self.shared.lock().net.latency_ns = ns;
     }
@@ -193,6 +204,11 @@ impl Coordinator {
             crashes_injected: s.crashes_injected,
             restarts: s.restarts,
             restarts_refused: s.restarts_refused,
+            clock_ns: s.clock_ns,
+            died_at: s.procs[..s.nprocs as usize]
+                .iter()
+                .map(|p| p.died_at)
+                .collect(),
         }
     }
 }

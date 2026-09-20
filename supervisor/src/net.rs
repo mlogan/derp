@@ -499,7 +499,7 @@ pub unsafe extern "C" fn my_send(fd: c_int, buf: *const c_void, n: usize, flags:
     sched::hook_event(sched::SITE_NET);
     match lookup(fd) {
         Some(sock) => send_fd(fd, sock, buf.cast(), n, flags),
-        None => libc::send(fd, buf, n, flags),
+        None => crate::io::sent(fd, libc::send(fd, buf, n, flags)),
     }
 }
 
@@ -507,7 +507,7 @@ pub unsafe extern "C" fn my_recv(fd: c_int, buf: *mut c_void, n: usize, flags: c
     sched::hook_event(sched::SITE_NET);
     match lookup(fd) {
         Some(sock) => recv_fd(fd, sock, buf.cast(), n, flags),
-        None => libc::recv(fd, buf, n, flags),
+        None => crate::io::when_readable(fd, || unsafe { libc::recv(fd, buf, n, flags) }),
     }
 }
 
@@ -523,7 +523,7 @@ pub unsafe extern "C" fn my_sendto(
     match lookup(fd) {
         // A stream ignores the destination
         Some(sock) => send_to(fd, sock, buf.cast(), n, flags, parse_addr(addr, len)),
-        None => libc::sendto(fd, buf, n, flags, addr, len),
+        None => crate::io::sent(fd, libc::sendto(fd, buf, n, flags, addr, len)),
     }
 }
 
@@ -537,7 +537,9 @@ pub unsafe extern "C" fn my_recvfrom(
 ) -> isize {
     sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
-        return libc::recvfrom(fd, buf, n, flags, addr, len);
+        return crate::io::when_readable(fd, || unsafe {
+            libc::recvfrom(fd, buf, n, flags, addr, len)
+        });
     };
     let mut from = None;
     let got = recv_from(fd, sock, buf.cast(), n, flags, &mut from);
@@ -554,7 +556,7 @@ pub unsafe extern "C" fn my_recvfrom(
 pub unsafe extern "C" fn my_sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) -> isize {
     sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
-        return libc::sendmsg(fd, msg, flags);
+        return crate::io::sent(fd, libc::sendmsg(fd, msg, flags));
     };
     let m = &*msg;
     if m.msg_controllen > 0 {

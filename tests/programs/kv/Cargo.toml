@@ -8,7 +8,8 @@ publish = false
 [workspace]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros", "fs", "process", "signal"] }
+libc = "0.2"
 
 [profile.dev]
 opt-level = 1

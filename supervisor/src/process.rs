@@ -572,6 +572,13 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
         return crate::errno::fail(libc::ESRCH);
     };
     if target == sched::pid() {
+        // To this thread, not to whichever thread the kernel would pick at
+        // whatever moment: the handler then runs here and now, with the
+        // baton, as a point of the schedule.
+        if sig != 0 && sched::on_scheduled_thread() {
+            let rc = libc::pthread_kill(libc::pthread_self(), sig);
+            return if rc == 0 { 0 } else { crate::errno::fail(rc) };
+        }
         return libc::kill(real, sig);
     }
     if sig == 0 {

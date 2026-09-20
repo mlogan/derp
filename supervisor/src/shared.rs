@@ -182,6 +182,8 @@ pub struct ProcRec {
     pub parent: u32,
     /// Raw wait status, valid once `state` is `P_EXITED`
     pub exit_status: i32,
+    /// Virtual time at which the run learned of the death (0: alive)
+    pub died_at: u64,
     /// The parent has collected the exit with `waitpid`
     pub reaped: bool,
     /// Another guest sent it a fatal signal: it is as good as dead, though
@@ -242,6 +244,12 @@ pub struct State {
     /// Crash times come from their own stream, so that adding faults to a
     /// run does not shift the choice of threads
     fault_rng: Rng,
+    /// Seed bisection: at the first hand-off at or after this virtual time
+    /// (0: never) the scheduler's streams start over from `reseed_with`.
+    /// Until then the run is the plain run of its seed.
+    pub reseed_at: u64,
+    pub reseed_with: u64,
+    pub reseeded: bool,
     pub crashes_injected: u64,
     pub restarts: u64,
     /// Restarts that were due but found the process or thread table full;
@@ -504,8 +512,10 @@ impl State {
                 t.deadline = 0;
             }
         }
+        let now = self.clock_ns;
         let p = &mut self.procs[victim as usize];
         p.killed = true;
+        p.died_at = now;
         p.crash_at = 0;
         self.unsignalled += 1;
         // One that has not attached holds nothing the run could wait for
@@ -786,6 +796,11 @@ impl State {
     /// Deadlines that have passed are handled before the choice; when
     /// nothing is runnable the clock jumps to the earliest deadline.
     fn pick(&mut self) -> Option<usize> {
+        if self.reseed_at != 0 && !self.reseeded && self.clock_ns >= self.reseed_at {
+            self.reseeded = true;
+            self.rng = Rng::seed_from_u64(self.reseed_with);
+            self.fault_rng = Rng::seed_from_u64(self.reseed_with ^ 0xFA17_FA17_FA17_FA17);
+        }
         self.clock_moved();
         self.inject_due_crashes();
         self.expire_deadlines();
@@ -864,6 +879,9 @@ impl State {
     pub fn process_died(&mut self, pid: u32, status: i32) -> Option<Handoff> {
         self.procs[pid as usize].state = P_EXITED;
         self.procs[pid as usize].exit_status = status;
+        if self.procs[pid as usize].died_at == 0 {
+            self.procs[pid as usize].died_at = self.clock_ns.max(1);
+        }
         // A crashed process died to the run when it was crashed; this call
         // comes at a moment of real time and must not wake anyone.
         if !self.procs[pid as usize].killed {

@@ -189,6 +189,24 @@ faults at the first hooked branch.
 `--no-supervisor` and `bench` still inject the dylib, in a passive mode
 that maps the region and schedules nothing. It adds under 1 ms of startup.
 
+## When did a failing run go wrong?
+
+```
+rewrite bisect --seed 5 --manifest run.yaml
+```
+
+A race may corrupt something long before an assert notices. `bisect`
+replays the failing seed and, at a virtual time `t`, gives the scheduler a
+new random stream: the run is the failing run until `t` and some other
+future after. Once the damage is done nearly every future fails; before,
+only as many as ever did. It measures that with `--runs` futures per probe
+(default 20, `--jobs` at a time), binary-searches `t` down to
+`--resolution` (2 ms of virtual time), and prints the probes, the interval
+in which the failure became certain, and the failing run's thread switches
+inside it. `--reseed-at T --reseed N` on `rewrite run` replays one such
+future. The heap layout and the entropy a guest reads are not yet part of
+what is reseeded.
+
 ## Debugging a guest
 
 lldb works on rewritten binaries. Text is patched in place and the UUID is

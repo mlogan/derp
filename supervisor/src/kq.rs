@@ -7,8 +7,7 @@
 //! user event another thread triggers) comes from scheduled threads. Only a
 //! kqueue whose every registration belongs to the outside world waits in
 //! the kernel. Level-triggered, `EV_CLEAR` and
-//! `EV_ONESHOT` registrations and `EV_RECEIPT` are modelled; `EV_DISPATCH` and
-//! the rest are logged and treated as level-triggered.
+//! `EV_ONESHOT` and `EV_DISPATCH` registrations and `EV_RECEIPT` are modelled.
 //!
 //! A kqueue is not inherited by `fork`, so the child starts with an empty
 //! registry (`forked`).
@@ -135,8 +134,6 @@ fn snapshot(sock: u32, filter: i16) -> Option<Snapshot> {
     })
 }
 
-const UNMODELLED: u16 = libc::EV_DISPATCH;
-
 /// Apply one change to a virtual registration.
 fn change(kq: &mut Kq, ev: &libc::kevent, sock: u32) {
     let fd = ev.ident as c_int;
@@ -149,9 +146,6 @@ fn change(kq: &mut Kq, ev: &libc::kevent, sock: u32) {
             kq.regs.remove(at);
         }
         return;
-    }
-    if ev.flags & UNMODELLED != 0 {
-        crate::report::log("kevent: EV_DISPATCH is not modelled on virtual sockets");
     }
     let reg = match at {
         Some(at) => &mut kq.regs[at],
@@ -170,7 +164,7 @@ fn change(kq: &mut Kq, ev: &libc::kevent, sock: u32) {
         None => return,
     };
     if ev.flags & libc::EV_ADD != 0 {
-        reg.flags = ev.flags & (libc::EV_CLEAR | libc::EV_ONESHOT);
+        reg.flags = ev.flags & (libc::EV_CLEAR | libc::EV_ONESHOT | libc::EV_DISPATCH);
         reg.udata = ev.udata;
         reg.sock = sock;
         // Re-adding re-arms an edge-triggered registration
@@ -218,6 +212,9 @@ fn collect(kq: &mut Kq, out: &mut [libc::kevent]) -> usize {
         n += 1;
         if r.flags & libc::EV_ONESHOT != 0 {
             fired_oneshot.push(i);
+        } else if r.flags & libc::EV_DISPATCH != 0 {
+            // Delivered once, then silent until the guest enables it again
+            r.enabled = false;
         }
     }
     for i in fired_oneshot.into_iter().rev() {
@@ -248,7 +245,7 @@ pub unsafe extern "C" fn my_kevent(
     // What the kernel would answer to our share of `EV_RECEIPT` changes
     let mut receipts: Vec<libc::kevent> = Vec::new();
     let wants_receipts = changes.iter().any(|ev| ev.flags & libc::EV_RECEIPT != 0);
-    let ours = {
+    let (ours, outside) = {
         let mut kqs = KQS.lock();
         let known = kqs.0.iter().position(|k| k.fds.contains(&kq));
         let at = known.unwrap_or_else(|| {
@@ -288,7 +285,8 @@ pub unsafe extern "C" fn my_kevent(
                 }
             }
         }
-        !k.regs.is_empty() || !k.guest_objects.is_empty() || k.external.is_empty()
+        let ours = !k.regs.is_empty() || !k.guest_objects.is_empty() || k.external.is_empty();
+        (ours, !k.external.is_empty())
     };
     if !ours && !wants_receipts {
         // Only the outside world can end this wait: a real wait is right
@@ -376,6 +374,9 @@ pub unsafe extern "C" fn my_kevent(
         }
         if n > 0 || timeout_ns == Some(0) {
             return n as c_int;
+        }
+        if outside {
+            crate::io::note_outside_in_wait();
         }
         if crate::io::park_for_io(deadline) {
             return 0;

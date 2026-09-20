@@ -91,6 +91,20 @@ pub fn park_for_io(deadline: Option<u64>) -> bool {
     sched::block_until(shared::IO_KEY, deadline)
 }
 
+/// Say once that a wait covers descriptors of the outside world too.
+/// Nothing in the run announces their readiness, and a run that waited for
+/// them could not be repeated, so they are not supported: only the guests'
+/// side of such a wait ever ends it.
+pub fn note_outside_in_wait() {
+    static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::report::log(
+            "a wait mixes guest descriptors with ones from outside the run; \
+             the outside ones will not wake it (unsupported: not repeatable)",
+        );
+    }
+}
+
 pub fn wake_io() {
     let outside = !sched::on_scheduled_thread();
     sched::with(|s, pid| {

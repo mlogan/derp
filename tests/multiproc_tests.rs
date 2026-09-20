@@ -1470,3 +1470,21 @@ fn guests_exit_when_the_launcher_is_killed() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+fn kevent_dispatch_registrations_fire_once_until_enabled() {
+    let dir = common::scratch_dir("kq_dispatch");
+    common::build_c("kq_dispatch", &dir, &[]);
+    let manifest = dir.join("dispatch.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: server\n    processes:\n      - kq_dispatch server 7000\n\
+         \x20 - name: client\n    processes:\n      - kq_dispatch client server 7000\n",
+    )
+    .unwrap();
+    let r = run_manifest(&manifest, &dir.join("scratch"), 1, 2);
+    assert_eq!(
+        r.stdout[0],
+        "first wait: 1\nwhile disabled: 0\nenabled again: 1\nafter accept: 0\n"
+    );
+}

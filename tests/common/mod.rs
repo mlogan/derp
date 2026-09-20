@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
@@ -150,4 +151,81 @@ fn run_mode(
     let outcome = rewrite::launch::launch(&cfg).expect("launch");
     let text = std::fs::read_to_string(&out_path).unwrap_or_default();
     (outcome, text)
+}
+
+pub struct RunReport {
+    pub fields: BTreeMap<String, String>,
+    pub stdout: Vec<String>,
+}
+
+impl RunReport {
+    pub fn u64(&self, key: &str) -> u64 {
+        self.fields
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} missing from {:?}", self.fields))
+            .parse()
+            .unwrap()
+    }
+}
+
+/// One `rewrite run --capture`: the guests' stdout from the scratch
+/// directory and the aggregated report from the launcher's stderr.
+pub fn run_manifest(manifest: &Path, scratch: &Path, seed: u64, guests: usize) -> RunReport {
+    run_manifest_with(manifest, scratch, seed, guests, &[])
+}
+
+pub fn run_manifest_with(
+    manifest: &Path,
+    scratch: &Path,
+    seed: u64,
+    guests: usize,
+    extra: &[&str],
+) -> RunReport {
+    supervisor_dylib();
+    let report = Command::new(rewrite_bin())
+        .args(["run", "--capture", "--seed", &seed.to_string()])
+        .args(extra)
+        .arg("--scratch")
+        .arg(scratch)
+        .arg("--manifest")
+        .arg(manifest)
+        .output()
+        .expect("rewrite run");
+    assert!(
+        report.status.success(),
+        "seed {seed}: {}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let stdout = (0..guests)
+        .map(|i| std::fs::read_to_string(scratch.join(format!("stdout.{i}"))).unwrap())
+        .collect();
+    let fields = String::from_utf8_lossy(&report.stderr)
+        .lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    RunReport { fields, stdout }
+}
+
+/// Build the tokio guest (`tests/programs/kv`, a package of its own) once
+/// per test binary and copy it into `out_dir`.
+pub fn build_kv(out_dir: &Path) -> PathBuf {
+    static BUILD: Once = Once::new();
+    let build = target_dir().join("rewrite-tests/kv-build");
+    BUILD.call_once(|| {
+        let status = Command::new(env!("CARGO"))
+            .args(["build", "--locked", "--manifest-path"])
+            .arg(programs_dir().join("kv/Cargo.toml"))
+            .arg("--target-dir")
+            .arg(&build)
+            .status()
+            .expect("cargo build");
+        assert!(status.success(), "building kv failed");
+    });
+    // A new file each time: macOS kills a process whose executable was
+    // overwritten in place under a cached code signature
+    let (out, fresh) = (out_dir.join("kv"), out_dir.join("kv.new"));
+    std::fs::copy(build.join("debug/kv"), &fresh).unwrap();
+    std::fs::rename(&fresh, &out).unwrap();
+    out
 }

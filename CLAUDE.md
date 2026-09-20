@@ -446,6 +446,11 @@ seeded crashes in virtual time and run-file restart policies with virtual
 downtime. Plan in `IMPLEMENTATION_PLAN_FAULTS.md`, progress, limits and
 review results in `TASKS_FAULTS.md`.
 
+**Tokio guest** (branch `mlogan-tokio-kv`, complete): `tests/programs/kv`,
+a key-value server and clients on tokio using most of `tokio::sync`, runs
+repeatably, also under fault injection. Plan in
+`IMPLEMENTATION_PLAN_TOKIO.md`, findings in `TASKS_TOKIO.md`.
+
 **Next Phase**: Not yet planned
 
 ---

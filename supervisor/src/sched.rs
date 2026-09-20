@@ -525,6 +525,7 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
         s.any_outside_threads()
     }) == Some(true);
     if !anywhere {
+        describe_blocked();
         fatal("deadlock: every thread is blocked");
     }
     let began = std::time::Instant::now();
@@ -542,6 +543,33 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
             fatal("deadlock: every thread is blocked, and no outside thread woke one");
         }
     }
+}
+
+/// What each blocked thread of the run waits for, for the deadlock report.
+fn describe_blocked() {
+    let mut text = String::new();
+    with(|s, _| {
+        let _ = writeln!(text, "blocked threads at virtual time {} ns:", s.clock_ns);
+        for (id, t) in s.threads[..s.nthreads as usize].iter().enumerate() {
+            if t.state != shared::T_BLOCKED {
+                continue;
+            }
+            let what = match t.key {
+                shared::WAIT_KEY => "a child to exit".to_string(),
+                shared::IO_KEY => "I/O (read, accept, poll, kevent…)".to_string(),
+                shared::SLEEP_KEY => "a sleep".to_string(),
+                shared::RESTART_KEY => "its restart delay".to_string(),
+                key => format!("a lock, condition or join at {key:#x}"),
+            };
+            let until = if t.deadline == 0 {
+                String::new()
+            } else {
+                format!(" until {} ns", t.deadline)
+            };
+            let _ = writeln!(text, "  p{} t{id}: {what}{until}", t.pid);
+        }
+    });
+    crate::report::log(text.trim_end());
 }
 
 /// What a hand-off decided, copied out from under the lock.

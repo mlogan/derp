@@ -1,0 +1,14 @@
+[package]
+name = "kv"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# A test guest, built by the tests on its own: not part of the workspace
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "io-util", "macros"] }
+
+[profile.dev]
+opt-level = 1

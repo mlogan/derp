@@ -803,6 +803,9 @@ pub unsafe extern "C" fn my_dup(fd: c_int) -> c_int {
     sched::hook_event(sched::SITE_NET);
     let sock = lookup(fd);
     let new = libc::dup(fd);
+    if new >= 0 {
+        crate::kq::duplicated(fd, new);
+    }
     if let (Some(sock), true) = (sock, new >= 0) {
         duplicated(sock);
     }
@@ -817,6 +820,7 @@ pub unsafe extern "C" fn my_dup2(fd: c_int, target: c_int) -> c_int {
     if new >= 0 && fd != target {
         // Whatever `target` was is closed, registrations and all
         crate::kq::closed(target);
+        crate::kq::duplicated(fd, target);
         if let Some(sock) = sock {
             duplicated(sock);
         }
@@ -843,6 +847,9 @@ pub unsafe extern "C" fn rewrite_fcntl_impl(fd: c_int, cmd: c_int, arg: usize) -
         return crate::files::record_lock(fd, cmd == libc::F_SETLKW, arg as *mut libc::flock);
     }
     let rc = libc::fcntl(fd, cmd, arg);
+    if rc >= 0 && (cmd == libc::F_DUPFD || cmd == libc::F_DUPFD_CLOEXEC) {
+        crate::kq::duplicated(fd, rc);
+    }
     if let (Some(sock), true) = (sock, rc >= 0) {
         duplicated(sock);
     }

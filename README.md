@@ -154,6 +154,14 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   groups, sources and I/O end the run with exit status 69 and a message
   naming the call. `dispatch_sync` and dispatch semaphores are fine. System
   libraries may use GCD internally; what they do there is input.
+- Blocking must go through something the scheduler sees, or the thread
+  sleeps in the kernel holding the baton. Seen: pthread mutexes, condition
+  variables (also `pthread_cond_timedwait_relative_np`, which is Rust's
+  `Condvar::wait_timeout`) and rwlocks, `os_unfair_lock` and the ulock
+  calls, dispatch semaphores, sleeps, `poll`/`select`/`kevent`, socket and
+  pipe I/O, `waitpid`. An async runtime works: tokio's multi-thread
+  runtime, reactor, blocking pool, timers and `tokio::sync` are tested
+  (`tests/programs/kv`). A deadlock report lists what each thread waits for.
 - Guests see virtual pids from 100,000 up (above any real pid), in spawn
   order; the launcher is pid 1.
 

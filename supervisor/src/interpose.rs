@@ -168,8 +168,13 @@ extern "C" fn trampoline(p: *mut c_void) -> *mut c_void {
 pub extern "C" fn thread_teardown(value: *mut c_void) {
     let id = value as usize - 1;
     count(C_EXIT);
-    sched::forget_thread();
+    // libpthread cleared our key before calling us. The join wake is still
+    // this scheduled thread's, made with the baton: it must not count as a
+    // wake from outside the schedule. After it, the thread is outside.
+    sched::set_identity(Some(id));
     sched::wake_all(join_key(id));
+    sched::set_identity(None);
+    sched::forget_thread();
     sched::yield_baton_as(id, State::Exited, 0, None);
 }
 

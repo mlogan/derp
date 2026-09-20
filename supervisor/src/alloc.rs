@@ -39,6 +39,12 @@ struct Header {
 }
 
 struct Heap {
+    /// Where the region should go and how big it is
+    hint: usize,
+    size: usize,
+    /// The guest's heap: its addresses are guest-visible, so a region that
+    /// lands elsewhere is worth a log line
+    guests: bool,
     base: usize,
     bump: usize,
     end: usize,
@@ -50,25 +56,81 @@ struct Heap {
     broken: bool,
 }
 
-static HEAP: SpinLock<Heap> = SpinLock::new(Heap {
-    base: 0,
-    bump: 0,
-    end: 0,
-    small: [0; N_SMALL],
-    large: [0; N_LARGE],
-    huge: 0,
-    broken: false,
-});
+impl Heap {
+    const fn new(hint: usize, size: usize, guests: bool) -> Heap {
+        Heap {
+            hint,
+            size,
+            guests,
+            base: 0,
+            bump: 0,
+            end: 0,
+            small: [0; N_SMALL],
+            large: [0; N_LARGE],
+            huge: 0,
+            broken: false,
+        }
+    }
+}
+
+static HEAP: SpinLock<Heap> = SpinLock::new(Heap::new(REGION_HINT, REGION_SIZE, true));
+
+/// The supervisor's own memory. Were it libmalloc's, our threads would
+/// share libmalloc's locks with each other and with the system libraries,
+/// in real time: a thread starting up, one that has handed the baton on,
+/// and the baton holder collide there, the loser's wait reaches our ulock
+/// interposer, and a collision that has nothing to do with the guest ends
+/// up in its schedule. Behind our own spin lock nothing of the kind can be
+/// seen from outside. It also makes allocating safe where libmalloc is not
+/// (after `fork`, from inside libmalloc's own lock path).
+static OWN: SpinLock<Heap> = SpinLock::new(Heap::new(OWN_HINT, OWN_SIZE, false));
+
+/// Between the guest's heap and the scheduler's fixed region
+const OWN_HINT: usize = 0x76_0000_0000;
+const OWN_SIZE: usize = 1 << 30;
+
+pub struct Private;
+
+#[global_allocator]
+static GLOBAL: Private = Private;
+
+unsafe impl std::alloc::GlobalAlloc for Private {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = OWN.lock().alloc(layout.size(), layout.align().max(16));
+        if p.is_null() {
+            // No region to be had: libmalloc still works
+            return libc::malloc(layout.size()).cast();
+        }
+        p.cast()
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, _: std::alloc::Layout) {
+        let mut own = OWN.lock();
+        if own.contains(p as usize) {
+            own.free(p as usize);
+        } else {
+            drop(own);
+            libc::free(p.cast());
+        }
+    }
+}
+
+/// Whether `p` is the supervisor's own memory, which may reach the guest's
+/// `free` when we hand a guest something we allocated.
+fn in_own(p: *mut c_void) -> bool {
+    OWN.lock().contains(p as usize)
+}
 
 /// In the child of a `fork`: see `SpinLock::force_unlock`.
 pub fn forked() {
     HEAP.force_unlock();
+    OWN.force_unlock();
 }
 
 /// True when the region is in use at its fixed address
 pub fn region_fixed() -> bool {
     let h = HEAP.lock();
-    h.base == REGION_HINT
+    h.base == h.hint
 }
 
 impl Heap {
@@ -79,14 +141,14 @@ impl Heap {
         // A fixed Mach allocation fails instead of replacing what is there,
         // so MAP_FIXED over it is safe; an mmap hint alone is ignored by
         // the kernel now and then.
-        let mut addr = REGION_HINT as u64;
+        let mut addr = self.hint as u64;
         let reserved =
-            unsafe { mach_vm_allocate(mach_task_self_, &raw mut addr, REGION_SIZE as u64, 0) } == 0;
+            unsafe { mach_vm_allocate(mach_task_self_, &raw mut addr, self.size as u64, 0) } == 0;
         let fixed = if reserved { libc::MAP_FIXED } else { 0 };
         let p = unsafe {
             libc::mmap(
-                REGION_HINT as *mut c_void,
-                REGION_SIZE,
+                self.hint as *mut c_void,
+                self.size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_PRIVATE | libc::MAP_ANON | fixed,
                 -1,
@@ -97,14 +159,15 @@ impl Heap {
             self.broken = true;
             return;
         }
-        if p as usize != REGION_HINT {
+        // Logging allocates: never from inside the supervisor's own heap
+        if p as usize != self.hint && self.guests {
             crate::report::log(
                 "heap region did not land at its fixed address; heap layout may vary",
             );
         }
         self.base = p as usize;
         self.bump = self.base;
-        self.end = self.base + REGION_SIZE;
+        self.end = self.base + self.size;
     }
 
     fn contains(&self, p: usize) -> bool {
@@ -288,7 +351,14 @@ pub extern "C" fn my_free(p: *mut c_void) {
         }
     } else {
         drop(h);
-        unsafe { libc::free(p) };
+        let mut own = OWN.lock();
+        if own.contains(p as usize) {
+            // Something of ours that a guest was given to free
+            own.free(p as usize);
+        } else {
+            drop(own);
+            unsafe { libc::free(p) };
+        }
     }
 }
 
@@ -296,7 +366,7 @@ pub extern "C" fn my_realloc(p: *mut c_void, size: usize) -> *mut c_void {
     if p.is_null() {
         return my_malloc(size);
     }
-    if !in_region(p) {
+    if !in_region(p) && !in_own(p) {
         return unsafe { libc::realloc(p, size) };
     }
     let old = Heap::usable(p as usize);
@@ -348,7 +418,7 @@ pub extern "C" fn my_valloc(size: usize) -> *mut c_void {
 }
 
 pub extern "C" fn my_malloc_size(p: *const c_void) -> usize {
-    if in_region(p.cast_mut()) {
+    if in_region(p.cast_mut()) || in_own(p.cast_mut()) {
         Heap::usable(p as usize)
     } else {
         unsafe { libc::malloc_size(p) }

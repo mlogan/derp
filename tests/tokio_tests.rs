@@ -221,11 +221,8 @@ impl Drop for CpuLoad {
 /// real time moves some address after it. The schedule hash alone can miss
 /// that (it only sees the addresses of contended locks).
 ///
-/// Ignored by default because it still fails about once in 1,000 runs
-/// under load (`TASKS_TOKIO.md`, "Open"); run it to hunt:
-/// `REWRITE_STRESS_RUNS=600 cargo test heap_addresses -- --ignored`
+/// `REWRITE_STRESS_RUNS=2000 cargo test heap_addresses` hunts for rare cases.
 #[test]
-#[ignore = "known rare failure under load; a hunting tool until that is fixed"]
 fn tokio_heap_addresses_are_a_function_of_the_seed() {
     let dir = common::scratch_dir("tokio_addrs");
     common::build_kv(&dir);

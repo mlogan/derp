@@ -132,6 +132,14 @@ pub fn is_parked(id: usize) -> bool {
     shared().is_some_and(|sh| sh.is_parked(id))
 }
 
+/// Set or clear this thread's scheduler id without touching the port list.
+/// A value left set when a key destructor returns would run it again.
+pub fn set_identity(id: Option<usize>) {
+    let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
+    let value = id.map_or(std::ptr::null(), |id| (id + 1) as *const c_void);
+    unsafe { libc::pthread_setspecific(key, value) };
+}
+
 pub fn forget_thread() {
     let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
     PORTS.lock().retain(|&(p, _)| p != port);

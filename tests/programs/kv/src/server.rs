@@ -91,14 +91,22 @@ fn process(store: &Store, mut inbox: mpsc::Receiver<Job>, clients: usize, log: O
                 }
             }
         }
-        std::fs::OpenOptions::new().create(true).append(true).open(path).unwrap()
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
     });
     while let Some(Job { write, reply }) = inbox.blocking_recv() {
         let mut map = store.map.blocking_write();
         let (changed, answer, record) = match write {
             Write::Set(k, v) => (k.clone(), "OK".to_string(), format!("SET {k} {v}\n")),
             Write::Del(k) => (k.clone(), "OK".to_string(), format!("DEL {k}\n")),
-            Write::Done(id) => (format!("__done:{id}"), "OK".to_string(), format!("SET __done:{id} 1\n")),
+            Write::Done(id) => (
+                format!("__done:{id}"),
+                "OK".to_string(),
+                format!("SET __done:{id} 1\n"),
+            ),
             Write::Incr(k, id) => {
                 let marker = format!("__applied:{id}");
                 if let Some(earlier) = map.get(&marker) {
@@ -106,7 +114,11 @@ fn process(store: &Store, mut inbox: mpsc::Receiver<Job>, clients: usize, log: O
                     continue;
                 }
                 let n = map.get(&k).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) + 1;
-                (k.clone(), format!("VALUE {n}"), format!("SET {k} {n}\nSET {marker} {n}\n"))
+                (
+                    k.clone(),
+                    format!("VALUE {n}"),
+                    format!("SET {k} {n}\nSET {marker} {n}\n"),
+                )
             }
         };
         if let Some(f) = file.as_mut() {
@@ -202,7 +214,11 @@ async fn connection(stream: TcpStream, store: Arc<Store>, jobs: mpsc::Sender<Job
             }
             _ => {
                 let answer = read_only(&store, &words).await;
-                if wr.write_all(format!("{answer}\n").as_bytes()).await.is_err() {
+                if wr
+                    .write_all(format!("{answer}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
                     return;
                 }
                 continue;
@@ -213,7 +229,11 @@ async fn connection(stream: TcpStream, store: Arc<Store>, jobs: mpsc::Sender<Job
             return;
         }
         let Ok(answer) = answer.await else { return };
-        if wr.write_all(format!("{answer}\n").as_bytes()).await.is_err() {
+        if wr
+            .write_all(format!("{answer}\n").as_bytes())
+            .await
+            .is_err()
+        {
             return;
         }
     }

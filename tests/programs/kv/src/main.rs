@@ -71,7 +71,10 @@ impl Conn {
             }
             let stream = self.stream.as_mut().unwrap();
             let mut reply = String::new();
-            let sent = stream.get_mut().write_all(format!("{line}\n").as_bytes()).await;
+            let sent = stream
+                .get_mut()
+                .write_all(format!("{line}\n").as_bytes())
+                .await;
             if sent.is_ok() && matches!(stream.read_line(&mut reply).await, Ok(n) if n > 0) {
                 return reply.trim_end().to_string();
             }
@@ -88,14 +91,21 @@ async fn client(addr: String, id: u32, rounds: u32) {
     for t in 0..TASKS {
         let (addr, barrier) = (addr.clone(), barrier.clone());
         tasks.spawn(async move {
-            let mut c = Conn { addr, stream: None, reconnects: 0 };
+            let mut c = Conn {
+                addr,
+                stream: None,
+                reconnects: 0,
+            };
             // Connected before the start, so that all three race
             assert!(c.request("STATS").await.starts_with("STATS"));
             barrier.wait().await;
             for i in 0..rounds {
                 let (key, value) = (format!("c{id}t{t}k{}", i % 5), format!("v{i}"));
                 assert_eq!(c.request(&format!("SET {key} {value}")).await, "OK");
-                assert_eq!(c.request(&format!("GET {key}")).await, format!("VALUE {value}"));
+                assert_eq!(
+                    c.request(&format!("GET {key}")).await,
+                    format!("VALUE {value}")
+                );
                 let n = c.request(&format!("INCR counter{id} c{id}t{t}i{i}")).await;
                 assert!(n.starts_with("VALUE "), "{n}");
                 c.request(&format!("INCR total c{id}t{t}i{i}T")).await;
@@ -115,7 +125,11 @@ async fn client(addr: String, id: u32, rounds: u32) {
     let watcher = {
         let addr = addr.clone();
         tokio::spawn(async move {
-            let mut c = Conn { addr, stream: None, reconnects: 0 };
+            let mut c = Conn {
+                addr,
+                stream: None,
+                reconnects: 0,
+            };
             assert_eq!(c.request("SUBSCRIBE").await, "OK");
             let mut stream = c.stream.take().unwrap();
             let (mut changes, mut line) = (0u32, String::new());
@@ -134,7 +148,11 @@ async fn client(addr: String, id: u32, rounds: u32) {
     while let Some(r) = tasks.join_next().await {
         reconnects += r.expect("client task");
     }
-    let mut c = Conn { addr, stream: None, reconnects: 0 };
+    let mut c = Conn {
+        addr,
+        stream: None,
+        reconnects: 0,
+    };
     let counter = c.request(&format!("GET counter{id}")).await;
     assert_eq!(counter, format!("VALUE {}", TASKS * rounds));
     assert_eq!(c.request(&format!("DONE {id}")).await, "OK");

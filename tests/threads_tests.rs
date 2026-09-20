@@ -132,3 +132,25 @@ fn channel_output_is_correct_and_schedule_is_stable() {
     hashes.dedup();
     assert!(hashes.len() > 1, "every seed produced the same schedule");
 }
+
+#[test]
+fn rwlock_readers_never_see_half_a_write() {
+    let dir = common::scratch_dir("rwlock");
+    let exe = common::build_c("rwlock", &dir, &[]);
+    let expected = "a=40000 b=40000 reads=80000 torn=0 probes=some\n";
+    for seed in 1..=4u64 {
+        let rw = dir.join(format!("rwlock.rw{seed}"));
+        rewrite_to(
+            &exe,
+            &rw,
+            &Options {
+                seed,
+                mem_rate: (1, 8),
+            },
+        );
+        let (text, hash) = supervised(&rw, &[], seed);
+        assert_eq!(text, expected, "seed {seed}");
+        let (text2, hash2) = supervised(&rw, &[], seed);
+        assert_eq!((text2, hash2), (text, hash), "seed {seed} not repeatable");
+    }
+}

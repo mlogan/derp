@@ -236,7 +236,11 @@ async fn notify_barrier_once() -> u64 {
     while let Some(v) = set.join_next().await {
         sum += v.unwrap();
     }
-    assert_eq!(inits.load(Ordering::SeqCst), 1, "OnceCell ran its init twice");
+    assert_eq!(
+        inits.load(Ordering::SeqCst),
+        1,
+        "OnceCell ran its init twice"
+    );
     // One leader among the waiters, unless it was us
     assert!(sum == 42 * WORKERS || sum == 42 * WORKERS + 1);
     42 * WORKERS
@@ -255,15 +259,18 @@ async fn time() -> u64 {
     let mut set = JoinSet::new();
     for ms in [30u64, 10, 20] {
         set.spawn(async move {
+            let asleep = tokio::time::Instant::now();
             tokio::time::sleep(Duration::from_millis(ms)).await;
+            assert!(asleep.elapsed() >= Duration::from_millis(ms), "woke early");
             ms
         });
     }
-    let mut order = Vec::new();
+    // Not their order: a late start can cost a sleeper more than 10 ms
+    let mut slept = 0;
     while let Some(ms) = set.join_next().await {
-        order.push(ms.unwrap());
+        slept += ms.unwrap();
     }
-    assert_eq!(order, [10, 20, 30], "sleepers woke out of order");
+    assert_eq!(slept, 60);
     assert!(began.elapsed() >= Duration::from_millis(90));
     seven
 }

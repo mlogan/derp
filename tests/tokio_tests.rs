@@ -14,8 +14,19 @@ use std::process::Command;
 const SMALL_QUANTUM: [&str; 2] = ["--quantum", "50..500"];
 
 fn twice(manifest: &std::path::Path, scratch: &std::path::Path, seed: u64, n: usize) -> RunReport {
-    let first = run_manifest_with(manifest, scratch, seed, n, &SMALL_QUANTUM);
-    let again = run_manifest_with(manifest, scratch, seed, n, &SMALL_QUANTUM);
+    twice_with(manifest, scratch, seed, n, &[])
+}
+
+fn twice_with(
+    manifest: &std::path::Path,
+    scratch: &std::path::Path,
+    seed: u64,
+    n: usize,
+    extra: &[&str],
+) -> RunReport {
+    let options = [&SMALL_QUANTUM[..], extra].concat();
+    let first = run_manifest_with(manifest, scratch, seed, n, &options);
+    let again = run_manifest_with(manifest, scratch, seed, n, &options);
     assert_eq!(again.stdout, first.stdout, "seed {seed} not repeatable");
     assert_eq!(
         again.fields["run.schedule_hash"], first.fields["run.schedule_hash"],
@@ -40,8 +51,14 @@ fn tokio_sync_primitives_hold_under_every_schedule() {
     )
     .unwrap();
     let mut hashes = Vec::new();
-    for seed in 1..=4 {
-        let r = twice(&manifest, &dir.join("scratch"), seed, 1);
+    for (seed, hooks) in [(1, "0"), (2, "0"), (3, "1/16"), (4, "1")] {
+        let r = twice_with(
+            &manifest,
+            &dir.join("scratch"),
+            seed,
+            1,
+            &["--mem-hook-rate", hooks],
+        );
         // The program checks itself; what it prints is the same always
         assert_eq!(r.stdout[0], expected, "seed {seed}");
         assert!(r.u64("p0.threads") >= 5, "workers and a blocking pool");
@@ -108,8 +125,17 @@ fn tokio_kv_server_survives_crashes() {
     let faults = "        restart: on-failure\n        restart-delay: 50ms..150ms\n\
                   \x20       crash: { every: 150ms..400ms, times: 3 }\n";
     std::fs::write(&manifest, KV_RUN.replace("SERVER_EXTRA", faults)).unwrap();
-    for seed in 1..=2 {
-        let r = twice(&manifest, &dir.join("scratch"), seed, 3);
+    // Also with switch points at memory accesses: between the halves of the
+    // runtime's own atomics-and-queues protocols, and with less done per
+    // virtual millisecond, so crashes land earlier in the work
+    for (seed, hooks) in [(1, "0"), (2, "0"), (2, "1/4")] {
+        let r = twice_with(
+            &manifest,
+            &dir.join("scratch"),
+            seed,
+            3,
+            &["--mem-hook-rate", hooks],
+        );
         assert_eq!(r.u64("run.crashes_injected"), 3, "seed {seed}");
         assert_eq!(r.u64("run.restarts"), 3, "seed {seed}");
         // Only the last life gets to print

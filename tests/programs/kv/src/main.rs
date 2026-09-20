@@ -121,27 +121,40 @@ async fn client(addr: String, id: u32, rounds: u32) {
             c.reconnects
         });
     }
-    // Watches the changes go by until the server ends the stream or dies
+    // Watches the changes go by until the server ends the stream. A server
+    // that dies takes the subscription with it: subscribe again, unless the
+    // client is finished and the server may be gone for good.
+    let (finished, mut is_finished) = tokio::sync::watch::channel(false);
     let watcher = {
         let addr = addr.clone();
         tokio::spawn(async move {
-            let mut c = Conn {
-                addr,
-                stream: None,
-                reconnects: 0,
-            };
-            assert_eq!(c.request("SUBSCRIBE").await, "OK");
-            let mut stream = c.stream.take().unwrap();
             let (mut changes, mut line) = (0u32, String::new());
-            while matches!(stream.read_line(&mut line).await, Ok(n) if n > 0) {
-                match line.trim_end() {
-                    "END" => break,
-                    l => assert!(l.starts_with("CHANGE ") || l.starts_with("LAGGED "), "{l}"),
+            loop {
+                let mut c = Conn {
+                    addr: addr.clone(),
+                    stream: None,
+                    reconnects: 0,
+                };
+                tokio::select! {
+                    reply = c.request("SUBSCRIBE") => assert_eq!(reply, "OK"),
+                    _ = is_finished.wait_for(|&f| f) => return changes,
                 }
-                changes += 1;
-                line.clear();
+                let mut stream = c.stream.take().unwrap();
+                loop {
+                    line.clear();
+                    if !matches!(stream.read_line(&mut line).await, Ok(n) if n > 0) {
+                        break;
+                    }
+                    match line.trim_end() {
+                        "END" => return changes,
+                        l => assert!(l.starts_with("CHANGE ") || l.starts_with("LAGGED "), "{l}"),
+                    }
+                    changes += 1;
+                }
+                if *is_finished.borrow() {
+                    return changes;
+                }
             }
-            changes
         })
     };
     let mut reconnects = 0;
@@ -156,6 +169,7 @@ async fn client(addr: String, id: u32, rounds: u32) {
     let counter = c.request(&format!("GET counter{id}")).await;
     assert_eq!(counter, format!("VALUE {}", TASKS * rounds));
     assert_eq!(c.request(&format!("DONE {id}")).await, "OK");
+    finished.send_replace(true);
     let changes = watcher.await.expect("watcher");
     assert!(changes > 0);
     println!("client {id}: {counter} reconnects={reconnects} changes={changes}");

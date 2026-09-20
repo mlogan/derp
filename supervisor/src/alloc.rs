@@ -30,6 +30,14 @@ const N_SMALL: usize = SMALL_MAX / 16;
 const N_LARGE: usize = 10;
 const PAGE: usize = 0x4000;
 
+/// A seeded heap hands out the region in slabs of this size
+const SLAB: usize = 64 << 10;
+const N_SLABS: usize = REGION_SIZE / SLAB;
+/// Blocks a seeded `malloc` chooses among, per class
+const POOL: usize = 32;
+/// Classes whose blocks fit a slab: the small ones, and 2 KB to 64 KB
+const N_POOLED: usize = N_SMALL + 6;
+
 /// Header just below the payload: where the raw block starts and how big
 /// the class is, so `free` can return the block regardless of alignment.
 #[repr(C)]
@@ -43,8 +51,18 @@ struct Heap {
     hint: usize,
     size: usize,
     /// The guest's heap: its addresses are guest-visible, so a region that
-    /// lands elsewhere is worth a log line
+    /// lands elsewhere is worth a log line, and where a block goes is drawn
+    /// from the seed (see `draw`)
     guests: bool,
+    /// Seeded before the first scheduled thread allocates; None keeps the
+    /// compact layout (the supervisor's own heap, and unit tests of it)
+    rng: Option<crate::rng::Rng>,
+    /// Which slabs of the region are taken
+    slabs: [u64; N_SLABS / 64],
+    /// Candidates `malloc` draws from, per class up to `SLAB`, as offsets
+    /// into the region
+    pools: [[u32; POOL]; N_POOLED],
+    pool_len: [u8; N_POOLED],
     base: usize,
     bump: usize,
     end: usize,
@@ -62,6 +80,10 @@ impl Heap {
             hint,
             size,
             guests,
+            rng: None,
+            slabs: [0; N_SLABS / 64],
+            pools: [[0; POOL]; N_POOLED],
+            pool_len: [0; N_POOLED],
             base: 0,
             bump: 0,
             end: 0,
@@ -119,6 +141,15 @@ unsafe impl std::alloc::GlobalAlloc for Private {
 /// `free` when we hand a guest something we allocated.
 fn in_own(p: *mut c_void) -> bool {
     OWN.lock().contains(p as usize)
+}
+
+/// From now on, where a guest's block lands is drawn from `seed`. Call
+/// before the first scheduled thread of the process allocates.
+pub fn seed_layout(seed: u64) {
+    let mut h = HEAP.lock();
+    if h.base == 0 {
+        h.rng = Some(crate::rng::Rng::seed_from_u64(seed));
+    }
 }
 
 /// In the child of a `fork`: see `SpinLock::force_unlock`.
@@ -230,8 +261,105 @@ impl Heap {
         None
     }
 
+    fn slab_taken(&self, i: usize) -> bool {
+        self.slabs[i / 64] & (1 << (i % 64)) != 0
+    }
+
+    fn mark_slabs(&mut self, first: usize, n: usize, taken: bool) {
+        for i in first..first + n {
+            if taken {
+                self.slabs[i / 64] |= 1 << (i % 64);
+            } else {
+                self.slabs[i / 64] &= !(1 << (i % 64));
+            }
+        }
+    }
+
+    /// A run of `n` free slabs starting at a random index, now taken.
+    fn take_slabs(&mut self, n: usize) -> Option<usize> {
+        let last = N_SLABS.checked_sub(n)?;
+        let free = |h: &Heap, at: usize| (at..at + n).all(|i| !h.slab_taken(i));
+        let rng = self.rng.as_mut()?;
+        // The region is mostly empty: a few draws find room. When they do
+        // not, the first fit from one more drawn index does, if any exists.
+        let mut tries = [0usize; 17];
+        for t in &mut tries {
+            *t = rng.below(last as u64 + 1) as usize;
+        }
+        let at = tries[..16]
+            .iter()
+            .copied()
+            .find(|&at| free(self, at))
+            .or_else(|| {
+                (0..=last)
+                    .map(|k| (tries[16] + k) % (last + 1))
+                    .find(|&at| free(self, at))
+            })?;
+        self.mark_slabs(at, n, true);
+        Some(self.base + at * SLAB)
+    }
+
+    /// A block of pooled class `c`, drawn from its candidates.
+    fn draw(&mut self, c: usize, size: usize) -> Option<usize> {
+        if self.pool_len[c] == 0 {
+            self.refill(c, size)?;
+        }
+        let len = self.pool_len[c] as usize;
+        // Half the time the newest candidate, which after a `free` is the
+        // block just freed: programs meet immediate reuse and its absence
+        let draw = self.rng.as_mut()?.below(2 * len as u64) as usize;
+        let i = if draw < len { draw } else { len - 1 };
+        let p = self.base + self.pools[c][i] as usize;
+        self.pools[c][i] = self.pools[c][len - 1];
+        self.pool_len[c] -= 1;
+        Some(p)
+    }
+
+    /// Candidates for class `c`: freed blocks that overflowed the pool
+    /// first, then a new slab at a random place, its slots in drawn order.
+    fn refill(&mut self, c: usize, size: usize) -> Option<()> {
+        while (self.pool_len[c] as usize) < POOL {
+            let Some(p) = self.pop(c) else { break };
+            self.offer(c, p);
+        }
+        if self.pool_len[c] > 0 {
+            return Some(());
+        }
+        let slab = self.take_slabs(1)?;
+        let n = SLAB / size;
+        let mut order = [0u16; SLAB / 16];
+        for (i, o) in order[..n].iter_mut().enumerate() {
+            *o = i as u16;
+        }
+        for i in (1..n).rev() {
+            let j = self.rng.as_mut()?.below(i as u64 + 1) as usize;
+            order.swap(i, j);
+        }
+        for &slot in &order[..n] {
+            let p = slab + slot as usize * size;
+            if (self.pool_len[c] as usize) < POOL {
+                self.offer(c, p);
+            } else {
+                self.push(c, p);
+            }
+        }
+        Some(())
+    }
+
+    /// Add `p` to the candidates of class `c`, which has room.
+    fn offer(&mut self, c: usize, p: usize) {
+        self.pools[c][self.pool_len[c] as usize] = (p - self.base) as u32;
+        self.pool_len[c] += 1;
+    }
+
     fn alloc_raw(&mut self, raw_size: usize) -> Option<(usize, usize)> {
         let (class, size) = Self::class_for(raw_size);
+        if self.rng.is_some() {
+            return match class {
+                Some(c) if c < N_POOLED => Some((self.draw(c, size)?, size)),
+                _ => Some((self.take_slabs(size.div_ceil(SLAB))?, size)),
+            };
+        }
         if let Some(c) = class {
             if let Some(p) = self.pop(c) {
                 return Some((p, size));
@@ -249,6 +377,14 @@ impl Heap {
 
     fn free_raw(&mut self, raw: usize, class_size: usize) {
         let (class, _) = Self::class_for(class_size);
+        if self.rng.is_some() {
+            match class {
+                Some(c) if c < N_POOLED && (self.pool_len[c] as usize) < POOL => self.offer(c, raw),
+                Some(c) if c < N_POOLED => self.push(c, raw),
+                _ => self.mark_slabs((raw - self.base) / SLAB, class_size.div_ceil(SLAB), false),
+            }
+            return;
+        }
         if let Some(c) = class {
             self.push(c, raw);
         } else {
@@ -428,4 +564,104 @@ pub extern "C" fn my_malloc_size(p: *const c_void) -> usize {
 pub extern "C" fn my_malloc_good_size(size: usize) -> usize {
     let (_, class) = Heap::class_for(size.max(1) + HEADER);
     class - HEADER
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A seeded heap of its own, away from the process's two
+    fn heap(seed: u64, hint: usize) -> Box<Heap> {
+        let mut h = Box::new(Heap::new(hint, REGION_SIZE, false));
+        h.rng = Some(crate::rng::Rng::seed_from_u64(seed));
+        h
+    }
+
+    const SIZES: [usize; 9] = [1, 40, 64, 900, 1024, 5000, 60_000, 300_000, 3 << 20];
+
+    fn addresses(seed: u64, hint: usize) -> Vec<usize> {
+        let mut h = heap(seed, hint);
+        let mut out = Vec::new();
+        for round in 0..40 {
+            let p = h.alloc(SIZES[round % SIZES.len()], 16) as usize;
+            assert_ne!(p, 0);
+            out.push(p - h.base);
+            if round % 3 == 2 {
+                h.free(p);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_seed_fixes_the_layout_and_seeds_differ() {
+        assert_eq!(addresses(7, 0x60_0000_0000), addresses(7, 0x61_0000_0000));
+        assert_ne!(addresses(7, 0x62_0000_0000), addresses(8, 0x63_0000_0000));
+    }
+
+    #[test]
+    fn live_blocks_never_overlap_and_are_aligned() {
+        let mut h = heap(3, 0x64_0000_0000);
+        let mut live: Vec<(usize, usize)> = Vec::new();
+        for round in 0..600usize {
+            let size = SIZES[round % SIZES.len()] + round % 7;
+            let align = if round % 5 == 0 { PAGE } else { 16 };
+            let p = h.alloc(size, align) as usize;
+            assert_ne!(p, 0);
+            assert_eq!(p % align, 0);
+            assert!(Heap::usable(p) >= size);
+            assert!(h.contains(p) && h.contains(p + size - 1));
+            for &(q, n) in &live {
+                assert!(
+                    p + size <= q || q + n <= p,
+                    "{p:#x}+{size} overlaps {q:#x}+{n}"
+                );
+            }
+            live.push((p, size));
+            if round % 2 == 1 {
+                let (q, _) = live.swap_remove(round * 31 % live.len());
+                h.free(q);
+            }
+        }
+    }
+
+    #[test]
+    fn two_blocks_compare_both_ways_across_seeds() {
+        for sizes in [(40, 40), (24, 900), (5000, 300_000), (3 << 20, 3 << 20)] {
+            let mut below = 0;
+            for seed in 0..32 {
+                let mut h = heap(seed, 0x65_0000_0000 + (seed as usize) * REGION_SIZE);
+                let (a, b) = (h.alloc(sizes.0, 16) as usize, h.alloc(sizes.1, 16) as usize);
+                below += usize::from(a < b);
+            }
+            assert!(
+                (6..=26).contains(&below),
+                "{sizes:?}: a<b on {below} of 32 seeds"
+            );
+        }
+    }
+
+    #[test]
+    fn a_freed_block_comes_straight_back_only_sometimes() {
+        let mut h = heap(5, 0x66_0000_0000 + 40 * REGION_SIZE);
+        let mut back = 0;
+        for _ in 0..200 {
+            let p = h.alloc(64, 16) as usize;
+            h.free(p);
+            let q = h.alloc(64, 16) as usize;
+            back += usize::from(p == q);
+            h.free(q);
+        }
+        assert!((60..=140).contains(&back), "{back} of 200");
+    }
+
+    #[test]
+    fn a_freed_run_of_slabs_is_free_again() {
+        let mut h = heap(9, 0x67_0000_0000 + 80 * REGION_SIZE);
+        let taken = |h: &Heap| h.slabs.iter().map(|w| w.count_ones()).sum::<u32>();
+        let p = h.alloc(3 << 20, 16) as usize;
+        assert_eq!(taken(&h), (3usize << 20).div_ceil(SLAB) as u32 + 1);
+        h.free(p);
+        assert_eq!(taken(&h), 0);
+    }
 }

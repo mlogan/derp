@@ -451,6 +451,12 @@ a key-value server and clients on tokio using most of `tokio::sync`, runs
 repeatably, also under fault injection. Plan in
 `IMPLEMENTATION_PLAN_TOKIO.md`, findings in `TASKS_TOKIO.md`.
 
+**Seeded heap layout** (branch `mlogan-seeded-heap`, complete): where a
+guest's heap blocks land, and whether a freed block is reused at once, is
+drawn from the seed, so bugs that depend on pointer order can be found and
+replayed. Plan in `IMPLEMENTATION_PLAN_HEAP.md`, progress in
+`TASKS_HEAP.md`.
+
 **Next Phase**: Not yet planned
 
 ---

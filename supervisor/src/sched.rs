@@ -473,11 +473,17 @@ pub fn clock_read() -> Option<u64> {
     with(|s, _| s.clock_read())
 }
 
+static YIELDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// `yield_baton` for a caller that already knows its id (the teardown hook
 /// runs after libpthread has cleared the key value).
 pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>) {
     let Some(sh) = shared() else { return };
     settle_hooks();
+    // A thread that never parks still has to notice a dead launcher
+    if YIELDS.fetch_add(1, Ordering::Relaxed).is_multiple_of(4096) {
+        sh.exit_if_orphaned();
+    }
     let (st, key) = match state {
         State::Runnable => (shared::T_RUNNABLE, 0),
         State::Blocked(k) => (shared::T_BLOCKED, k as u64),
@@ -524,6 +530,7 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
     let began = std::time::Instant::now();
     loop {
         unsafe { libc::usleep(200) };
+        sh.exit_if_orphaned();
         let mut s = sh.lock();
         let handoff = s.choose(Some(me), site);
         let after = After::of(&mut s, handoff);
@@ -633,6 +640,10 @@ fn wait_out_deaths(sh: &Shared, new_quantum: bool) {
             return;
         }
         drop(s);
+        // Only the launcher can tell us that the victim is dead
+        if polls.is_multiple_of(1024) {
+            sh.exit_if_orphaned();
+        }
         unsafe { libc::usleep(50) };
     }
 }

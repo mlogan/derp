@@ -110,21 +110,44 @@ Decided with Mark: **waits on descriptors from outside the run stay
 unsupported**; they could not be repeated. Such a wait now says so once in
 the log instead of failing silently.
 
-## Open
+## The supervisor has its own allocator (2026-09-20)
 
-- **One 96-byte block of the deterministic heap is sometimes placed
-  differently**: same switches, same hook counts, same clock, every later
-  fresh address 0x70 off, so a different hash (the hash covers lock
-  addresses). About 1 run in 200 with tracing on and 1 in 1,000 without,
-  under heavy load, and only in runs that had a contended `__ulock_wait2`
-  (`interposed_ulock_wait` > 0); most such runs are fine. Not yet
-  explained. `kv addrs` prints where the heap would put a block of each
-  size at every step, so the first differing line names the phase; the
-  ignored test `tokio_heap_addresses_are_a_function_of_the_seed` repeats
-  it under load. Per-allocation logging hides it; an in-memory ring with
-  stacks for that size class is the way in.
-- One real hang (no debug code involved) in 2,000 such runs, at the first
-  hand-off to a new thread. Not reproduced since.
+Finding 10 treated the symptom. The cause was that the supervisor's Rust
+allocations went to libmalloc, so our threads shared libmalloc's locks with
+each other and with the system libraries, in real time. `alloc.rs` now has
+a second heap (`OWN`, 1 GB of address space at 0x76_0000_0000, the same
+size-class code as the guest's heap, its own spin lock) behind
+`#[global_allocator]`. The guest's `free`, `realloc` and `malloc_size`
+accept its pointers, in case a guest is ever handed one; Rust-side frees of
+foreign pointers go to libc. It initialises itself without allocating or
+logging, and is force-unlocked in a `fork` child like our other locks.
+
+Also fixed: the thread-exit hook's join wake was counted as a wake from
+outside the schedule (libpthread clears our key before calling the hook),
+which marked every threaded process as having outside threads. An idle run
+then polled for 30 s instead of reporting its deadlock. `outside_wakes` is
+0 again for a guest without GCD threads.
+
+Measured, seed 2 of `kv addrs`, 32 spinning processes, tracing on:
+
+| build | divergent runs | runs with a contended `__ulock_wait2` |
+|---|---|---|
+| before this round | about 1 in 40 | about 1 in 40 |
+| interposer fix only | 15 of 3,000 | 30 of 3,000 |
+| own allocator | 0 of 3,000 | 0 of 3,000 |
+
+and the test, with its own load and no tracing: 0 of 4,000 (2,000 per
+seed), then 0 of 1,000 after the exit-hook change. The 96-byte placement
+difference and the one hang listed as open are gone with the collisions;
+what exactly placed that block differently was never identified.
+`tokio_heap_addresses_are_a_function_of_the_seed` runs by default again
+(8 runs per seed; `REWRITE_STRESS_RUNS` to hunt).
+
+Cost: none measurable. `loops 3`, release: 1.74x branch hooks, 2.26x with
+memory hooks at 1/16 (1.73x and 2.21x before). Server with two clients at
+200 rounds, release: 0.609 s against 0.612 s with libmalloc. The stubs and
+the hand-off path never allocated; the supervisor allocates a few small
+blocks per intercepted system call.
 
 ## Limits
 

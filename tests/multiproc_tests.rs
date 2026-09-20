@@ -1409,3 +1409,64 @@ fn restarts_stop_where_the_run_file_says() {
         );
     }
 }
+
+/// Guests must not outlive a launcher that is killed: one parked in
+/// `accept` and one that keeps the baton busy both notice and exit.
+#[test]
+fn guests_exit_when_the_launcher_is_killed() {
+    use std::time::{Duration, Instant};
+    let dir = common::scratch_dir("orphans");
+    common::build_c("ping_pong", &dir, &[]);
+    common::build_c("lifecycle", &dir, &[]);
+    common::supervisor_dylib();
+    let manifest = dir.join("orphans.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - ping_pong pong 7000\n      - lifecycle forever\n",
+    )
+    .unwrap();
+    let mut launcher = Command::new(common::rewrite_bin())
+        .args(["run", "--capture", "--scratch"])
+        .arg(dir.join("scratch"))
+        .arg("--manifest")
+        .arg(&manifest)
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let children = || -> Vec<i32> {
+        let out = Command::new("pgrep")
+            .args(["-P", &launcher.id().to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    };
+    let began = Instant::now();
+    let mut guests = children();
+    while guests.len() < 2 {
+        assert!(
+            began.elapsed() < Duration::from_secs(30),
+            "guests never started"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        guests = children();
+    }
+    // Let them attach and settle into the run
+    std::thread::sleep(Duration::from_millis(500));
+    launcher.kill().unwrap();
+    launcher.wait().unwrap();
+
+    let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+    let began = Instant::now();
+    while guests.iter().any(|&g| alive(g)) {
+        if began.elapsed() > Duration::from_secs(20) {
+            for &g in &guests {
+                unsafe { libc::kill(g, libc::SIGKILL) };
+            }
+            panic!("guests outlived the launcher");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

@@ -3,63 +3,10 @@
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-struct RunReport {
-    fields: BTreeMap<String, String>,
-    stdout: Vec<String>,
-}
-
-impl RunReport {
-    fn u64(&self, key: &str) -> u64 {
-        self.fields
-            .get(key)
-            .unwrap_or_else(|| panic!("{key} missing from {:?}", self.fields))
-            .parse()
-            .unwrap()
-    }
-}
-
-/// One `rewrite run --capture`: the guests' stdout from the scratch
-/// directory and the aggregated report from the launcher's stderr.
-fn run_manifest(manifest: &Path, scratch: &Path, seed: u64, guests: usize) -> RunReport {
-    run_manifest_with(manifest, scratch, seed, guests, &[])
-}
-
-fn run_manifest_with(
-    manifest: &Path,
-    scratch: &Path,
-    seed: u64,
-    guests: usize,
-    extra: &[&str],
-) -> RunReport {
-    common::supervisor_dylib();
-    let report = Command::new(common::rewrite_bin())
-        .args(["run", "--capture", "--seed", &seed.to_string()])
-        .args(extra)
-        .arg("--scratch")
-        .arg(scratch)
-        .arg("--manifest")
-        .arg(manifest)
-        .output()
-        .expect("rewrite run");
-    assert!(
-        report.status.success(),
-        "seed {seed}: {}",
-        String::from_utf8_lossy(&report.stderr)
-    );
-    let stdout = (0..guests)
-        .map(|i| std::fs::read_to_string(scratch.join(format!("stdout.{i}"))).unwrap())
-        .collect();
-    let fields = String::from_utf8_lossy(&report.stderr)
-        .lines()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
-    RunReport { fields, stdout }
-}
+use common::{run_manifest, run_manifest_with, RunReport};
 
 #[test]
 fn two_loops_processes_share_one_schedule() {

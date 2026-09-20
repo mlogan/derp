@@ -90,5 +90,7 @@ unit.
 ## Remaining (days 6-7 slack, not started)
 
 - Stub cost: keep `b.cond` at the site when in reach; x16/x17 at call sites.
-- Virtual-clock-driven timed waits.
-- Blocking pass-through calls (`read` on a pipe) still hold the baton.
+- ~~Virtual-clock-driven timed waits.~~ Done in the multi-process work
+  (`TASKS_MULTIPROC.md`, day 7).
+- ~~Blocking pass-through calls (`read` on a pipe) still hold the baton.~~
+  Done there too (day 4).

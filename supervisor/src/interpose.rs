@@ -43,7 +43,7 @@ use crate::io::{
     my_readv_nocancel, my_write, my_write_nocancel, my_writev, my_writev_nocancel, read_nocancel,
     readv_nocancel, write_nocancel, writev_nocancel,
 };
-use crate::kq::my_kevent;
+use crate::kq::{my_kevent, my_kqueue};
 use crate::names::{
     my_freeaddrinfo, my_freeifaddrs, my_getaddrinfo, my_gethostname, my_getifaddrs,
 };
@@ -82,6 +82,11 @@ macro_rules! interposers {
 }
 
 extern "C" {
+    fn pthread_cond_timedwait_relative_np(
+        c: *mut libc::pthread_cond_t,
+        m: *mut libc::pthread_mutex_t,
+        ts: *const libc::timespec,
+    ) -> c_int;
     fn __ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int;
     fn __ulock_wait2(op: u32, addr: *mut c_void, value: u64, timeout_ns: u64, value2: u64)
         -> c_int;
@@ -280,6 +285,33 @@ extern "C" fn my_pthread_cond_timedwait(
             .saturating_add((*ts).tv_nsec as u64)
     };
     let deadline = abs.saturating_sub(crate::determinism::REALTIME_BASE_NS);
+    cond_wait_until(c, m, me, deadline)
+}
+
+/// What Rust's `Condvar::wait_timeout` calls on this platform.
+extern "C" fn my_pthread_cond_timedwait_relative_np(
+    c: *mut libc::pthread_cond_t,
+    m: *mut libc::pthread_mutex_t,
+    ts: *const libc::timespec,
+) -> c_int {
+    let Some(me) = my_id() else {
+        return unsafe { pthread_cond_timedwait_relative_np(c, m, ts) };
+    };
+    count(C_COND);
+    let rel = unsafe {
+        ((*ts).tv_sec as u64)
+            .saturating_mul(1_000_000_000)
+            .saturating_add((*ts).tv_nsec as u64)
+    };
+    cond_wait_until(c, m, me, sched::now().saturating_add(rel))
+}
+
+fn cond_wait_until(
+    c: *mut libc::pthread_cond_t,
+    m: *mut libc::pthread_mutex_t,
+    me: usize,
+    deadline: u64,
+) -> c_int {
     cond_enqueue(c as usize, me);
     my_pthread_mutex_unlock(m);
     let signaled = cond_block(c as usize, me, Some(deadline));
@@ -292,6 +324,44 @@ extern "C" fn my_pthread_cond_timedwait(
     } else {
         libc::ETIMEDOUT
     }
+}
+
+// A contended real rwlock would sleep in the kernel with the baton held.
+// Try, and wait in the scheduler for an unlock instead. Writers are not
+// preferred over readers; who gets the lock next is the scheduler's draw.
+
+extern "C" fn my_pthread_rwlock_rdlock(l: *mut libc::pthread_rwlock_t) -> c_int {
+    if my_id().is_none() {
+        return unsafe { libc::pthread_rwlock_rdlock(l) };
+    }
+    loop {
+        let rc = unsafe { libc::pthread_rwlock_tryrdlock(l) };
+        if rc != libc::EBUSY {
+            return rc;
+        }
+        count(C_MUTEX);
+        sched::yield_baton(State::Blocked(l as usize), l as usize as u64);
+    }
+}
+
+extern "C" fn my_pthread_rwlock_wrlock(l: *mut libc::pthread_rwlock_t) -> c_int {
+    if my_id().is_none() {
+        return unsafe { libc::pthread_rwlock_wrlock(l) };
+    }
+    loop {
+        let rc = unsafe { libc::pthread_rwlock_trywrlock(l) };
+        if rc != libc::EBUSY {
+            return rc;
+        }
+        count(C_MUTEX);
+        sched::yield_baton(State::Blocked(l as usize), l as usize as u64);
+    }
+}
+
+extern "C" fn my_pthread_rwlock_unlock(l: *mut libc::pthread_rwlock_t) -> c_int {
+    let rc = unsafe { libc::pthread_rwlock_unlock(l) };
+    sched::wake_all(l as usize);
+    rc
 }
 
 fn cond_wake(c: usize, all: bool) {
@@ -609,6 +679,10 @@ interposers! {
     my_pthread_mutex_unlock => libc::pthread_mutex_unlock,
     my_pthread_cond_wait => libc::pthread_cond_wait,
     my_pthread_cond_timedwait => libc::pthread_cond_timedwait,
+    my_pthread_cond_timedwait_relative_np => pthread_cond_timedwait_relative_np,
+    my_pthread_rwlock_rdlock => libc::pthread_rwlock_rdlock,
+    my_pthread_rwlock_wrlock => libc::pthread_rwlock_wrlock,
+    my_pthread_rwlock_unlock => libc::pthread_rwlock_unlock,
     my_pthread_cond_signal => libc::pthread_cond_signal,
     my_pthread_cond_broadcast => libc::pthread_cond_broadcast,
     my_ulock_wait => __ulock_wait,
@@ -722,6 +796,7 @@ interposers! {
     rewrite_dispatch_write_shim => gcd_real::dispatch_write,
     rewrite_dispatch_io_create_shim => gcd_real::dispatch_io_create,
     my_kevent => libc::kevent,
+    my_kqueue => libc::kqueue,
     my_poll => libc::poll,
     my_select => libc::select,
     my_sendmsg => libc::sendmsg,

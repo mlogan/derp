@@ -84,12 +84,20 @@ Found and fixed:
    (`signals.rs`, `sigaction`/`signal` interposed for this signal only),
    the kernel's delivery is dropped, and the handler runs on the parent's
    next thread to take up the baton after the death is recorded.
-10. **A thread in its last exit cleanup freed deterministic-heap blocks**
-    after giving up the baton, reordering the free lists at a real-time
-    moment (same switches, different lock addresses, so a different
-    hash; 2 in 40 under load). A block of the deterministic heap freed by a
-    thread outside the schedule is now leaked. This also closes the
-    "outside thread frees a block" item of `TASKS_RUNFILE.md` §6.
+10. **Unexplained, not reproduced since:** after fix 9, seed 2 of
+    `kv extras` gave a second hash in 3 of 52 runs under load. The two
+    traces had the same switches, issue counts and clock; only a lock's
+    heap address differed (0x70 apart), so an allocation had landed
+    differently. I blamed frees of deterministic-heap blocks by threads
+    outside the schedule and made such frees leak the block. Measurement
+    says that was wrong for tokio: the report now counts such frees
+    (`heap_leaked_blocks`, `heap_leaked_bytes`) and every tokio mode shows
+    0, and with the old behaviour switched back on, 460 further runs under
+    load (with and without tracing, with freshly copied binaries) gave one
+    hash. The cause of the 3 divergent runs is unknown.
+    The leak rule stays because the hazard is real elsewhere: the curl
+    scenario, which has a GCD thread, frees one 144-byte block this way
+    per run (`TASKS_RUNFILE.md` §6 had recorded it).
 11. `EV_DISPATCH` is modelled (checked against the kernel's answers).
 
 Decided with Mark: **waits on descriptors from outside the run stay

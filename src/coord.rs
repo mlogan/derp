@@ -38,6 +38,10 @@ pub struct Totals {
     pub clock_ns: u64,
     /// When each process died, in virtual time (0: it did not)
     pub died_at: Vec<u64>,
+    /// The run reached its `stop-after` time (0: it did not, or had none)
+    pub stopped_at: u64,
+    /// Which processes were killed by that stop
+    pub stopped: Vec<bool>,
 }
 
 static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
@@ -115,6 +119,11 @@ impl Coordinator {
     /// Delay for traffic between different hosts, in virtual time.
     pub fn set_net_latency(&self, ns: u64) {
         self.shared.lock().net.latency_ns = ns;
+    }
+
+    /// End the run when the virtual clock reaches `ns` (0: never).
+    pub fn set_stop_at(&self, ns: u64) {
+        self.shared.lock().stop_at_ns = ns;
     }
 
     /// Fill the host table, in declaration order: host `i` is `10.0.0.(i + 1)`.
@@ -202,7 +211,7 @@ impl Coordinator {
         s.take_kills(|victim| unsafe {
             libc::kill(victim, libc::SIGKILL);
         });
-        let deadlock = matches!(handoff, Some(Handoff::Idle)) && s.any_alive();
+        let deadlock = matches!(handoff, Some(Handoff::Idle)) && s.any_alive() && !s.stopped;
         drop(s);
         if let Some(Handoff::Switch { to, .. }) = handoff {
             self.shared.unpark(to);
@@ -229,6 +238,11 @@ impl Coordinator {
             died_at: s.procs[..s.nprocs as usize]
                 .iter()
                 .map(|p| p.died_at)
+                .collect(),
+            stopped_at: if s.stopped { s.stop_at_ns } else { 0 },
+            stopped: s.procs[..s.nprocs as usize]
+                .iter()
+                .map(|p| p.stopped)
                 .collect(),
         }
     }

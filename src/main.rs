@@ -47,11 +47,16 @@ options:
                                        in the scratch directory instead of ours
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
+  --stop-after T                       the run is over at this virtual time: what still runs
+                                       is killed there, reported as stopped, and does not
+                                       fail the run (for servers that never exit)
 run file:
-  seed: 7                              optional; the command line overrides these four
+  seed: 7                              optional; the command line overrides these six
   quantum: 1000..10000
   mem-hook-rate: 1/16
   net-latency: 5ms
+  heap-size: 32G
+  stop-after: 30s
   env: { LOG_LEVEL: debug }            for every process
   pass-env: [SSL_CERT_FILE]            inherited from your environment; nothing else is
   hosts:                               in order: 10.0.0.1, 10.0.0.2, ...
@@ -82,6 +87,8 @@ struct Cli {
     capture: bool,
     net_latency_ns: u64,
     heap_size: u64,
+    /// Virtual time at which the run is over (0: when its processes are)
+    stop_after_ns: u64,
     reseed_at: Option<u64>,
     reseed: u64,
     jobs: u32,
@@ -118,7 +125,17 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
         cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
     }
+    if let (Some(t), true) = (&m.stop_after, from_file("stop-after")) {
+        cli.stop_after_ns = parse_stop_after(t)?;
+    }
     Ok(cli)
+}
+
+fn parse_stop_after(v: &str) -> Result<u64, String> {
+    match parse_duration_ns(v) {
+        Some(0) | None => Err(format!("bad stop-after time {v}")),
+        Some(ns) => Ok(ns),
+    }
 }
 
 fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
@@ -132,6 +149,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         capture: false,
         net_latency_ns: 0,
         heap_size: launch::DEFAULT_HEAP,
+        stop_after_ns: 0,
         reseed_at: None,
         reseed: 0,
         jobs: 4,
@@ -175,6 +193,10 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 let v = take_value(&mut args)?;
                 cli.heap_size = manifest::parse_size(&v).ok_or(format!("bad heap size {v}"))?;
                 cli.given.push("heap-size");
+            }
+            "--stop-after" => {
+                cli.stop_after_ns = parse_stop_after(&take_value(&mut args)?)?;
+                cli.given.push("stop-after");
             }
             "--reseed-at" => {
                 let v = take_value(&mut args)?;
@@ -242,8 +264,10 @@ fn run_guest(
         disable_aslr: cli.disable_aslr,
         heap_size: cli.heap_size,
         stdout,
+        stderr: None,
         seed: cli.opts.seed,
         quantum: cli.quantum,
+        stop_at_ns: cli.stop_after_ns,
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
     };
@@ -314,6 +338,10 @@ fn stdout_file(scratch: &Path, index: usize) -> PathBuf {
     scratch.join(format!("stdout.{index}"))
 }
 
+fn stderr_file(scratch: &Path, index: usize) -> PathBuf {
+    scratch.join(format!("stderr.{index}"))
+}
+
 /// Start the manifest's processes under one scheduler. With `capture`,
 /// each guest's stdout goes to `stdout.<index>` in the scratch directory.
 fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallible<RunOutcome> {
@@ -371,6 +399,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
                 host: p.host,
                 env,
                 stdout: capture.then(|| stdout_file(&scratch, i)),
+                stderr: capture.then(|| stderr_file(&scratch, i)),
                 cwd: Some(root.clone()),
                 daemon: p.daemon,
                 faults: p.faults,
@@ -390,7 +419,11 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
         reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
+        stop_at_ns: cli.stop_after_ns,
     };
+    if run.stop_at_ns != 0 && (run.passive || run.dylib.is_none()) {
+        return Err("stop-after needs the supervisor: it is a virtual time".into());
+    }
     let has_faults = run
         .guests
         .iter()
@@ -430,6 +463,9 @@ fn print_run_report(o: &RunOutcome) {
     eprintln!("run.crashes_injected={}", o.totals.crashes_injected);
     eprintln!("run.restarts={}", o.totals.restarts);
     eprintln!("run.clock_ns={}", o.totals.clock_ns);
+    if o.totals.stopped_at != 0 {
+        eprintln!("run.stopped_at={}", o.totals.stopped_at);
+    }
     if let Some((entry, life)) = failed_life(o) {
         eprintln!(
             "run.failure=entry {entry}: {}",
@@ -460,9 +496,10 @@ fn print_run_report(o: &RunOutcome) {
 }
 
 fn describe_status(o: &launch::Outcome) -> String {
-    match (o.exit_code(), o.signal()) {
-        (Some(c), _) => format!("exit {c}"),
-        (None, Some(s)) => format!("signal {s}"),
+    match (o.stopped, o.exit_code(), o.signal()) {
+        (true, ..) => "stopped".into(),
+        (_, Some(c), _) => format!("exit {c}"),
+        (_, None, Some(s)) => format!("signal {s}"),
         _ => "abnormal".into(),
     }
 }
@@ -470,7 +507,7 @@ fn describe_status(o: &launch::Outcome) -> String {
 /// Exit status of a manifest run: the first of the run file's entries
 /// whose last life did not exit 0. Earlier lives that crashed and were
 /// restarted do not count, what children return is their parents' business,
-/// and daemons are killed by design.
+/// and daemons and what the run's stop time killed are killed by design.
 fn exit_from_run(o: &RunOutcome) -> ExitCode {
     failed_life(o).map_or(ExitCode::SUCCESS, |(_, life)| exit_from(&o.guests[life]))
 }
@@ -481,7 +518,7 @@ fn failed_life(o: &RunOutcome) -> Option<(usize, usize)> {
     (0..o.initial)
         .filter(|&entry| !o.daemons[entry])
         .filter_map(|entry| Some((entry, o.specs.iter().rposition(|&s| s == Some(entry))?)))
-        .find(|&(_, life)| o.guests[life].exit_code() != Some(0))
+        .find(|&(_, life)| !o.guests[life].stopped && o.guests[life].exit_code() != Some(0))
 }
 
 /// The run a tool replays: the command line laid over the run file's own
@@ -499,7 +536,7 @@ fn replay_of(
     let path = cli.manifest.clone().unwrap();
     let m = manifest::parse(&std::fs::read_to_string(&path)?)?;
     let cli = with_run_file_settings(cli, &m)?;
-    let pass = vec![
+    let mut pass = vec![
         "--seed".to_string(),
         cli.opts.seed.to_string(),
         "--quantum".to_string(),
@@ -511,6 +548,10 @@ fn replay_of(
         "--heap-size".to_string(),
         cli.heap_size.to_string(),
     ];
+    if cli.stop_after_ns != 0 {
+        pass.push("--stop-after".to_string());
+        pass.push(format!("{}ns", cli.stop_after_ns));
+    }
     let replay = rewrite::replay::Replay {
         manifest: path,
         dir: scratch_dir(&cli).join(tool),
@@ -577,9 +618,10 @@ fn bisect(cli: &Cli) -> Fallible<()> {
 }
 
 fn exit_from(outcome: &launch::Outcome) -> ExitCode {
-    match (outcome.exit_code(), outcome.signal()) {
-        (Some(c), _) => ExitCode::from(c as u8),
-        (None, Some(s)) => fail(format!("guest killed by signal {s}")),
+    match (outcome.stopped, outcome.exit_code(), outcome.signal()) {
+        (true, ..) => ExitCode::SUCCESS,
+        (_, Some(c), _) => ExitCode::from(c as u8),
+        (_, None, Some(s)) => fail(format!("guest killed by signal {s}")),
         _ => fail("guest ended abnormally"),
     }
 }

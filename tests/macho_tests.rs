@@ -17,8 +17,10 @@ fn run_capture(
         disable_aslr: true,
         heap_size: rewrite::launch::DEFAULT_HEAP,
         stdout: Some(out_path.clone()),
+        stderr: None,
         seed: 0,
         quantum: launch::DEFAULT_QUANTUM,
+        stop_at_ns: 0,
         passive: false,
         rewrite: None,
     };

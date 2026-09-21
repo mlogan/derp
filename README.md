@@ -23,9 +23,14 @@ Options worth knowing:
 - `--manifest FILE` is the run file, in YAML (below). Hosts get `10.0.0.1`
   upward in the order listed and are reachable by name. `--net-latency 5ms`
   delays traffic between different hosts in virtual time.
-- `--capture` writes each guest's stdout to `stdout.<index>` in the
-  `--scratch` directory. The report goes to stderr: `run.*` totals, then
-  `p<index>.*` per process.
+- `--stop-after 30s` ends the run at that virtual time: whatever still
+  runs is killed at that point of the schedule, reported as `stopped`,
+  and does not fail the run. For servers that never exit by themselves,
+  and for comparing what a program did in a fixed span of virtual time.
+  Also `stop-after:` in the run file; it needs the supervisor.
+- `--capture` writes each guest's stdout and stderr to `stdout.<index>`
+  and `stderr.<index>` in the `--scratch` directory. The report goes to
+  stderr: `run.*` totals, then `p<index>.*` per process.
 - `REWRITE_TRACE=file` appends one line per baton switch (from, to, hook
   events issued, site, virtual clock). Diff two of them to find where two
   runs part ways; the schedule hash covers the same values.
@@ -35,11 +40,12 @@ Options worth knowing:
 ## The run file
 
 ```yaml
-seed: 7                  # optional; the command line overrides these five
+seed: 7                  # optional; the command line overrides these six
 quantum: 1000..10000
 heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
+stop-after: 30s          # the run is over at this virtual time (default: never)
 env: { LOG_LEVEL: debug }   # for every process (guests start from a fixed environment)
 pass-env: [SSL_CERT_FILE]   # inherited from yours on purpose; nothing else is
 allow: [/opt/site-content]  # extra paths every host may touch

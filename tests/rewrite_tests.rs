@@ -73,8 +73,10 @@ fn stubs_are_slide_proof() {
         disable_aslr: false,
         heap_size: rewrite::launch::DEFAULT_HEAP,
         stdout: None,
+        stderr: None,
         seed: 0,
         quantum: launch::DEFAULT_QUANTUM,
+        stop_at_ns: 0,
         passive: false,
         rewrite: None,
     };

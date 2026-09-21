@@ -113,6 +113,7 @@ struct RawRun {
     mem_hook_rate: Option<Scalar>,
     net_latency: Option<Scalar>,
     heap_size: Option<Scalar>,
+    stop_after: Option<Scalar>,
     #[serde(default)]
     allow: Vec<String>,
     #[serde(default)]
@@ -243,6 +244,8 @@ pub struct Manifest {
     pub mem_hook_rate: Option<String>,
     pub net_latency: Option<String>,
     pub heap_size: Option<String>,
+    /// Virtual time at which the run is over, whatever still runs
+    pub stop_after: Option<String>,
     pub allow: Vec<String>,
     /// Variables for every process of the run
     pub env: Vec<(String, String)>,
@@ -292,6 +295,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         mem_hook_rate: raw.mem_hook_rate.as_ref().map(Scalar::text),
         net_latency: raw.net_latency.as_ref().map(Scalar::text),
         heap_size: raw.heap_size.as_ref().map(Scalar::text),
+        stop_after: raw.stop_after.as_ref().map(Scalar::text),
         allow: raw.allow,
         env: raw.env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
         pass_env: raw.pass_env,

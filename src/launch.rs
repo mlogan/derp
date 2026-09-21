@@ -24,9 +24,12 @@ pub struct Launch {
     pub heap_size: u64,
     /// Redirect the guest's stdout to this file (created or truncated)
     pub stdout: Option<PathBuf>,
+    pub stderr: Option<PathBuf>,
     pub seed: u64,
     /// Hook events per quantum, inclusive range
     pub quantum: (u32, u32),
+    /// See `Run::stop_at_ns`
+    pub stop_at_ns: u64,
     /// Inject the dylib without scheduling: see `Run::passive`
     pub passive: bool,
     /// See `Run::rewrite`
@@ -77,6 +80,8 @@ pub struct Outcome {
     /// from; None for a run without the supervisor
     pub image: Option<PathBuf>,
     pub program: Option<PathBuf>,
+    /// Killed because the run reached its stop time: not a failure
+    pub stopped: bool,
 }
 
 impl Outcome {
@@ -106,6 +111,7 @@ pub struct Guest {
     pub env: Vec<(String, String)>,
     /// Redirect the guest's stdout to this file (created or truncated)
     pub stdout: Option<PathBuf>,
+    pub stderr: Option<PathBuf>,
     /// Working directory: the guest's host directory in a manifest run
     pub cwd: Option<PathBuf>,
     /// Killed when every guest that is not a daemon has exited
@@ -141,6 +147,9 @@ pub struct Run {
     pub net_latency_ns: u64,
     /// Seed bisection: (virtual time, replacement seed)
     pub reseed: Option<(u64, u64)>,
+    /// Virtual time at which the run is over whatever is still running
+    /// (0: never): for servers that never exit by themselves
+    pub stop_at_ns: u64,
 }
 
 #[derive(Debug)]
@@ -259,10 +268,12 @@ fn spawn(
         let mut actions: libc::posix_spawn_file_actions_t = std::mem::zeroed();
         libc::posix_spawn_file_actions_init(&raw mut actions);
         let stdout_c = guest.stdout.as_deref().map(cstring);
-        if let Some(p) = &stdout_c {
+        let stderr_c = guest.stderr.as_deref().map(cstring);
+        for (fd, path) in [(1, &stdout_c), (2, &stderr_c)] {
+            let Some(p) = path else { continue };
             libc::posix_spawn_file_actions_addopen(
                 &raw mut actions,
-                1,
+                fd,
                 p.as_ptr(),
                 // Appending, so that lives of one entry (and children that
                 // outlive a crashed one) never write over each other
@@ -552,9 +563,13 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
     let specs: Vec<Option<usize>> = procs.iter().map(|p| p.spec).collect();
     let guests = procs
         .into_iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             let mut report = Report::parse(&c.report);
-            if coord.is_some() && !report.fields.is_empty() {
+            let stopped = totals.stopped.get(i).copied().unwrap_or(false);
+            // A guest the stop killed never reported; the run-wide values
+            // are still worth having
+            if coord.is_some() && (!report.fields.is_empty() || stopped) {
                 // Run-wide values as of the end of the run, not of this
                 // guest's exit
                 for (k, v) in [
@@ -564,12 +579,18 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
                 ] {
                     report.fields.insert(k.into(), v);
                 }
+                if stopped {
+                    report
+                        .fields
+                        .insert("stopped_at".into(), totals.stopped_at.to_string());
+                }
             }
             Outcome {
                 status: c.status.unwrap_or(0),
                 report,
                 image: c.image,
                 program: c.program,
+                stopped,
             }
         })
         .collect();
@@ -723,6 +744,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     }
     if let Some(c) = coord {
         c.set_net_latency(run.net_latency_ns);
+        c.set_stop_at(run.stop_at_ns);
         c.set_debug_paths();
         if let Some((at, with)) = run.reseed {
             c.set_reseed(at, with);
@@ -881,6 +903,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
             host: 0,
             env: Vec::new(),
             stdout: cfg.stdout.clone(),
+            stderr: cfg.stderr.clone(),
             cwd: None,
             daemon: false,
             faults: shared::Faults::default(),
@@ -896,6 +919,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         rewrite: cfg.rewrite.clone(),
         net_latency_ns: 0,
         reseed: None,
+        stop_at_ns: cfg.stop_at_ns,
     };
     let mut out = launch_run(&run)?;
     Ok(out.guests.remove(0))

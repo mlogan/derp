@@ -147,12 +147,22 @@ first crash times. Later ones are drawn from the reseeded stream.
   taken over and the run hangs. Found by reading, not reproduced. Needs
   the lock released or taken around the exec, or a generation beside the
   pid.
-- **`suspects` and a guest's own children.** A child a guest forks runs
-  the same program, so a mask reaches it by name, but its sites are never
-  candidates: the trace names processes by run-file entry, and a child has
-  none. A failure that needs a switch inside such a child fails the first
-  sanity check with a misleading message. Needs processes mapped to
-  programs through the launcher's spawn records.
+## Third pass (2026-09-21): a guest's own children
+
+Reproduced first, and worse than predicted: a parent that starts
+`lost_update` and ends as it ended made `suspects` report "0 of 0 sites
+are needed" and exit 0. The child's sites were outside the tool's
+universe, so no mask ever reached them and every check passed.
+
+Fixed: a process sends `MSG_IMAGE` with its executable's path once it
+first holds the baton (a new image after `execve` does so too; a fork
+child is recorded as running its parent's program). The launcher keeps
+rewritten-to-original for every rewrite it made and reports
+`p<i>.program` and `p<i>.image` for every process. `suspects` builds its
+program list from the reference run's report, so a child's program, and
+one only a child runs, is masked and symbolised like the entries'.
+Test: `the_suspects_may_be_in_a_guests_own_child` names the child's racy
+line.
 
 Not done, by choice: reuse order of two freed blocks (A5), streams
 restarting after `execve` (A8), and the larger refactors (a `Layout` enum

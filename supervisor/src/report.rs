@@ -16,7 +16,7 @@ pub fn log(msg: &str) {
     }
 }
 
-fn write_report() {
+pub fn write_report() {
     if !crate::coord::connected() {
         return;
     }

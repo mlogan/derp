@@ -418,6 +418,40 @@ fn futex_block(addr: *mut c_void, timeout_ns: u64) -> bool {
     !sched::block_until(addr as usize as u64, deadline)
 }
 
+/// The caller wants errors as negative errno values, not -1 and `errno`
+/// (libdispatch, which treats anything else as a bug in the kernel)
+const ULF_NO_ERRNO: u32 = 0x0100_0000;
+
+fn ulock_fail(op: u32, e: c_int) -> c_int {
+    if op & ULF_NO_ERRNO != 0 {
+        -e
+    } else {
+        crate::errno::fail(e)
+    }
+}
+
+/// A compare-and-wait timed out on the virtual clock. When a thread the
+/// scheduler does not run (a GCD worker doing the Security framework's
+/// work, say) is the one to wake it, virtual time says nothing about when
+/// that comes: wait the same again, for real, before reporting the
+/// timeout. `real` is the real call; its result is returned as it is.
+fn timed_out(addr: *mut c_void, value: u64, wide: bool, real: impl FnOnce() -> c_int, fail: c_int) -> c_int {
+    if !value_matches(addr, value, wide) {
+        return 0;
+    }
+    if sched::has_outside_threads() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            crate::report::log(
+                "a wait timed out in virtual time; waiting the same again in real time, \
+                 in case a thread outside the schedule is to end it",
+            );
+        }
+        return real();
+    }
+    fail
+}
+
 /// Sleep for `ns` of virtual time: a wait nothing but the deadline ends.
 fn sleep_ns(ns: u64) {
     let deadline = sched::now().saturating_add(ns);
@@ -503,10 +537,15 @@ extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: 
         });
     }
     if futex_block(addr, u64::from(timeout_us) * 1000) {
-        0
-    } else {
-        crate::errno::fail(libc::ETIMEDOUT)
+        return 0;
     }
+    timed_out(
+        addr,
+        value,
+        ulock_is_wide(op),
+        || unsafe { __ulock_wait(op, addr, value, timeout_us) },
+        ulock_fail(op, libc::ETIMEDOUT),
+    )
 }
 
 extern "C" fn my_ulock_wait2(
@@ -529,10 +568,15 @@ extern "C" fn my_ulock_wait2(
         });
     }
     if futex_block(addr, timeout_ns) {
-        0
-    } else {
-        crate::errno::fail(libc::ETIMEDOUT)
+        return 0;
     }
+    timed_out(
+        addr,
+        value,
+        ulock_is_wide(op),
+        || unsafe { __ulock_wait2(op, addr, value, timeout_ns, value2) },
+        ulock_fail(op, libc::ETIMEDOUT),
+    )
 }
 
 extern "C" fn my_ulock_wake(op: u32, addr: *mut c_void, wake_value: u64) -> c_int {
@@ -581,10 +625,19 @@ extern "C" fn my_os_sync_wait_on_address_with_timeout(
         return 0;
     }
     if futex_block(addr, timeout_ns.max(1)) {
-        0
-    } else {
-        crate::errno::fail(libc::ETIMEDOUT)
+        return 0;
     }
+    timed_out(
+        addr,
+        value,
+        size == 8,
+        || {
+            sched::with_passthrough(|| unsafe {
+                os_sync_wait_on_address_with_timeout(addr, value, size, flags, clockid, timeout_ns)
+            })
+        },
+        crate::errno::fail(libc::ETIMEDOUT),
+    )
 }
 
 extern "C" fn my_os_sync_wake_by_address_any(addr: *mut c_void, size: usize, flags: u32) -> c_int {

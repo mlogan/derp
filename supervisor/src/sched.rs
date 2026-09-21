@@ -192,7 +192,7 @@ pub fn forget_thread() {
 }
 
 /// Whether this process has threads the scheduler does not run.
-fn has_outside_threads() -> bool {
+pub fn has_outside_threads() -> bool {
     let mut list: *mut u32 = std::ptr::null_mut();
     let mut count = 0u32;
     if unsafe { task_threads(mach_task_self_, &raw mut list, &raw mut count) } != 0 {
@@ -261,13 +261,27 @@ pub fn wake_all(addr: usize) -> usize {
         if outside {
             note_outside_wake(s, pid);
         }
-        s.wake_all(pid, addr as u64)
+        let woken = s.wake_all(pid, addr as u64);
+        if outside && woken > 0 {
+            let _ = FIRST_OUTSIDE_WAKE_NS.compare_exchange(
+                0,
+                s.clock_ns.max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        woken
     });
     if woken > 0 && outside {
         OUTSIDE_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
     }
     woken
 }
+
+/// Virtual time of the first outside wake that made a thread runnable
+/// (0: none), for finding what let real time into the schedule
+pub static FIRST_OUTSIDE_WAKE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// A wake from a thread the scheduler does not run: see
 /// `ProcRec::outside_wakes`.
@@ -797,6 +811,11 @@ fn wait_out_deaths(sh: &Shared, new_quantum: bool) {
 /// The scheduler crashed this process: its threads are already out of the
 /// schedule, so all that is left is to go the way a crash goes.
 fn die() -> ! {
+    // A process the run's stop ends has done nothing wrong: its report is
+    // still wanted (the exit hook will not run)
+    if with(|s, pid| s.procs[pid as usize].stopped) == Some(true) {
+        crate::report::write_report();
+    }
     unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
     loop {
         unsafe { libc::pause() };
@@ -1005,6 +1024,11 @@ pub fn report(out: &mut String) {
         out,
         "outside_wakes={}",
         OUTSIDE_WAKES.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "first_outside_wake_ns={}",
+        FIRST_OUTSIDE_WAKE_NS.load(Ordering::Relaxed)
     );
     let _ = writeln!(
         out,

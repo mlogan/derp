@@ -229,8 +229,9 @@ always-empty `env` fields, `Death` and the overloaded `Handoff::Stay`.
 Recorded, not fixed:
 - A `poll` or `kevent` that mixes virtual sockets with descriptors whose
   peer is outside the run is not woken by the outside ones.
-- A process that dies holding the shared spinlock (an outside thread
-  killed mid-wake) wedges the run. Low probability, no recovery.
+- ~~A process that dies holding the shared spinlock wedges the run.~~ The
+  lock names its owner and is taken over from a dead one
+  (`TASKS_SUSPECTS.md`, `TASKS_REVIEW2.md`).
 - Per-process hook counts are wrong when an outside thread expires the
   quantum, and across `execve` (report only).
 - Wake keys are per process: process-shared mutexes and condition variables

@@ -54,8 +54,8 @@ Tracks `IMPLEMENTATION_PLAN_FAULTS.md`. Branch `mlogan-fault-injection`.
   that is otherwise deadlocked keeps it going until then.
 - A crash lands on a hand-off, so its virtual time is the first yield at or
   after `crash_at`, not `crash_at` exactly.
-- A process killed while one of its unscheduled threads holds the shared
-  lock wedges the run (GCD guests are refused, so nothing does this today).
+- ~~A process killed while holding the shared lock wedges the run.~~ The
+  lock is taken over from a dead owner (`TASKS_SUSPECTS.md`).
 - The crashed process's own last `REWRITE_TRACE` line can be lost; the
   schedule hash is unaffected.
 

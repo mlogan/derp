@@ -191,3 +191,59 @@ fn a_seed_that_passes_has_nothing_to_bisect() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("does not fail"));
 }
+
+/// Failures decided by a draw from a per-process stream, not by the
+/// schedule: where heap blocks land, and what `arc4random` returns. Those
+/// streams are reseeded at the probe time too, or every future would fail
+/// and there would be no moment to find.
+#[test]
+fn bisection_finds_a_draw_from_a_process_stream() {
+    for mode in ["heap", "entropy"] {
+        let dir = common::scratch_dir(&format!("bisect_late_{mode}"));
+        common::build_c("late_draw", &dir, &[]);
+        let manifest = dir.join("late.yaml");
+        std::fs::write(
+            &manifest,
+            format!("hosts:\n  - name: a\n    processes:\n      - late_draw {mode}\n"),
+        )
+        .unwrap();
+        let scratch = dir.join("scratch");
+        let seed = failing_seed(&scratch, &manifest);
+
+        let out = rewrite(
+            &["bisect", "--seed", &seed.to_string()],
+            &scratch,
+            &manifest,
+        );
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            out.status.success(),
+            "{mode}: {text}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let f = fields(&text);
+        let num = |k: &str| {
+            f[k].parse::<u64>()
+                .unwrap_or_else(|_| panic!("{k} in {text}"))
+        };
+        let (lo, hi, failed_at) = (
+            num("bisect.lo_ns"),
+            num("bisect.hi_ns"),
+            num("bisect.failure_at_ns"),
+        );
+
+        let said = std::fs::read_to_string(scratch.join("bisect/reference/stdout.0")).unwrap();
+        let numbers =
+            |l: &str| -> Vec<u64> { l.split(' ').filter_map(|w| w.parse().ok()).collect() };
+        let offset = numbers(said.lines().last().unwrap()).pop().unwrap() - failed_at;
+        let draw = numbers(said.lines().find(|l| l.starts_with("draw:")).unwrap());
+        let (from, to) = (draw[0] - offset, draw[1] - offset);
+
+        let slack = 2_000_000;
+        assert!(
+            hi + slack >= from && lo <= to + slack,
+            "{mode}: decided in {lo}..{hi}, but the draw was at {from}..{to}\n{text}"
+        );
+        assert!(hi < failed_at / 2 && hi - lo <= 2_000_000, "{mode}: {text}");
+    }
+}

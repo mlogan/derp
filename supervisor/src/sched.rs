@@ -126,6 +126,20 @@ pub fn scheduled_thread(port: u32) -> Option<usize> {
         .map(|&(_, id)| id)
 }
 
+/// Seed bisection reseeds every random stream at a virtual time. The
+/// scheduler's own are swapped in the shared state; a process's streams
+/// (heap layout, entropy) are its own, and each asks here before it draws.
+/// `done` is the stream's note that it has switched. The answer differs
+/// per process and, through `stream`, per stream.
+pub fn reseed_once(done: &std::sync::atomic::AtomicBool, stream: u64) -> Option<u64> {
+    if done.load(Ordering::Relaxed) {
+        return None;
+    }
+    let with = shared()?.reseeded_with()?;
+    done.store(true, Ordering::Relaxed);
+    Some(with.wrapping_add(u64::from(pid()).wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ stream)
+}
+
 /// Whether thread `id` is parked, as opposed to running in real time
 /// without the baton (starting up, or between a hand-off and its park).
 pub fn is_parked(id: usize) -> bool {

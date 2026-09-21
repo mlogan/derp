@@ -32,10 +32,24 @@ fn outside() -> bool {
 pub fn forked(seed: u64) {
     ENTROPY.force_unlock();
     init(seed);
+    // A child made after the run's reseed time switches at its first draw
+    RESEEDED.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+static RESEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The entropy stream, switched first if the run's reseed time has passed.
+fn entropy() -> crate::spin::Guard<'static, Option<Rng>> {
+    let reseed = crate::sched::reseed_once(&RESEEDED, 0x5EED_5EED_5EED_5EED);
+    let mut guard = ENTROPY.lock();
+    if let Some(seed) = reseed {
+        *guard = Some(Rng::seed_from_u64(seed));
+    }
+    guard
 }
 
 fn fill(buf: *mut u8, n: usize) {
-    let mut guard = ENTROPY.lock();
+    let mut guard = entropy();
     let rng = guard.get_or_insert_with(|| Rng::seed_from_u64(0));
     let mut i = 0;
     while i < n {
@@ -67,8 +81,7 @@ pub extern "C" fn my_arc4random_uniform(bound: u32) -> u32 {
     if outside() {
         return unsafe { libc::arc4random_uniform(bound) };
     }
-    ENTROPY
-        .lock()
+    entropy()
         .get_or_insert_with(|| Rng::seed_from_u64(0))
         .below(u64::from(bound)) as u32
 }

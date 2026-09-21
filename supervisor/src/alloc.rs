@@ -143,6 +143,19 @@ fn in_own(p: *mut c_void) -> bool {
     OWN.lock().contains(p as usize)
 }
 
+static LAYOUT_RESEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The guest's heap, its layout stream switched first if the run's reseed
+/// time has passed.
+fn guest_heap() -> crate::spin::Guard<'static, Heap> {
+    let reseed = crate::sched::reseed_once(&LAYOUT_RESEEDED, 0x4845_4150_4845_4150);
+    let mut h = HEAP.lock();
+    if let (Some(seed), true) = (reseed, h.rng.is_some()) {
+        h.rng = Some(crate::rng::Rng::seed_from_u64(seed));
+    }
+    h
+}
+
 /// From now on, where a guest's block lands is drawn from `seed`. Call
 /// before the first scheduled thread of the process allocates.
 pub fn seed_layout(seed: u64) {
@@ -447,7 +460,7 @@ pub extern "C" fn my_malloc(size: usize) -> *mut c_void {
     if !deterministic() {
         return unsafe { libc::malloc(size) };
     }
-    HEAP.lock().alloc(size, 16)
+    guest_heap().alloc(size, 16)
 }
 
 pub extern "C" fn my_calloc(n: usize, size: usize) -> *mut c_void {
@@ -457,7 +470,7 @@ pub extern "C" fn my_calloc(n: usize, size: usize) -> *mut c_void {
     let Some(total) = n.checked_mul(size) else {
         return std::ptr::null_mut();
     };
-    let p = HEAP.lock().alloc(total, 16);
+    let p = guest_heap().alloc(total, 16);
     if !p.is_null() {
         unsafe { std::ptr::write_bytes(p.cast::<u8>(), 0, total) };
     }
@@ -528,7 +541,7 @@ pub extern "C" fn my_posix_memalign(
     if !align.is_power_of_two() || align < std::mem::size_of::<usize>() {
         return libc::EINVAL;
     }
-    let p = HEAP.lock().alloc(size, align.max(16));
+    let p = guest_heap().alloc(size, align.max(16));
     if p.is_null() {
         return libc::ENOMEM;
     }
@@ -543,14 +556,14 @@ pub extern "C" fn my_aligned_alloc(align: usize, size: usize) -> *mut c_void {
     if !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    HEAP.lock().alloc(size, align.max(16))
+    guest_heap().alloc(size, align.max(16))
 }
 
 pub extern "C" fn my_valloc(size: usize) -> *mut c_void {
     if !deterministic() {
         return unsafe { valloc(size) };
     }
-    HEAP.lock().alloc(size, PAGE)
+    guest_heap().alloc(size, PAGE)
 }
 
 pub extern "C" fn my_malloc_size(p: *const c_void) -> usize {

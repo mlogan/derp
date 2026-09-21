@@ -204,8 +204,10 @@ only as many as ever did. It measures that with `--runs` futures per probe
 `--resolution` (2 ms of virtual time), and prints the probes, the interval
 in which the failure became certain, and the failing run's thread switches
 inside it. `--reseed-at T --reseed N` on `rewrite run` replays one such
-future. The heap layout and the entropy a guest reads are not yet part of
-what is reseeded.
+future. Every random stream starts over at `T`: thread choice and quanta,
+injected faults, where heap blocks land, and the entropy guests read. So a
+failure decided by pointer order or by a random value is found the same
+way; its moment is the allocation or the draw.
 
 ## Debugging a guest
 

@@ -64,13 +64,37 @@ and its write. 200 runs, 1.2 s.
   time, and is at most 2 ms wide. 15 of 15 repetitions passed.
 - A passing seed is refused.
 
+## Complete reseeding (2026-09-21, branch `mlogan-reseed-all`)
+
+A reseed replaced only the scheduler's and the fault stream. A failure
+decided by where heap blocks land, or by what `arc4random` returns, then
+failed on every future, and bisect refused it as having no moment. Now
+every stream starts over at the reseed time:
+
+- The shared state already said whether the reseed time has passed and
+  with what (`Shared::reseeded_with`, read without the lock: it is set at
+  a hand-off, and those who ask are scheduled threads).
+- Each per-process stream asks before it draws (`sched::reseed_once`) and
+  switches once, to the replacement seed mixed with the process index and
+  a constant of the stream: the guest heap's layout stream in
+  `alloc::guest_heap`, the entropy stream in `determinism::entropy`. A
+  process that starts after the reseed time switches at its first draw; a
+  `fork` child's fresh entropy stream does too.
+- Blocks that exist stay where they are: the past is fixed. The moment
+  bisection finds for a layout bug is the allocation, not the use.
+- There is no choice of streams. A probe is a complete reseed.
+
+`late_draw.c` sleeps 60 ms, makes one draw that dooms it one time in
+eight (three pairs of blocks all comparing `a < b`, or
+`arc4random_uniform(8) == 0`), works 240 ms more and aborts. Both modes:
+"decided between 59.766 ms and 60.938 ms", the draw being at 60.001 ms.
+Test `bisection_finds_a_draw_from_a_process_stream`, 10 of 10 repetitions.
+
+Still fixed by the seed and not reseedable: which memory instructions the
+rewriter hooked (chosen before the run).
+
 ## Not done
 
-- **Per-process streams are not reseeded**: heap layout (once the seeded
-  heap lands) and the entropy a guest reads. Their state lives in each
-  guest. A failure that depends only on them looks decided from the start,
-  and bisect then refuses it as "fails on most futures". The way in is a
-  reseed epoch in the shared state that each process checks when it draws.
 - Run files only, no `rewrite run prog`.
 - The signature is the failing entry and its status. Wrong output with a
   clean exit needs a user-supplied check command.

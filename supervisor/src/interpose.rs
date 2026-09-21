@@ -54,10 +54,14 @@ use crate::net::{
 };
 use crate::poll::{my_poll, my_select};
 use crate::process::{
-    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_vfork, my_wait, my_wait4,
-    my_waitpid,
+    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_pthread_threadid_np, my_vfork,
+    my_wait, my_wait4, my_waitpid,
 };
 use crate::process::{rewrite_getpid_shim, rewrite_getppid_shim};
+use crate::vmmap::{
+    mach_vm_allocate, mach_vm_deallocate, mach_vm_map, my_mach_vm_allocate,
+    my_mach_vm_deallocate, my_mach_vm_map, my_mmap, my_munmap,
+};
 use crate::sched::{self, my_id, State};
 use crate::shared;
 use crate::signals::{my_sigaction, my_signal};
@@ -898,6 +902,12 @@ interposers! {
     my_wait4 => libc::wait4,
     my_wait => libc::wait,
     rewrite_getpid_shim => libc::getpid,
+    my_pthread_threadid_np => libc::pthread_threadid_np,
+    my_mach_vm_map => mach_vm_map,
+    my_mach_vm_allocate => mach_vm_allocate,
+    my_mach_vm_deallocate => mach_vm_deallocate,
+    my_mmap => libc::mmap,
+    my_munmap => libc::munmap,
     rewrite_getppid_shim => libc::getppid,
     my_kill => libc::kill,
     my_sigaction => libc::sigaction,

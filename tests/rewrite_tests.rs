@@ -248,3 +248,32 @@ fn an_unnamed_constant_table_in_the_text_is_left_alone() {
     assert_eq!(supervised.exit_code(), Some(0));
     assert_eq!(text, expected);
 }
+
+/// Where scheduled threads' stacks and mappings land is the run's to
+/// decide: in the reserved region, the same on every run, whatever the
+/// kernel placed elsewhere meanwhile.
+#[test]
+fn thread_stacks_and_mappings_land_in_the_region_and_repeat() {
+    let dir = common::scratch_dir("stacks");
+    let exe = common::build_c("stacks", &dir, &[]);
+    let rw_path = dir.join("stacks.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    assert!(o.report.get_u64("mappings_placed").unwrap() >= 5, "{first}");
+    assert_eq!(o.report.get_u64("mappings_overflowed"), Some(0));
+    let addresses: Vec<u64> = first
+        .split(|c: char| !c.is_ascii_hexdigit() && c != 'x')
+        .filter_map(|w| w.strip_prefix("0x"))
+        .filter_map(|h| u64::from_str_radix(h, 16).ok())
+        .collect();
+    assert_eq!(addresses.len(), 9, "{first}");
+    for a in &addresses {
+        assert!(
+            (0x7C_0000_0000..0x8C_0000_0000).contains(a),
+            "{a:#x} outside the region"
+        );
+    }
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+}

@@ -1686,3 +1686,37 @@ fn a_single_program_run_stops_too() {
     assert!(out.status.success(), "{err}");
     assert!(err.contains("stopped_at=2000000000"), "{err}");
 }
+
+/// Unless the run file says `outside-network: allow`, a name the run does
+/// not know and an address beyond the virtual network are unreachable, the
+/// same way every run; a numeric address needs no lookup.
+#[test]
+fn the_outside_network_is_refused_unless_allowed() {
+    let dir = common::scratch_dir("multiproc_outside");
+    common::build_c("outside", &dir, &[]);
+    let manifest = dir.join("outside.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - outside\n",
+    )
+    .unwrap();
+    let r = run_manifest(&manifest, &dir.join("scratch"), 1, 1);
+    assert_eq!(
+        r.stdout[0],
+        "lookup nodename nor servname provided, or not known\nnumeric ok\nconnect Network is unreachable\n"
+    );
+    // The file may let them out; the lookup then reaches the real resolver,
+    // which is not this test's to depend on: only the numeric path is checked
+    std::fs::write(
+        &manifest,
+        "outside-network: allow\nhosts:\n  - name: a\n    processes:\n      - outside\n",
+    )
+    .unwrap();
+    let r = run_manifest(&manifest, &dir.join("scratch"), 1, 1);
+    assert!(r.stdout[0].contains("numeric ok\n"), "{}", r.stdout[0]);
+    assert!(
+        !r.stdout[0].contains("Network is unreachable"),
+        "{}",
+        r.stdout[0]
+    );
+}

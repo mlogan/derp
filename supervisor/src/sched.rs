@@ -464,6 +464,7 @@ const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
 /// launcher), then park the main thread until it is handed the baton.
 pub fn init(info: Option<Info>, cfg: &Config) {
     *INFO.lock() = info;
+    crate::vmmap::init();
     if let Some(spins) = std::env::var("REWRITE_PARK_SPINS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -529,6 +530,7 @@ pub fn become_forked_child(child: u32) {
     PORTS.force_unlock();
     PORTS.lock().clear();
     crate::alloc::forked();
+    crate::vmmap::forked();
     crate::hostfs::forked();
     crate::signals::forked();
     crate::io::forked();
@@ -1031,6 +1033,16 @@ pub fn report(out: &mut String) {
         out,
         "first_outside_wake_ns={}",
         FIRST_OUTSIDE_WAKE_NS.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "mappings_placed={}",
+        crate::vmmap::PLACED.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "mappings_overflowed={}",
+        crate::vmmap::OVERFLOWED.load(Ordering::Relaxed)
     );
     let _ = writeln!(
         out,

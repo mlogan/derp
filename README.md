@@ -207,7 +207,35 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   same block, goes both ways across seeds. A bug that depends on pointer
   order shows on some seeds and replays on those.
 - Guests see virtual pids from 100,000 up (above any real pid), in spawn
-  order; the launcher is pid 1.
+  order; the launcher is pid 1. A scheduled thread's `pthread_threadid_np`
+  is its index in the run plus a billion (kernel thread ids differ from
+  run to run; RocksDB mixes one into its DB session ids).
+- Where a scheduled thread's mappings land is the run's: thread stacks,
+  `pthread_t` blocks and `mmap`s without an address go to a reserved
+  region (64 GB at `0x7c_0000_0000`) in schedule order, so the kernel's
+  placement of what it maps meanwhile (GCD workers' stacks) cannot move
+  them. `pthread_self` is a stack address, and RocksDB seeds its skip-list
+  heights from it. The report counts `mappings_placed`.
+
+## Big programs
+
+Stubs are one shared body per program and a four-to-six-word trampoline
+per hooked site, so a release build of sui (106 MB of code, 2.5 million
+sites) has 45 MB of them. Every site must reach its trampoline, and the
+trampoline its target, with one `b` (±128 MB). The stub segment goes
+right after `__DATA`, so in a program whose code runs past about 120 MB
+the earliest sites cannot reach it: they are left as they are and counted
+(`unreachable` in `rewrite scan`, and in the "sites hooked" line; 2.5% of
+sui's sites). Code that is not hooked runs without preemption until it
+reaches a hook or a blocking call; the run stays deterministic. A callee
+too far for a `b` is reached through x16, as a linker's branch island
+would. Below `__TEXT` is not an option: the kernel wants `__PAGEZERO` to
+cover the low 4 GB and reserves everything up to the first segment.
+
+A function-table entry without a symbol is a constant table in
+hand-written assembly (blst keeps its SHA-256 round constants that way),
+whose words would be hooked as instructions; such entries are left alone
+when the file names at least half of its functions (`unnamed_entries`).
 
 ## Rewritten binaries only run under the supervisor
 

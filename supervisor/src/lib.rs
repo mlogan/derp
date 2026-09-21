@@ -29,6 +29,7 @@ mod signals;
 mod shared;
 mod spin;
 mod stubdata;
+mod vmmap;
 
 #[used]
 #[link_section = "__DATA,__mod_init_func"]

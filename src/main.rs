@@ -447,6 +447,10 @@ fn print_run_report(o: &RunOutcome) {
         if let Some(entry) = o.specs[i] {
             eprintln!("p{i}.entry={entry}");
         }
+        if let (Some(program), Some(image)) = (&g.program, &g.image) {
+            eprintln!("p{i}.program={}", program.display());
+            eprintln!("p{i}.image={}", image.display());
+        }
         for (k, v) in &g.report.fields {
             if !RUN_WIDE.contains(&k.as_str()) {
                 eprintln!("p{i}.{k}={v}");
@@ -519,48 +523,14 @@ fn replay_of(
 
 /// `rewrite suspects`: the loads and stores a failing seed needs.
 fn suspects(cli: &Cli) -> Fallible<()> {
-    let (cli, m, replay) = replay_of(cli, "suspects")?;
+    let (cli, _, replay) = replay_of(cli, "suspects")?;
     if cli.opts.mem_rate.0 == 0 {
         return Err("no loads or stores are hooked: give --mem-hook-rate".into());
-    }
-    let base = replay
-        .manifest
-        .parent()
-        .unwrap_or(Path::new("."))
-        .to_path_buf();
-    let mut programs: Vec<rewrite::suspects::Program> = Vec::new();
-    let mut program_of_entry = Vec::new();
-    for p in &m.processes {
-        let original = std::fs::canonicalize(base.join(&p.argv[0]))
-            .map_err(|e| format!("{}: {e}", p.argv[0]))?;
-        let known = programs.iter().position(|q| q.original == original);
-        program_of_entry.push(known.unwrap_or(programs.len()));
-        if known.is_some() {
-            continue;
-        }
-        let name = original
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        if programs.iter().any(|q| q.name == name) {
-            return Err(format!("two programs are called {name}: a mask goes by file name").into());
-        }
-        let rewritten = cached_rewrite(&original, &cli.opts)?;
-        let table = std::fs::read_to_string(rewrite::cache::sites_path(&rewritten))
-            .map_err(|e| format!("{}: no site table ({e})", rewritten.display()))?;
-        programs.push(rewrite::suspects::Program {
-            name,
-            original,
-            sites: rw::sites_from_text(&table),
-        });
     }
     let mut cfg = rewrite::suspects::Config {
         replay,
         seed: cli.opts.seed,
         jobs: cli.jobs,
-        programs,
-        program_of_entry,
     };
     let found = rewrite::suspects::suspects(&mut cfg, |line| println!("{line}"))?;
     println!(

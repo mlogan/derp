@@ -28,12 +28,9 @@ pub struct Config {
     pub replay: Replay,
     pub seed: u64,
     pub jobs: u32,
-    pub programs: Vec<Program>,
-    /// Which of `programs` each run-file entry runs
-    pub program_of_entry: Vec<usize>,
 }
 
-/// A hook site of a program: (index in `Config::programs`, yield pc)
+/// A hook site of a program: (index in `Runner::programs`, yield pc)
 type Key = (usize, u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +51,8 @@ pub struct Found {
 
 struct Runner<'a> {
     cfg: &'a Config,
+    /// Every program the reference run ran, its own children's included
+    programs: Vec<Program>,
     reference: Ending,
     /// The sites being decided on: all of them are masked but the allowed
     universe: BTreeSet<Key>,
@@ -65,7 +64,7 @@ impl Runner<'_> {
         use std::fmt::Write;
         let mut text = String::new();
         for &(p, pc) in self.universe.iter().filter(|k| !allowed.contains(k)) {
-            let _ = writeln!(text, "{} {pc:x}", self.cfg.programs[p].name);
+            let _ = writeln!(text, "{} {pc:x}", self.programs[p].name);
         }
         text
     }
@@ -170,9 +169,46 @@ fn symbolize(binary: &Path, addrs: &[u64]) -> Vec<String> {
         .collect()
 }
 
-/// The sites of `among` at which a traced run switched, in order of first
-/// appearance. A process is its run-file entry's program.
-fn switched_at(cfg: &Config, ending: &Ending, trace: &Path, among: &BTreeSet<Key>) -> Vec<Key> {
+/// The programs a run ran, by the run's report, each once. A mask goes by
+/// file name, so two programs of one name is an error.
+fn programs_of(ending: &Ending) -> Result<Vec<Program>, String> {
+    let mut programs: Vec<Program> = Vec::new();
+    for (original, image) in ending.program_of.values() {
+        if programs.iter().any(|q| q.original == *original) {
+            continue;
+        }
+        let name = original
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if programs.iter().any(|q| q.name == name) {
+            return Err(format!(
+                "two programs are called {name}: a mask goes by file name"
+            ));
+        }
+        let table = std::fs::read_to_string(crate::cache::sites_path(image))
+            .map_err(|e| format!("{}: no site table ({e})", image.display()))?;
+        programs.push(Program {
+            name,
+            original: original.clone(),
+            sites: crate::rewrite::sites_from_text(&table),
+        });
+    }
+    if programs.is_empty() {
+        return Err("the report names no program: is the run supervised?".into());
+    }
+    Ok(programs)
+}
+
+/// The sites of `among` at which a traced run's quantum ended, in order of
+/// first appearance. A process is what the report says it ran.
+fn switched_at(
+    programs: &[Program],
+    ending: &Ending,
+    trace: &Path,
+    among: &BTreeSet<Key>,
+) -> Vec<Key> {
     let mut out: Vec<Key> = Vec::new();
     for (_, line) in trace_lines(trace) {
         let process = line.split(' ').next().unwrap_or_default();
@@ -181,10 +217,10 @@ fn switched_at(cfg: &Config, ending: &Ending, trace: &Path, among: &BTreeSet<Key
             .find_map(|w| w.strip_prefix("site=0x"))
             .and_then(|v| u64::from_str_radix(v, 16).ok());
         let program = ending
-            .entry_of
+            .program_of
             .get(process)
-            .and_then(|&entry| cfg.program_of_entry.get(entry));
-        if let (Some(&p), Some(pc)) = (program, site) {
+            .and_then(|(original, _)| programs.iter().position(|q| q.original == *original));
+        if let (Some(p), Some(pc)) = (program, site) {
             if among.contains(&(p, pc)) && !out.contains(&(p, pc)) {
                 out.push((p, pc));
             }
@@ -208,9 +244,10 @@ pub fn suspects(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Foun
         ));
     };
     let trace = cfg.replay.trace_path(0);
+    let programs = programs_of(&reference)?;
 
     let of_kind = |memory: bool| -> BTreeSet<Key> {
-        cfg.programs
+        programs
             .iter()
             .enumerate()
             .flat_map(|(p, prog)| {
@@ -222,7 +259,7 @@ pub fn suspects(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Foun
             .collect()
     };
     let (memory_sites, other_sites) = (of_kind(true), of_kind(false));
-    let candidates = switched_at(cfg, &reference, &trace, &memory_sites);
+    let candidates = switched_at(&programs, &reference, &trace, &memory_sites);
     progress(&format!(
         "reference: seed {} fails (entry {entry}: {status}); a quantum ended at {} of {} hooked loads and stores",
         cfg.seed,
@@ -232,6 +269,7 @@ pub fn suspects(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Foun
 
     let mut runner = Runner {
         cfg,
+        programs,
         reference: reference.clone(),
         universe: memory_sites.clone(),
         runs: 1.into(),
@@ -243,7 +281,7 @@ pub fn suspects(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Foun
         runner.universe = memory_sites.union(&other_sites).copied().collect();
         let all_others: Vec<Key> = other_sites.iter().copied().collect();
         let traced = cfg.replay.run(0, &[], &runner.mask_for(&all_others));
-        let candidates = switched_at(cfg, &traced, &trace, &other_sites);
+        let candidates = switched_at(&runner.programs, &traced, &trace, &other_sites);
         progress(&format!(
             "in that run a quantum ended at {} hooked branches and calls",
             candidates.len()
@@ -261,7 +299,7 @@ pub fn suspects(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Foun
     };
 
     let mut suspects = Vec::new();
-    for (p, prog) in cfg.programs.iter().enumerate() {
+    for (p, prog) in runner.programs.iter().enumerate() {
         let here: Vec<&Site> = prog
             .sites
             .iter()

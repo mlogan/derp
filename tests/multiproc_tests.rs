@@ -1576,3 +1576,39 @@ fn the_heap_size_is_the_runs_to_set() {
     let large = run_manifest_with(&manifest, &scratch, 1, 1, &["--heap-size", "8G"]);
     assert_eq!(large.stdout[0], roomy);
 }
+
+/// A signal handler runs on a parked thread at a moment of real time and
+/// may interrupt the thread inside the scheduler lock; it must not wait
+/// for itself. And a thread killed by `execve` may be inside the lock: the
+/// new image must not wait for a thread of the old one. Both guests hung
+/// the run most of the time before the fixes.
+#[test]
+fn signal_handlers_and_execve_do_not_wedge_the_run() {
+    let dir = common::scratch_dir("exec_race");
+    for name in ["exec_race", "exec_race2"] {
+        common::build_c(name, &dir, &[]);
+        let manifest = dir.join(format!("{name}.yaml"));
+        std::fs::write(
+            &manifest,
+            format!("hosts:\n  - name: a\n    processes:\n      - {name} 100\n"),
+        )
+        .unwrap();
+        let scratch = dir.join("scratch");
+        for seed in 1..=3 {
+            let out = common::run_manifest_timed(
+                &manifest,
+                &scratch,
+                seed,
+                std::time::Duration::from_mins(1),
+            )
+            .unwrap_or_else(|| panic!("{name}, seed {seed}: the run hung"));
+            let report = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{name}, seed {seed}: {report}");
+            assert_eq!(
+                std::fs::read_to_string(scratch.join("stdout.0")).unwrap(),
+                "done\n",
+                "{name}, seed {seed}"
+            );
+        }
+    }
+}

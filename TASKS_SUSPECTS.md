@@ -94,6 +94,9 @@ Unit test with a forked child that dies holding the lock, reaped and not.
   needed. Combining with seed bisection's probabilities would tell.
 - Switches at blocking calls and at interposed system calls cannot be
   masked; only stubs can.
-- A process is matched to its program through its run-file entry, so
-  children a guest spawns are not minimised over.
+- ~~A process is matched to its program through its run-file entry, so
+  children a guest spawns are not minimised over.~~ Every process
+  announces its image to the launcher once it holds the baton, and the
+  report says what each ran (`p<i>.program`, `p<i>.image`); `suspects`
+  takes its programs from there (`TASKS_REVIEW2.md`, third pass).
 - Needs `atos` (Xcode tools) for source lines; without it, addresses.

@@ -221,23 +221,48 @@ fn shared() -> Option<&'static Shared> {
 }
 
 /// Run `f` on the locked scheduler state. `f` must not block or allocate.
+/// None outside a run, and from a signal handler that interrupted this
+/// thread inside the lock: the state is mid-update then and not for use.
 pub fn with<R>(f: impl FnOnce(&mut shared::State, u32) -> R) -> Option<R> {
     let sh = shared()?;
-    let mut s = sh.lock();
+    let mut s = sh.lock_unless_reentrant()?;
     Some(f(&mut s, pid()))
+}
+
+/// `with` for a wake, which a handler on the lock's holder leaves to the
+/// holder instead of dropping.
+fn with_or_defer(key: u64, f: impl FnOnce(&mut shared::State, u32) -> usize) -> usize {
+    let Some(sh) = shared() else { return 0 };
+    if let Some(mut s) = sh.lock_unless_reentrant() {
+        f(&mut s, pid())
+    } else {
+        sh.defer_wake(pid(), key);
+        0
+    }
 }
 
 /// Make every thread of this process blocked on `addr` runnable; returns
 /// how many there were. Safe from a thread the scheduler does not run.
+/// `wake_io`, deferred like `wake_all` when a handler cannot make it.
+pub fn wake_io() {
+    let outside = !on_scheduled_thread();
+    with_or_defer(shared::DEFERRED_IO, |s, pid| {
+        if outside {
+            note_outside_wake(s, pid);
+        }
+        s.wake_io();
+        0
+    });
+}
+
 pub fn wake_all(addr: usize) -> usize {
     let outside = !on_scheduled_thread();
-    let woken = with(|s, pid| {
+    let woken = with_or_defer(addr as u64, |s, pid| {
         if outside {
             note_outside_wake(s, pid);
         }
         s.wake_all(pid, addr as u64)
-    })
-    .unwrap_or(0);
+    });
     if woken > 0 && outside {
         OUTSIDE_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
     }
@@ -363,6 +388,7 @@ fn join_run(path: &str) -> (&'static Shared, usize) {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| fatal("REWRITE_PROC missing"));
+    sh.reclaim_after_exec();
     let mut s = sh.lock();
     if s.procs[pid as usize].killed {
         s.procs[pid as usize].signalled = true;
@@ -453,12 +479,11 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     open_trace();
     load_mask();
     // Its own stream, per process; a `fork` child carries its parent's on
-    crate::alloc::seed_layout(
-        process_seed(cfg.seed, pid()),
-        cfg.heap_size,
-    );
+    crate::alloc::seed_layout(process_seed(cfg.seed, pid()), cfg.heap_size);
     set_my_id(me);
     wait_for_baton(me);
+    // With the baton: only its holder talks to the launcher
+    crate::coord::announce_image();
 }
 
 /// In the child of a `fork`: become process `child`, whose main thread the
@@ -562,7 +587,10 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
         State::Blocked(k) => (shared::T_BLOCKED, k as u64),
         State::Exited => (shared::T_EXITED, 0),
     };
-    let mut s = sh.lock();
+    let Some(mut s) = sh.lock_unless_reentrant() else {
+        // A signal handler on the thread that is inside the lock
+        return;
+    };
     if s.current as usize != me {
         // Guest code on a thread that does not hold the baton: a signal
         // handler on a parked thread. It must not hand over what it lacks.

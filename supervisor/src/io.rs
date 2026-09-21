@@ -106,13 +106,7 @@ pub fn note_outside_in_wait() {
 }
 
 pub fn wake_io() {
-    let outside = !sched::on_scheduled_thread();
-    sched::with(|s, pid| {
-        if outside {
-            sched::note_outside_wake(s, pid);
-        }
-        s.wake_io();
-    });
+    sched::wake_io();
 }
 
 fn ready(fd: c_int, events: libc::c_short) -> bool {

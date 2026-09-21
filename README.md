@@ -169,6 +169,11 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
 - A wait (`poll`, `select`, `kevent`) may not depend on a descriptor whose
   other end is outside the run: nothing could repeat it. Such a wait is
   logged, and only the guests' side ever ends it.
+- A handler for any other signal runs when the kernel delivers it, at a
+  moment of real time, on whichever thread it lands, usually one that is
+  parked. What it does is input to the run. It may call anything; a wake
+  it causes while its thread is inside the scheduler is made when that
+  thread leaves it.
 - `SIGCHLD` handlers run at a point of the schedule (the parent's next
   thread to run after the death), not when the kernel sends the signal. A
   signal a guest sends itself is delivered to the calling thread.

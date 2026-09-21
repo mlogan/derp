@@ -278,3 +278,41 @@ pub fn failing_and_passing_seed(extra: &[&str], scratch: &Path, manifest: &Path)
     }
     panic!("200 seeds: failing {failing:?}, passing {passing:?}");
 }
+
+/// `rewrite run --capture` of a run file with a watchdog: None when the
+/// run was still going after `timeout` and had to be killed.
+pub fn run_manifest_timed(
+    manifest: &Path,
+    scratch: &Path,
+    seed: u64,
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    let mut child = rewrite_cmd(
+        &["run", "--capture", "--seed", &seed.to_string()],
+        &[],
+        scratch,
+        manifest,
+    )
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .expect("rewrite run");
+    let began = std::time::Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            let mut stderr = Vec::new();
+            std::io::Read::read_to_end(child.stderr.as_mut().unwrap(), &mut stderr).unwrap();
+            return Some(std::process::Output {
+                status,
+                stdout: Vec::new(),
+                stderr,
+            });
+        }
+        if began.elapsed() > timeout {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}

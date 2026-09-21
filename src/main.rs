@@ -45,6 +45,8 @@ options:
                                        (default: a directory under the system temp dir)
   --capture                            manifest run: each guest's stdout goes to stdout.<index>
                                        in the scratch directory instead of ours
+  --capture-stderr                     and its stderr to stderr.<index>, with the supervisor's
+                                       messages about it
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
   --stop-after T                       the run is over at this virtual time: what still runs
@@ -85,6 +87,9 @@ struct Cli {
     manifest: Option<PathBuf>,
     scratch: Option<PathBuf>,
     capture: bool,
+    /// Each guest's stderr to a file too; otherwise it stays ours, where
+    /// the supervisor's own messages about a guest are expected
+    capture_stderr: bool,
     net_latency_ns: u64,
     heap_size: u64,
     /// Virtual time at which the run is over (0: when its processes are)
@@ -147,6 +152,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         manifest: None,
         scratch: None,
         capture: false,
+        capture_stderr: false,
         net_latency_ns: 0,
         heap_size: launch::DEFAULT_HEAP,
         stop_after_ns: 0,
@@ -184,6 +190,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             "--manifest" => cli.manifest = Some(take_value(&mut args)?.into()),
             "--scratch" => cli.scratch = Some(take_value(&mut args)?.into()),
             "--capture" => cli.capture = true,
+            "--capture-stderr" => cli.capture_stderr = true,
             "--net-latency" => {
                 let v = take_value(&mut args)?;
                 cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
@@ -399,7 +406,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
                 host: p.host,
                 env,
                 stdout: capture.then(|| stdout_file(&scratch, i)),
-                stderr: capture.then(|| stderr_file(&scratch, i)),
+                stderr: cli.capture_stderr.then(|| stderr_file(&scratch, i)),
                 cwd: Some(root.clone()),
                 daemon: p.daemon,
                 faults: p.faults,

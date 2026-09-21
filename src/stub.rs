@@ -6,6 +6,7 @@ pub const STR_X30_PRE: u32 = 0xF81F_0FFE; // str x30, [sp, #-16]!
 pub const LDR_X30_POST: u32 = 0xF841_07FE; // ldr x30, [sp], #16
 pub const SUB_X1_X1_1: u32 = 0xD100_0421;
 pub const BLR_X0: u32 = 0xD63F_0000;
+pub const RET: u32 = 0xD65F_03C0;
 
 pub const B_RANGE: i64 = 128 << 20;
 
@@ -93,6 +94,7 @@ mod tests {
         assert_eq!(tbz(7, 40, false, 0x1018, 0x1000), Some(0xB647_FF47));
         assert_eq!(tbz(2, 3, true, 0x101C, 0x1000), Some(0x371F_FF22));
         assert_eq!(br(9), 0xD61F_0120);
+        assert_eq!(RET, 0xD65F_03C0);
         assert_eq!(movz_x(0, 0x78_0000_0000), Some(0xD2C0_0F00));
         assert_eq!(movz_x(3, 0x1234), Some(0xD282_4683));
         assert_eq!(movz_x(0, 0), Some(0xD280_0000));

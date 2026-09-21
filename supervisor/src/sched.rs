@@ -1022,6 +1022,8 @@ pub fn report(out: &mut String) {
 // Saves every register the guest may have live (the stub already saved x0,
 // x1 and x30), calls the Rust scheduler, and restores them. x18 is the
 // platform register and x19-x28 are callee-saved, so neither needs saving.
+// The site is the return address the shared stub body saved last, at the
+// top of the stack on entry: our own frame then puts it at [x29, #16].
 std::arch::global_asm!(
     ".globl _rewrite_scheduler_yield",
     ".p2align 2",
@@ -1055,7 +1057,7 @@ std::arch::global_asm!(
     "stp q26, q27, [sp, #-32]!",
     "stp q28, q29, [sp, #-32]!",
     "stp q30, q31, [sp, #-32]!",
-    "mov x0, x30",
+    "ldr x0, [x29, #16]",
     "bl _rewrite_yield_impl",
     "ldp q30, q31, [sp], #32",
     "ldp q28, q29, [sp], #32",

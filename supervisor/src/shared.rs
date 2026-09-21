@@ -94,7 +94,7 @@ pub const DEBUG_PATH_LEN: usize = 1024;
 
 /// What the cache puts between a program's file name and the key of its
 /// rewritten copy
-pub const CACHE_TAG: &str = ".rw3-";
+pub const CACHE_TAG: &str = ".rw4-";
 
 /// Store `path` in one of the state's path fields; too long is not stored.
 pub fn set_debug_path(field: &mut [u8; DEBUG_PATH_LEN], path: &str) {

@@ -28,9 +28,11 @@ Options worth knowing:
   and does not fail the run. For servers that never exit by themselves,
   and for comparing what a program did in a fixed span of virtual time.
   Also `stop-after:` in the run file; it needs the supervisor.
-- `--capture` writes each guest's stdout and stderr to `stdout.<index>`
-  and `stderr.<index>` in the `--scratch` directory. The report goes to
-  stderr: `run.*` totals, then `p<index>.*` per process.
+- `--capture` writes each guest's stdout to `stdout.<index>` in the
+  `--scratch` directory, and `--capture-stderr` its stderr to
+  `stderr.<index>` (the supervisor's messages about that guest included;
+  without it they come out on ours). The report goes to stderr: `run.*`
+  totals, then `p<index>.*` per process.
 - `REWRITE_TRACE=file` appends one line per baton switch (from, to, hook
   events issued, site, virtual clock). Diff two of them to find where two
   runs part ways; the schedule hash covers the same values.
@@ -201,7 +203,7 @@ counter and the scheduler entry point in a fixed region at
 `0x78_0000_0000` that the supervisor dylib maps at startup (one private
 page per process, then the run's shared scheduler state). A default-linked
 binary has header room for one new segment, which holds the stub code;
-there is nowhere to put a writable word. Running `prog.rw3-…` directly
+there is nowhere to put a writable word. Running `prog.rw4-…` directly
 faults at the first hooked branch.
 
 `--no-supervisor` and `bench` still inject the dylib, in a passive mode

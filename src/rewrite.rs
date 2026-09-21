@@ -1,13 +1,17 @@
-//! Rewrites the program text: every hooked site becomes a branch to a stub
-//! in `__STUB` that decrements the run's quantum counter, calls the
-//! scheduler when it expires, and then performs the original branch or
-//! memory access.
+//! Rewrites the program text: every hooked site becomes a branch to a
+//! trampoline in `__STUB` that calls the segment's one shared body, which
+//! decrements the run's quantum counter and enters the scheduler when it
+//! expires, and then performs the original branch or memory access. The
+//! trampoline is four to six words; what names the site to the scheduler
+//! is the trampoline's return address, which the body leaves on the stack.
+//! Big programs hook millions of sites, and every site must reach its
+//! trampoline, and the trampoline its target, with one `b` (±128 MB).
 //!
 //! The counter and the scheduler slot are not in the image: they live in
-//! the fixed region the supervisor sets up at `shared::STUB_BASE`, which a
-//! stub reaches with one `movz`. A default-linked binary has header room
-//! for one new segment but not for a second, writable one, so a rewritten
-//! binary only runs with the supervisor injected.
+//! the fixed region the supervisor sets up at `shared::STUB_BASE`, which
+//! the body reaches with one `movz`. A default-linked binary has header
+//! room for one new segment but not for a second, writable one, so a
+//! rewritten binary only runs with the supervisor injected.
 
 use crate::decode::{self, Class, FP, SP};
 use crate::macho::{self, MachO};
@@ -22,7 +26,7 @@ pub const HEADER_SITES: u32 = 8;
 pub const HEADER_MEM_SITES: u32 = 16;
 pub const HEADER_SEED: u32 = 24;
 pub const HEADER_SIZE: u64 = 32;
-pub const MAGIC: u64 = 0x0032_3030_5453_5752; // "RWST002" little-endian
+pub const MAGIC: u64 = 0x0033_3030_5453_5752; // "RWST003" little-endian
 
 #[derive(Debug, Clone)]
 pub struct Options {
@@ -121,8 +125,9 @@ pub enum SiteKind {
 /// One hooked instruction
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Site {
-    /// Where the stub's expiry path returns to: what the supervisor sees
-    /// when a quantum runs out here, and what a schedule trace calls `site`
+    /// Where the shared body returns to in this site's trampoline: what
+    /// the supervisor sees when a quantum runs out here, and what a
+    /// schedule trace calls `site`
     pub yield_pc: u64,
     /// The original instruction
     pub addr: u64,
@@ -222,6 +227,8 @@ enum Guard {
 
 struct Builder {
     text_addr: u64,
+    /// Address of the shared body
+    common: u64,
     code: Vec<u32>,
     patches: Vec<(u64, u32)>,
     sites: Vec<Site>,
@@ -236,8 +243,49 @@ impl Builder {
         self.code.push(w);
     }
 
-    /// Emit one stub for `site` and record the site patch. `call` means the
-    /// site keeps a `bl` so x30 is set by hardware.
+    /// The body every trampoline calls with x0, x1 and x30 live: count the
+    /// event and, when the quantum is out, enter the scheduler. Its own
+    /// x30 is the trampoline's return address, which names the site; the
+    /// scheduler's entry reads it from the stack, where it is saved before
+    /// the call.
+    fn emit_common(&mut self) {
+        self.common = self.pc();
+        self.emit(stub::STP_X0_X1_PRE);
+        self.emit(stub::movz_x(0, STUB_BASE as u64).expect("STUB_BASE fits one movz"));
+        self.emit(stub::ldr_x_imm(1, 0, COUNTER_OFFSET));
+        self.emit(stub::SUB_X1_X1_1);
+        self.emit(stub::str_x_imm(1, 0, COUNTER_OFFSET));
+        let cbz_at = self.code.len();
+        self.emit(0);
+        let resume = self.pc();
+        self.emit(stub::LDP_X0_X1_POST);
+        self.emit(stub::RET);
+        // Expired path
+        let expired = self.pc();
+        self.code[cbz_at] = stub::cbz(
+            true,
+            1,
+            false,
+            self.text_addr + (cbz_at * 4) as u64,
+            expired,
+        )
+        .unwrap();
+        // x0 still holds STUB_BASE here
+        self.emit(stub::STR_X30_PRE);
+        self.emit(stub::ldr_x_imm(0, 0, SLOT_OFFSET));
+        let skip_at = self.code.len();
+        self.emit(0);
+        self.emit(stub::BLR_X0);
+        let skip = self.pc();
+        self.code[skip_at] =
+            stub::cbz(true, 0, false, self.text_addr + (skip_at * 4) as u64, skip).unwrap();
+        self.emit(stub::LDR_X30_POST);
+        let pc = self.pc();
+        self.emit(stub::b(pc, resume).unwrap());
+    }
+
+    /// Emit one trampoline for `site` and record the site patch. `call`
+    /// means the site keeps a `bl` so x30 is set by hardware.
     fn stub(&mut self, site: u64, guard: Guard, call: bool, tail: Tail) -> Result<(), Error> {
         let start = self.pc();
         let site_word = if call {
@@ -258,15 +306,15 @@ impl Builder {
             self.emit(0);
             Some(self.code.len() - 1)
         };
-        self.emit(stub::STP_X0_X1_PRE);
-        self.emit(stub::movz_x(0, STUB_BASE as u64).expect("STUB_BASE fits one movz"));
-        self.emit(stub::ldr_x_imm(1, 0, COUNTER_OFFSET));
-        self.emit(stub::SUB_X1_X1_1);
-        self.emit(stub::str_x_imm(1, 0, COUNTER_OFFSET));
-        let cbz_at = self.code.len();
-        self.emit(0);
-        let resume = self.pc();
-        self.emit(stub::LDP_X0_X1_POST);
+        self.emit(stub::STR_X30_PRE);
+        let pc = self.pc();
+        let to_common = stub::bl(pc, self.common).ok_or(Error::OutOfRange {
+            site,
+            target: self.common,
+        })?;
+        self.emit(to_common);
+        let yield_pc = self.pc();
+        self.emit(stub::LDR_X30_POST);
         match tail {
             Tail::Jump(target) => {
                 let w = b_to(self.pc(), target)?;
@@ -279,23 +327,6 @@ impl Builder {
                 self.emit(w);
             }
         }
-        // Expired path
-        let expired = self.pc();
-        self.code[cbz_at] = stub::cbz(
-            true,
-            1,
-            false,
-            self.text_addr + (cbz_at * 4) as u64,
-            expired,
-        )
-        .unwrap();
-        // x0 still holds STUB_BASE here
-        self.emit(stub::STR_X30_PRE);
-        self.emit(stub::ldr_x_imm(0, 0, SLOT_OFFSET));
-        let skip_at = self.code.len();
-        self.emit(0);
-        self.emit(stub::BLR_X0);
-        let skip = self.pc();
         let kind = match tail {
             Tail::Replay(word) if is_load(word) => SiteKind::Load,
             Tail::Replay(_) => SiteKind::Store,
@@ -303,15 +334,10 @@ impl Builder {
             _ => SiteKind::Branch,
         };
         self.sites.push(Site {
-            yield_pc: skip,
+            yield_pc,
             addr: site,
             kind,
         });
-        self.code[skip_at] =
-            stub::cbz(true, 0, false, self.text_addr + (skip_at * 4) as u64, skip).unwrap();
-        self.emit(stub::LDR_X30_POST);
-        let pc = self.pc();
-        self.emit(stub::b(pc, resume).unwrap());
 
         if let Some(at) = guard_at {
             let fallthrough = self.pc();
@@ -371,10 +397,12 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
     let layout = m.plan_layout()?;
     let mut b = Builder {
         text_addr: layout.text_addr + HEADER_SIZE,
+        common: 0,
         code: Vec::new(),
         patches: Vec::new(),
         sites: Vec::new(),
     };
+    b.emit_common();
     let mut stats = Stats::default();
     let mut rng = Rng::seed_from_u64(opts.seed);
     let (rate_num, rate_den) = opts.mem_rate;

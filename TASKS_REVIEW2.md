@@ -140,13 +140,52 @@ Faults injected by the run file draw their first crash time when a
 process is registered, before any reseed: a probe at time 0 keeps those
 first crash times. Later ones are drawn from the reseeded stream.
 
+## Fourth pass (2026-09-21): `execve` under the lock, and what it hid
+
+Mark asked for a reproduction before a fix. What can hold the scheduler
+lock without the baton is a signal handler on a parked thread: it runs at
+a moment of real time, and a `write` to a pipe in it wakes the
+scheduler's waiters, which takes the lock. So the guest is a worker that
+takes signals and writes in the handler while main re-executes the
+program 100 times (`tests/programs/exec_race.c`, `exec_race2.c`).
+
+Two things came out:
+
+1. **A handler on the thread that is inside the lock deadlocked on
+   itself.** The worker is inside `yield_baton_as` holding the lock when
+   the timer signal lands; the handler's `write` wakes waiters, which
+   waits for the lock the same thread holds. 8 of 10 runs hung this way.
+   The lock word now names the holder's thread as well as its pid
+   (`owner_word`); `lock_unless_reentrant` tells a handler that it is on
+   the holder, `with` then does nothing, and a wake the handler wanted is
+   left in `Shared::deferred` for the holder to make as it leaves the lock
+   (`Guard::drop`), with the state consistent again. A yield from such a
+   handler is ignored, as one from a thread without the baton was.
+2. **The `execve` case as predicted.** Sampled: the new image spinning in
+   `join_run` on a lock word naming its own pid. `reclaim_after_exec`
+   resets such a word before the new image's first lock: no thread of the
+   new image can hold it yet. Validated on its own with `exec_race2`
+   (main sends the worker a thread-directed signal whose handler writes
+   2,000 times, and calls `execve` at once): 12 of 12 runs hung without
+   the reclaim, 0 of 12 with it; the first guest gave 12 of 15 without
+   the re-entrancy fix and 0 of 15 with it.
+
+Found on the way, not ours: macOS kills a process that `execve`s with a
+process-directed signal pending (or a real timer in flight) with SIGILL
+before the new image's first instruction, natively too. The test guests
+drain the timer or use thread-directed signals.
+
+Observed once and not reproduced: during one full-suite run, right after
+these changes, `a_reseeded_run_is_the_plain_run_until_the_reseed` found
+two runs of one reseeded configuration with different traces. 30 further
+runs of that test under CPU load and 5 further full suites were clean;
+the failing run's traces were not kept. If it comes back, the two trace
+files in its scratch directory are the evidence.
+
 ## Open
 
-- **`execve` with the scheduler lock held by a thread without the baton.**
-  The lock word names a pid that lives on in the new image, so it is never
-  taken over and the run hangs. Found by reading, not reproduced. Needs
-  the lock released or taken around the exec, or a generation beside the
-  pid.
+Nothing from the review.
+
 ## Third pass (2026-09-21): a guest's own children
 
 Reproduced first, and worse than predicted: a parent that starts

@@ -165,8 +165,21 @@ extern "C" fn trampoline(p: *mut c_void) -> *mut c_void {
 /// Runs during the exiting thread's TSD cleanup, after dyld's thread-local
 /// destructors (its key is older than ours), so guest destructors ran with
 /// the baton. Marks the thread exited and hands the baton on.
+/// The fourth and last round of key destructors libpthread makes
+const LAST_ROUND: usize = 3;
+
 pub extern "C" fn thread_teardown(value: *mut c_void) {
-    let id = value as usize - 1;
+    let id = (value as usize & sched::ID_MASK) - 1;
+    // Our key is older than any of the guest's, so we are called first in
+    // each round of destructors, and the guest's would run after we have
+    // given the baton away: guest code outside the schedule. libpthread
+    // makes up to four rounds while values remain. Put ours back for all
+    // but the last, and the guest's destructors run with the baton.
+    let round = value as usize >> sched::ROUND_SHIFT;
+    if round < LAST_ROUND {
+        sched::rearm_identity(id, round + 1);
+        return;
+    }
     count(C_EXIT);
     // libpthread cleared our key before calling us. The join wake is still
     // this scheduled thread's, made with the baton: it must not count as a

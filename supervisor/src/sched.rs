@@ -87,7 +87,19 @@ pub fn my_id() -> Option<usize> {
         return None;
     }
     let v = unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) } as usize;
-    (v != 0).then(|| v - 1)
+    (v != 0).then(|| (v & ID_MASK) - 1)
+}
+
+/// The key's value is the id plus one; above it, how many rounds of key
+/// destructors the exiting thread has been through (`thread_teardown`).
+pub const ID_MASK: usize = 0xFFFF_FFFF;
+pub const ROUND_SHIFT: u32 = 32;
+
+/// Keep this thread's identity for another round of key destructors.
+pub fn rearm_identity(id: usize, round: usize) {
+    let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
+    let value = (id + 1) | (round << ROUND_SHIFT);
+    unsafe { libc::pthread_setspecific(key, value as *const c_void) };
 }
 
 /// `my_id().is_some()` for the allocator, which must not touch a Rust

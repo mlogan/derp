@@ -17,11 +17,13 @@ extern "C" {
     fn mach_vm_allocate(task: u32, addr: *mut u64, size: u64, flags: i32) -> i32;
 }
 
-/// Above the GPU carveout and below the scheduler's fixed region, where
-/// nothing else lands; low addresses are taken now and then by whatever
-/// the kernel maps first (see `shared::STUB_BASE`).
-const REGION_HINT: usize = 0x74_0000_0000;
-const REGION_SIZE: usize = 4 << 30;
+/// High up, where nothing else lands (low addresses are taken now and then
+/// by whatever the kernel maps first; see `shared::STUB_BASE`). Address
+/// space only: pages are touched as blocks are. Large, because a seeded
+/// layout scatters what it hands out, and a small region would soon have
+/// no room left for a big block between the scattered ones.
+const REGION_HINT: usize = 0x2000_0000_0000;
+const REGION_SIZE: usize = 1 << 40;
 const HEADER: usize = 16;
 /// Small classes are multiples of 16 up to this size
 const SMALL_MAX: usize = 1024;
@@ -32,7 +34,11 @@ const PAGE: usize = 0x4000;
 
 /// A seeded heap hands out the region in slabs of this size
 const SLAB: usize = 64 << 10;
-const N_SLABS: usize = REGION_SIZE / SLAB;
+/// Slabs for the pooled classes come from a window at one end of the
+/// region (which end is the seed's choice) and runs from the rest: small
+/// blocks scattered all over would leave no long runs free. It is also as
+/// far as a pool's 32-bit offsets, in units of 16 bytes, reach.
+const WINDOW: usize = 64 << 30;
 /// Blocks a seeded `malloc` chooses among, per class
 const POOL: usize = 32;
 /// Classes whose blocks fit a slab: the small ones, and 2 KB to 64 KB
@@ -57,8 +63,13 @@ struct Heap {
     /// Seeded before the first scheduled thread allocates; None keeps the
     /// compact layout (the supervisor's own heap, and unit tests of it)
     rng: Option<crate::rng::Rng>,
-    /// Which slabs of the region are taken
-    slabs: [u64; N_SLABS / 64],
+    /// Bitmap of taken slabs, mapped when the layout is seeded (an address)
+    slabs: usize,
+    /// First slab and length in slabs of the pooled classes' window
+    window: (usize, usize),
+    /// Scratch for shuffling a new slab's slots. Here and not on the stack:
+    /// a guest may call `malloc` with a few kilobytes of stack left.
+    order: [u16; SLAB / 16],
     /// Candidates `malloc` draws from, per class up to `SLAB`, as offsets
     /// into the region
     pools: [[u32; POOL]; N_POOLED],
@@ -81,7 +92,9 @@ impl Heap {
             size,
             guests,
             rng: None,
-            slabs: [0; N_SLABS / 64],
+            slabs: 0,
+            window: (0, 0),
+            order: [0; SLAB / 16],
             pools: [[0; POOL]; N_POOLED],
             pool_len: [0; N_POOLED],
             base: 0,
@@ -91,6 +104,21 @@ impl Heap {
             large: [0; N_LARGE],
             huge: 0,
             broken: false,
+        }
+    }
+}
+
+// The two heaps of a process live as long as it does; a heap made for a
+// moment must give its terabyte of address space back.
+impl Drop for Heap {
+    fn drop(&mut self) {
+        unsafe {
+            if self.base != 0 {
+                libc::munmap(self.base as *mut c_void, self.size);
+            }
+            if self.slabs != 0 {
+                libc::munmap(self.slabs as *mut c_void, (self.size / SLAB).div_ceil(8));
+            }
         }
     }
 }
@@ -121,7 +149,13 @@ unsafe impl std::alloc::GlobalAlloc for Private {
         let p = OWN.lock().alloc(layout.size(), layout.align().max(16));
         if p.is_null() {
             // No region to be had: libmalloc still works
-            return libc::malloc(layout.size()).cast();
+            let mut out = std::ptr::null_mut();
+            let align = layout.align().max(16);
+            return if libc::posix_memalign(&raw mut out, align, layout.size()) == 0 {
+                out.cast()
+            } else {
+                std::ptr::null_mut()
+            };
         }
         p.cast()
     }
@@ -212,6 +246,27 @@ impl Heap {
         self.base = p as usize;
         self.bump = self.base;
         self.end = self.base + self.size;
+        if let Some(rng) = self.rng.as_mut() {
+            let n_slabs = self.size / SLAB;
+            let bitmap = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    n_slabs.div_ceil(8),
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if bitmap == libc::MAP_FAILED {
+                self.broken = true;
+                return;
+            }
+            self.slabs = bitmap as usize;
+            let len = (WINDOW / SLAB).min(n_slabs / 4);
+            let low = rng.below(2) == 0;
+            self.window = (if low { 0 } else { n_slabs - len }, len);
+        }
     }
 
     fn contains(&self, p: usize) -> bool {
@@ -219,19 +274,20 @@ impl Heap {
     }
 
     /// Class index and size for a raw block of at least `raw_size` bytes
-    fn class_for(raw_size: usize) -> (Option<usize>, usize) {
+    /// None for a size no block can have
+    fn class_for(raw_size: usize) -> Option<(Option<usize>, usize)> {
         if raw_size <= SMALL_MAX {
             let k = raw_size.div_ceil(16).max(1);
-            return (Some(k - 1), k * 16);
+            return Some((Some(k - 1), k * 16));
         }
         let mut size = 2048;
         for i in 0..N_LARGE {
             if raw_size <= size {
-                return (Some(N_SMALL + i), size);
+                return Some((Some(N_SMALL + i), size));
             }
             size *= 2;
         }
-        (None, raw_size.div_ceil(PAGE) * PAGE)
+        Some((None, raw_size.div_ceil(PAGE).checked_mul(PAGE)?))
     }
 
     fn list(&mut self, class: usize) -> &mut usize {
@@ -274,30 +330,47 @@ impl Heap {
         None
     }
 
+    fn slab_word(&self, i: usize) -> *mut u64 {
+        (self.slabs as *mut u64).wrapping_add(i / 64)
+    }
+
     fn slab_taken(&self, i: usize) -> bool {
-        self.slabs[i / 64] & (1 << (i % 64)) != 0
+        unsafe { *self.slab_word(i) & (1 << (i % 64)) != 0 }
     }
 
     fn mark_slabs(&mut self, first: usize, n: usize, taken: bool) {
         for i in first..first + n {
-            if taken {
-                self.slabs[i / 64] |= 1 << (i % 64);
-            } else {
-                self.slabs[i / 64] &= !(1 << (i % 64));
+            let word = self.slab_word(i);
+            unsafe {
+                if taken {
+                    *word |= 1 << (i % 64);
+                } else {
+                    *word &= !(1 << (i % 64));
+                }
             }
         }
     }
 
-    /// A run of `n` free slabs starting at a random index, now taken.
-    fn take_slabs(&mut self, n: usize) -> Option<usize> {
-        let last = N_SLABS.checked_sub(n)?;
+    /// A run of `n` free slabs at a random place, now taken: in the window
+    /// for a pooled class's slab, outside it for a run.
+    fn take_slabs(&mut self, n: usize, pooled: bool) -> Option<usize> {
+        let (window_first, window_len) = self.window;
+        let (first, len) = match (pooled, window_first) {
+            (true, _) => self.window,
+            (false, 0) => (window_len, self.size / SLAB - window_len),
+            (false, _) => (0, window_first),
+        };
+        let last = len.checked_sub(n.max(1))?;
+        if n == 0 {
+            return None;
+        }
         let free = |h: &Heap, at: usize| (at..at + n).all(|i| !h.slab_taken(i));
         let rng = self.rng.as_mut()?;
         // The region is mostly empty: a few draws find room. When they do
         // not, the first fit from one more drawn index does, if any exists.
         let mut tries = [0usize; 17];
         for t in &mut tries {
-            *t = rng.below(last as u64 + 1) as usize;
+            *t = first + rng.below(last as u64 + 1) as usize;
         }
         let at = tries[..16]
             .iter()
@@ -305,7 +378,7 @@ impl Heap {
             .find(|&at| free(self, at))
             .or_else(|| {
                 (0..=last)
-                    .map(|k| (tries[16] + k) % (last + 1))
+                    .map(|k| first + (tries[16] - first + k) % (last + 1))
                     .find(|&at| free(self, at))
             })?;
         self.mark_slabs(at, n, true);
@@ -322,7 +395,7 @@ impl Heap {
         // block just freed: programs meet immediate reuse and its absence
         let draw = self.rng.as_mut()?.below(2 * len as u64) as usize;
         let i = if draw < len { draw } else { len - 1 };
-        let p = self.base + self.pools[c][i] as usize;
+        let p = self.window_base() + self.pools[c][i] as usize * 16;
         self.pools[c][i] = self.pools[c][len - 1];
         self.pool_len[c] -= 1;
         Some(p)
@@ -338,18 +411,17 @@ impl Heap {
         if self.pool_len[c] > 0 {
             return Some(());
         }
-        let slab = self.take_slabs(1)?;
+        let slab = self.take_slabs(1, true)?;
         let n = SLAB / size;
-        let mut order = [0u16; SLAB / 16];
-        for (i, o) in order[..n].iter_mut().enumerate() {
-            *o = i as u16;
+        for i in 0..n {
+            self.order[i] = i as u16;
         }
         for i in (1..n).rev() {
             let j = self.rng.as_mut()?.below(i as u64 + 1) as usize;
-            order.swap(i, j);
+            self.order.swap(i, j);
         }
-        for &slot in &order[..n] {
-            let p = slab + slot as usize * size;
+        for k in 0..n {
+            let p = slab + self.order[k] as usize * size;
             if (self.pool_len[c] as usize) < POOL {
                 self.offer(c, p);
             } else {
@@ -360,17 +432,21 @@ impl Heap {
     }
 
     /// Add `p` to the candidates of class `c`, which has room.
+    fn window_base(&self) -> usize {
+        self.base + self.window.0 * SLAB
+    }
+
     fn offer(&mut self, c: usize, p: usize) {
-        self.pools[c][self.pool_len[c] as usize] = (p - self.base) as u32;
+        self.pools[c][self.pool_len[c] as usize] = ((p - self.window_base()) / 16) as u32;
         self.pool_len[c] += 1;
     }
 
     fn alloc_raw(&mut self, raw_size: usize) -> Option<(usize, usize)> {
-        let (class, size) = Self::class_for(raw_size);
+        let (class, size) = Self::class_for(raw_size)?;
         if self.rng.is_some() {
             return match class {
                 Some(c) if c < N_POOLED => Some((self.draw(c, size)?, size)),
-                _ => Some((self.take_slabs(size.div_ceil(SLAB))?, size)),
+                _ => Some((self.take_slabs(size.div_ceil(SLAB), false)?, size)),
             };
         }
         if let Some(c) = class {
@@ -380,7 +456,7 @@ impl Heap {
         } else if let Some(p) = self.pop_huge(size) {
             return Some((p, size));
         }
-        if self.bump + size > self.end {
+        if self.bump.checked_add(size)? > self.end {
             return None;
         }
         let p = self.bump;
@@ -389,7 +465,9 @@ impl Heap {
     }
 
     fn free_raw(&mut self, raw: usize, class_size: usize) {
-        let (class, _) = Self::class_for(class_size);
+        let Some((class, _)) = Self::class_for(class_size) else {
+            return;
+        };
         if self.rng.is_some() {
             match class {
                 Some(c) if c < N_POOLED && (self.pool_len[c] as usize) < POOL => self.offer(c, raw),
@@ -575,8 +653,10 @@ pub extern "C" fn my_malloc_size(p: *const c_void) -> usize {
 }
 
 pub extern "C" fn my_malloc_good_size(size: usize) -> usize {
-    let (_, class) = Heap::class_for(size.max(1) + HEADER);
-    class - HEADER
+    size.max(1)
+        .checked_add(HEADER)
+        .and_then(Heap::class_for)
+        .map_or(size, |(_, class)| class - HEADER)
 }
 
 #[cfg(test)]
@@ -669,9 +749,47 @@ mod tests {
     }
 
     #[test]
+    fn absurd_sizes_are_refused() {
+        let mut h = heap(1, 0x68_0000_0000 + 90 * REGION_SIZE);
+        for size in [
+            usize::MAX,
+            usize::MAX - 17,
+            usize::MAX - 100,
+            usize::MAX - 16_000,
+            REGION_SIZE,
+        ] {
+            assert!(h.alloc(size, 16).is_null(), "{size:#x}");
+        }
+        assert!(!h.alloc(64, 16).is_null());
+        assert_eq!(my_malloc_good_size(usize::MAX - 3), usize::MAX - 3);
+    }
+
+    /// Scattered small blocks must not use up the room for big ones.
+    #[test]
+    fn big_blocks_fit_after_many_small_ones() {
+        for seed in 0..6 {
+            let mut h = heap(seed, 0x69_0000_0000 + (100 + seed as usize) * REGION_SIZE);
+            // 16,000 blocks of 40 KB: 625 MB live in about 16,000 slabs
+            for _ in 0..16_000 {
+                assert!(!h.alloc(40_000, 16).is_null());
+            }
+            for size in [8 << 20, 256 << 20, 4 << 30, 64usize << 30] {
+                let p = h.alloc(size, 16);
+                assert!(!p.is_null(), "seed {seed}: {size:#x}");
+                h.free(p as usize);
+            }
+        }
+    }
+
+    #[test]
     fn a_freed_run_of_slabs_is_free_again() {
         let mut h = heap(9, 0x67_0000_0000 + 80 * REGION_SIZE);
-        let taken = |h: &Heap| h.slabs.iter().map(|w| w.count_ones()).sum::<u32>();
+        let taken = |h: &Heap| {
+            (0..h.size / SLAB)
+                .step_by(64)
+                .map(|i| unsafe { (*h.slab_word(i)).count_ones() })
+                .sum::<u32>()
+        };
         let p = h.alloc(3 << 20, 16) as usize;
         assert_eq!(taken(&h), (3usize << 20).div_ceil(SLAB) as u32 + 1);
         h.free(p);

@@ -15,6 +15,7 @@ fn run_capture(
         args: Vec::new(),
         dylib,
         disable_aslr: true,
+        heap_size: rewrite::launch::DEFAULT_HEAP,
         stdout: Some(out_path.clone()),
         seed: 0,
         quantum: launch::DEFAULT_QUANTUM,

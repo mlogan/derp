@@ -1554,3 +1554,25 @@ fn edge_cases_behave_as_they_do_natively() {
         }
     }
 }
+
+/// A guest's heap is 32 GB of address space unless the run says otherwise,
+/// in the run file or on the command line, which wins.
+#[test]
+fn the_heap_size_is_the_runs_to_set() {
+    let dir = common::scratch_dir("heap_size");
+    common::build_c("heap_limit", &dir, &[]);
+    let scratch = dir.join("scratch");
+    let manifest = dir.join("heap.yaml");
+    let processes = "hosts:\n  - name: a\n    processes:\n      - heap_limit\n";
+    let (roomy, tight) = ("100 MB: ok\n1000 MB: ok\n", "100 MB: ok\n1000 MB: null\n");
+
+    std::fs::write(&manifest, processes).unwrap();
+    assert_eq!(run_manifest(&manifest, &scratch, 1, 1).stdout[0], roomy);
+    let small = run_manifest_with(&manifest, &scratch, 1, 1, &["--heap-size", "256M"]);
+    assert_eq!(small.stdout[0], tight);
+
+    std::fs::write(&manifest, format!("heap-size: 256M\n{processes}")).unwrap();
+    assert_eq!(run_manifest(&manifest, &scratch, 1, 1).stdout[0], tight);
+    let large = run_manifest_with(&manifest, &scratch, 1, 1, &["--heap-size", "8G"]);
+    assert_eq!(large.stdout[0], roomy);
+}

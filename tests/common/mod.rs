@@ -142,6 +142,7 @@ fn run_mode(
         args: args.iter().map(std::convert::Into::into).collect(),
         dylib,
         disable_aslr: true,
+        heap_size: rewrite::launch::DEFAULT_HEAP,
         stdout: Some(out_path.clone()),
         seed,
         quantum: rewrite::launch::DEFAULT_QUANTUM,

@@ -14,6 +14,8 @@ use crate::stubdata::Info;
 
 pub struct Config {
     pub seed: u64,
+    /// Bytes of address space for the guest's heap
+    pub heap_size: usize,
     pub quantum_lo: u32,
     pub quantum_hi: u32,
 }
@@ -34,8 +36,13 @@ impl Config {
                 }
             }
         }
+        let heap_size = std::env::var("REWRITE_HEAP")
+            .ok()
+            .and_then(|v| usize::from_str_radix(&v, 16).ok())
+            .unwrap_or(crate::alloc::DEFAULT_SIZE);
         Config {
             seed,
+            heap_size,
             quantum_lo: lo,
             quantum_hi: hi,
         }
@@ -436,7 +443,10 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     open_trace();
     load_mask();
     // Its own stream, per process; a `fork` child carries its parent's on
-    crate::alloc::seed_layout(process_seed(cfg.seed, pid()) ^ 0x4845_4150_4845_4150);
+    crate::alloc::seed_layout(
+        process_seed(cfg.seed, pid()) ^ 0x4845_4150_4845_4150,
+        cfg.heap_size,
+    );
     set_my_id(me);
     wait_for_baton(me);
 }

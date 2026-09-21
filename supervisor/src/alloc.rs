@@ -19,12 +19,15 @@ extern "C" {
 }
 
 /// High up, where nothing else lands (low addresses are taken now and then
-/// by whatever the kernel maps first; see `shared::STUB_BASE`). Address
-/// space only: pages are touched as blocks are. Large, because a seeded
-/// layout scatters what it hands out, and a small region would soon have
-/// no room left for a big block between the scattered ones.
+/// by whatever the kernel maps first; see `shared::STUB_BASE`), with room
+/// above for the largest heap a run may ask for.
 const REGION_HINT: usize = 0x2000_0000_0000;
-const REGION_SIZE: usize = 1 << 40;
+/// Address space only: pages are touched as blocks are. Roomy, because a
+/// seeded layout scatters what it hands out, and a tight region soon has
+/// no run left for a big block between the scattered ones. The run's
+/// `heap-size` replaces it.
+pub const DEFAULT_SIZE: usize = 32 << 30;
+const REGION_SIZE: usize = DEFAULT_SIZE;
 const HEADER: usize = 16;
 /// Small classes are multiples of 16 up to this size
 const SMALL_MAX: usize = 1024;
@@ -37,8 +40,9 @@ const PAGE: usize = 0x4000;
 const SLAB: usize = 64 << 10;
 /// Slabs for the pooled classes come from a window at one end of the
 /// region (which end is the seed's choice) and runs from the rest: small
-/// blocks scattered all over would leave no long runs free. It is also as
-/// far as a pool's 32-bit offsets, in units of 16 bytes, reach.
+/// blocks scattered all over would leave no long runs free. A quarter of
+/// the region, and at most this, which is as far as a pool's 32-bit
+/// offsets, in units of 16 bytes, reach.
 const WINDOW: usize = 64 << 30;
 /// Blocks a seeded `malloc` chooses among, per class
 const POOL: usize = 32;
@@ -110,7 +114,7 @@ impl Heap {
 }
 
 // The two heaps of a process live as long as it does; a heap made for a
-// moment must give its terabyte of address space back.
+// moment must give its address space back.
 impl Drop for Heap {
     fn drop(&mut self) {
         unsafe {
@@ -193,10 +197,12 @@ fn guest_heap() -> crate::spin::Guard<'static, Heap> {
 
 /// From now on, where a guest's block lands is drawn from `seed`. Call
 /// before the first scheduled thread of the process allocates.
-pub fn seed_layout(seed: u64) {
+pub fn seed_layout(seed: u64, size: usize) {
     let mut h = HEAP.lock();
     if h.base == 0 {
         h.rng = Some(crate::rng::Rng::seed_from_u64(seed));
+        // Whole words of the slab bitmap
+        h.size = (size / (64 * SLAB)).max(1) * 64 * SLAB;
     }
 }
 
@@ -774,7 +780,7 @@ mod tests {
             for _ in 0..16_000 {
                 assert!(!h.alloc(40_000, 16).is_null());
             }
-            for size in [8 << 20, 256 << 20, 4 << 30, 64usize << 30] {
+            for size in [8 << 20, 256 << 20, 4 << 30, 16usize << 30] {
                 let p = h.alloc(size, 16);
                 assert!(!p.is_null(), "seed {seed}: {size:#x}");
                 h.free(p as usize);

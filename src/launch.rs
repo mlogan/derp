@@ -20,6 +20,8 @@ pub struct Launch {
     pub args: Vec<OsString>,
     pub dylib: Option<PathBuf>,
     pub disable_aslr: bool,
+    /// Bytes of address space for each guest's heap
+    pub heap_size: u64,
     /// Redirect the guest's stdout to this file (created or truncated)
     pub stdout: Option<PathBuf>,
     pub seed: u64,
@@ -33,6 +35,11 @@ pub struct Launch {
 
 /// Tells the supervisor to set up the stubs' region and nothing else
 pub const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
+
+/// Address space of a guest's heap unless the run says otherwise. Only
+/// touched pages cost memory; it bounds what a guest can have live, and a
+/// seeded layout wants room to scatter blocks in.
+pub const DEFAULT_HEAP: u64 = 32 << 30;
 
 pub const DEFAULT_QUANTUM: (u32, u32) = (1000, 10000);
 
@@ -115,6 +122,8 @@ pub struct Run {
     /// an unrecorded input, and their total length moves the guest's stack.
     pub inherit_env: bool,
     pub disable_aslr: bool,
+    /// Bytes of address space for each guest's heap
+    pub heap_size: u64,
     pub seed: u64,
     pub quantum: (u32, u32),
     /// Rewritten binaries need the dylib for the region their stubs
@@ -575,6 +584,11 @@ fn only_daemons_left(run: &Run, procs: &[Tracked]) -> bool {
 /// The environment that makes a guest process `proc_index` of the run.
 fn guest_env(run: &Run, coord: Option<(&Coordinator, u32)>) -> Vec<(String, String)> {
     let mut env = vec![("REWRITE_SEED".to_string(), run.seed.to_string())];
+    // As wide whatever the size: the environment's length places the stack
+    env.push((
+        "REWRITE_HEAP".to_string(),
+        format!("{:016x}", run.heap_size),
+    ));
     if run.passive {
         env.push((PASSIVE_VAR.into(), "1".into()));
     }
@@ -848,6 +862,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         dylib: cfg.dylib.clone(),
         inherit_env: true,
         disable_aslr: cfg.disable_aslr,
+        heap_size: cfg.heap_size,
         seed: cfg.seed,
         quantum: cfg.quantum,
         passive: cfg.passive,

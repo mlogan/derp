@@ -33,6 +33,8 @@ options:
   --reseed-at T --reseed N             from virtual time T on, every random stream (schedule,
                                        faults, heap layout, entropy) starts over from N: what
                                        bisect does at each probe
+  --heap-size N                        address space of each guest's heap: 32G (default), 512M,
+                                       4T. Only touched pages cost memory
   --jobs J                             bisect, suspects: runs at a time (default 4)
   --resolution T                       bisect: stop at an interval this short (default 2ms)
   --no-supervisor                      no scheduling: the dylib only provides the stubs' counter
@@ -79,6 +81,7 @@ struct Cli {
     scratch: Option<PathBuf>,
     capture: bool,
     net_latency_ns: u64,
+    heap_size: u64,
     reseed_at: Option<u64>,
     reseed: u64,
     jobs: u32,
@@ -112,6 +115,9 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(l), true) = (&m.net_latency, from_file("net-latency")) {
         cli.net_latency_ns = parse_duration_ns(l).ok_or(format!("bad duration {l}"))?;
     }
+    if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
+        cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
+    }
     Ok(cli)
 }
 
@@ -125,6 +131,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         scratch: None,
         capture: false,
         net_latency_ns: 0,
+        heap_size: launch::DEFAULT_HEAP,
         reseed_at: None,
         reseed: 0,
         jobs: 4,
@@ -163,6 +170,11 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 let v = take_value(&mut args)?;
                 cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
                 cli.given.push("net-latency");
+            }
+            "--heap-size" => {
+                let v = take_value(&mut args)?;
+                cli.heap_size = manifest::parse_size(&v).ok_or(format!("bad heap size {v}"))?;
+                cli.given.push("heap-size");
             }
             "--reseed-at" => {
                 let v = take_value(&mut args)?;
@@ -224,6 +236,7 @@ fn run_guest(
         args,
         dylib: dylib_for(cli)?,
         disable_aslr: cli.disable_aslr,
+        heap_size: cli.heap_size,
         stdout,
         seed: cli.opts.seed,
         quantum: cli.quantum,
@@ -366,6 +379,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         dylib: dylib_for(cli)?,
         inherit_env: false,
         disable_aslr: cli.disable_aslr,
+        heap_size: cli.heap_size,
         seed: cli.opts.seed,
         quantum: cli.quantum,
         passive: !cli.supervisor,
@@ -480,6 +494,8 @@ fn replay_of(
         format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
         "--net-latency".to_string(),
         format!("{}ns", cli.net_latency_ns),
+        "--heap-size".to_string(),
+        cli.heap_size.to_string(),
     ];
     let replay = rewrite::replay::Replay {
         manifest: path,

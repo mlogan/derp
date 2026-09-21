@@ -91,8 +91,9 @@ after the fix; those guests are now `tests/programs/edge_*.c`,
   not. The trace now records both. The first sanity check compares
   schedule hashes and caught this: masking a site where the quantum ended
   but the same thread went on still moves the run.
-- **Heap**: 1 TB, window for pooled classes, overflow checks, shuffle
-  scratch off the stack.
+- **Heap**: 32 GB by default and configurable (`heap-size`), a window for
+  pooled classes and the rest for runs, overflow checks, shuffle scratch
+  off the stack.
 - **Key destructors** run with the baton: `thread_teardown` re-arms its key
   for all but the last of libpthread's four rounds.
 - **`process_lives`**: `proc_pidinfo` fails with `ESRCH` for a zombie

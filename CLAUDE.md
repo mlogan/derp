@@ -470,7 +470,7 @@ Plan in `IMPLEMENTATION_PLAN_SUSPECTS.md`, results in `TASKS_SUSPECTS.md`.
 
 **Review of PRs #4 to #10** (branch `mlogan-review-fixes`): findings and
 what was done about each in `TASKS_REVIEW2.md`. Since then the guest heap
-is a 1 TB region, guests outlive neither the launcher nor a dead lock
+is 32 GB of address space (`heap-size` to change it), guests outlive neither the launcher nor a dead lock
 owner, the supervisor allocates from its own heap, and the trace and mask
 paths reach guests through the shared state, not their environment.
 

@@ -729,10 +729,17 @@ fn wait_out_deaths(sh: &Shared, new_quantum: bool) {
             if new_quantum {
                 install_quantum(s.pending_quantum);
             }
-            let child_died = std::mem::take(&mut s.procs[pid() as usize].child_deaths) > 0;
+            let me = &mut s.procs[pid() as usize];
+            let mut about = None;
+            if me.child_deaths > 0 && crate::signals::takes_sigchld() {
+                me.child_deaths = 0;
+                let child = me.last_dead_child;
+                let status = s.procs[child as usize].exit_status;
+                about = Some((shared::vpid_of(child), status));
+            }
             drop(s);
-            if child_died {
-                crate::signals::deliver_sigchld();
+            if let Some((child, status)) = about {
+                crate::signals::deliver_sigchld(child, status);
             }
             return;
         }

@@ -1514,3 +1514,43 @@ fn sigchld_is_delivered_at_a_point_of_the_schedule() {
         r.fields["run.schedule_hash"]
     );
 }
+
+/// Small programs from a review, each of which behaved differently under
+/// the supervisor than natively: a kqueue holding a user event next to a
+/// signal registration, a timer whose ident equals a closed descriptor, a
+/// receipt call with no event list, `recv(MSG_DONTWAIT)` on a socket pair,
+/// a `SIGCHLD` blocked around `fork`, the handler's `siginfo` and
+/// `SA_RESETHAND`, and `kill(getpid())` with the signal blocked in the
+/// caller. What they print natively is what they must print here.
+#[test]
+fn edge_cases_behave_as_they_do_natively() {
+    let dir = common::scratch_dir("edges");
+    for name in [
+        "kquser",
+        "kqtimer",
+        "kqnull",
+        "dontwait",
+        "chldblock",
+        "chldinfo",
+        "selfkill",
+    ] {
+        let program = format!("edge_{name}");
+        let exe = common::build_c(&program, &dir, &[]);
+        let native = Command::new(&exe).output().unwrap();
+        assert!(native.status.success(), "{name} natively");
+        let manifest = dir.join(format!("{name}.yaml"));
+        std::fs::write(
+            &manifest,
+            format!("hosts:\n  - name: a\n    processes:\n      - {program}\n"),
+        )
+        .unwrap();
+        for seed in 1..=3 {
+            let r = run_manifest(&manifest, &dir.join("scratch"), seed, 1);
+            assert_eq!(
+                r.stdout[0],
+                String::from_utf8_lossy(&native.stdout),
+                "{name}, seed {seed}"
+            );
+        }
+    }
+}

@@ -480,9 +480,11 @@ fn unfair_wait(op: u32, addr: *mut c_void, value: u64, real: impl Fn() -> c_int)
                 return 0;
             }
             Some(_) => {
-                unsafe { __ulock_wait2(op, addr, value, LOOK_AGAIN_NS, 0) };
+                let rc = unsafe { __ulock_wait2(op, addr, value, LOOK_AGAIN_NS, 0) };
                 if !value_matches(addr, value, wide) {
-                    return 0;
+                    // Not 0 when the kernel says others still wait: the
+                    // caller's unlock must then wake them
+                    return rc.max(0);
                 }
             }
         }

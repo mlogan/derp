@@ -25,7 +25,11 @@ static DELIVERING_TO: AtomicUsize = AtomicUsize::new(0);
 /// In the child of a `fork`: see `SpinLock::force_unlock`.
 pub fn forked() {
     GUEST.force_unlock();
+    ABOUT.force_unlock();
 }
+
+/// The child the delivery is about: virtual pid and raw wait status
+static ABOUT: SpinLock<(libc::pid_t, c_int)> = SpinLock::new((0, 0));
 
 extern "C" fn on_sigchld(sig: c_int, info: *mut libc::siginfo_t, context: *mut libc::c_void) {
     let me = unsafe { libc::pthread_self() } as usize;
@@ -34,6 +38,26 @@ extern "C" fn on_sigchld(sig: c_int, info: *mut libc::siginfo_t, context: *mut l
     }
     let Some(action) = GUEST.lock().0 else { return };
     let handler = action.sa_sigaction;
+    if action.sa_flags & libc::SA_RESETHAND != 0 {
+        // Kept from the kernel, which would have reset on a delivery of its
+        // own that we drop; ours to honour
+        GUEST.lock().0 = None;
+        unsafe { libc::signal(sig, libc::SIG_DFL) };
+    }
+    // What arrived describes our `pthread_kill`; the guest asked about a child
+    let (child, status) = *ABOUT.lock();
+    if !info.is_null() {
+        let info = unsafe { &mut *info };
+        info.si_pid = child;
+        info.si_uid = unsafe { libc::getuid() };
+        if libc::WIFEXITED(status) {
+            info.si_code = libc::CLD_EXITED;
+            info.si_status = libc::WEXITSTATUS(status);
+        } else {
+            info.si_code = libc::CLD_KILLED;
+            info.si_status = libc::WTERMSIG(status);
+        }
+    }
     unsafe {
         if action.sa_flags & libc::SA_SIGINFO != 0 {
             let f: extern "C" fn(c_int, *mut libc::siginfo_t, *mut libc::c_void) =
@@ -48,14 +72,27 @@ extern "C" fn on_sigchld(sig: c_int, info: *mut libc::siginfo_t, context: *mut l
 
 /// A child of this process died at this point of the schedule: run the
 /// guest's handler here, on the thread that holds the baton.
-pub fn deliver_sigchld() {
+/// Whether this thread would take a `SIGCHLD` now. One that has it blocked
+/// (around a `fork`, inside its handler, a worker that blocks everything)
+/// leaves the delivery to the next thread of the process to take the baton,
+/// or to itself once it unblocks.
+#[must_use]
+pub fn takes_sigchld() -> bool {
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask);
+        libc::sigismember(&raw const mask, libc::SIGCHLD) == 0
+    }
+}
+
+pub fn deliver_sigchld(child: libc::pid_t, status: c_int) {
     if GUEST.lock().0.is_none() {
         return;
     }
+    *ABOUT.lock() = (child, status);
     let me = unsafe { libc::pthread_self() };
     DELIVERING_TO.store(me as usize, Ordering::Relaxed);
-    // Synchronous for a signal a thread sends itself, unless it blocks it;
-    // then it stays pending on this thread and is dropped when it comes
+    // Synchronous: the caller checked that this thread takes the signal
     unsafe { libc::pthread_kill(me, libc::SIGCHLD) };
     DELIVERING_TO.store(0, Ordering::Relaxed);
 }
@@ -95,6 +132,7 @@ pub unsafe extern "C" fn my_sigaction(
     let mut ours = *new;
     ours.sa_sigaction = on_sigchld as *const () as usize;
     ours.sa_flags |= libc::SA_SIGINFO;
+    ours.sa_flags &= !libc::SA_RESETHAND;
     let rc = libc::sigaction(sig, &raw const ours, std::ptr::null_mut());
     if rc == 0 {
         kept.0 = Some(*new);

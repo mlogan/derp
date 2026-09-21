@@ -575,7 +575,11 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
         // To this thread, not to whichever thread the kernel would pick at
         // whatever moment: the handler then runs here and now, with the
         // baton, as a point of the schedule.
-        if sig != 0 && sched::on_scheduled_thread() {
+        let mut mask: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask);
+        // Blocked here, the kernel must find a thread that takes it
+        let taken_here = sig != 0 && libc::sigismember(&raw const mask, sig) == 0;
+        if taken_here && sched::on_scheduled_thread() {
             let rc = libc::pthread_kill(libc::pthread_self(), sig);
             return if rc == 0 { 0 } else { crate::errno::fail(rc) };
         }

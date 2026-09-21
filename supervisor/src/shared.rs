@@ -90,6 +90,39 @@ pub struct Faults {
     pub crashes_left: u32,
 }
 
+pub const DEBUG_PATH_LEN: usize = 1024;
+
+/// What the cache puts between a program's file name and the key of its
+/// rewritten copy
+pub const CACHE_TAG: &str = ".rw3-";
+
+/// Store `path` in one of the state's path fields; too long is not stored.
+pub fn set_debug_path(field: &mut [u8; DEBUG_PATH_LEN], path: &str) {
+    if path.len() < DEBUG_PATH_LEN {
+        field[..path.len()].copy_from_slice(path.as_bytes());
+        field[path.len()] = 0;
+    }
+}
+
+#[must_use]
+pub fn debug_path(field: &[u8; DEBUG_PATH_LEN]) -> Option<String> {
+    let len = field.iter().position(|&b| b == 0)?;
+    (len > 0).then(|| String::from_utf8_lossy(&field[..len]).into_owned())
+}
+
+/// False for a process that does not exist, and for a zombie, whoever's
+/// child it is: a zombie still answers `kill`, but runs no more code.
+/// `proc_pidinfo` fails with `ESRCH` for both.
+#[must_use]
+pub fn process_lives(pid: libc::pid_t) -> bool {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let got =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    // Someone else's process is not ours to inspect, but it exists
+    got == size || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 /// Raw wait status of a process that died of `SIGKILL`
 const KILLED_STATUS: i32 = 9;
 
@@ -192,6 +225,9 @@ pub struct ProcRec {
     /// Children that died since a thread of this process last took up the
     /// baton: its `SIGCHLD` is due
     pub child_deaths: u32,
+    /// The child whose death is the latest of them, for the handler's
+    /// `siginfo`
+    pub last_dead_child: u32,
     /// Bumped by every wake that comes from a thread the scheduler does not
     /// run. Such a wake is not serialized by the baton, so it can land
     /// between a thread's "would I block?" check and its blocking; a thread
@@ -244,12 +280,17 @@ pub struct State {
     /// Crash times come from their own stream, so that adding faults to a
     /// run does not shift the choice of threads
     fault_rng: Rng,
-    /// Seed bisection: at the first hand-off at or after this virtual time
-    /// (0: never) the scheduler's streams start over from `reseed_with`.
-    /// Until then the run is the plain run of its seed.
+    /// Seed bisection: one more than the virtual time (0: never) from whose
+    /// first hand-off on every stream starts over from `reseed_with`. Until
+    /// then the run is the plain run of its seed.
     pub reseed_at: u64,
     pub reseed_with: u64,
     pub reseeded: bool,
+    /// The launcher's `REWRITE_TRACE` and `REWRITE_MASK`, NUL-terminated.
+    /// Here and not in the guests' environment: its size places a guest's
+    /// stack, and a run must not move because it is being looked at.
+    pub trace_path: [u8; DEBUG_PATH_LEN],
+    pub mask_path: [u8; DEBUG_PATH_LEN],
     pub crashes_injected: u64,
     pub restarts: u64,
     /// Restarts that were due but found the process or thread table full;
@@ -392,20 +433,14 @@ impl Shared {
         if launcher == 0 || launcher == unsafe { libc::getpid() } {
             return;
         }
-        // EPERM would still mean it exists
-        let gone = unsafe { libc::kill(launcher, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
+        if !process_lives(launcher) {
             unsafe { libc::_exit(ORPHANED_EXIT) };
         }
     }
 
-    /// The lock word holds its owner's real pid. A process can be killed
-    /// with the lock held (the launcher kills what is left at the end of a
-    /// run; a crash is a `SIGKILL`), and a lock nobody can release would
-    /// wedge everyone, the launcher included. A waiter that finds the owner
-    /// gone takes the lock over. The state may be mid-update then; the
-    /// alternative is a run that never ends.
+    /// The word holds the owner's real pid: a process killed with the lock
+    /// held (end of run, a crash) would wedge everyone, so a waiter takes it
+    /// over from a dead owner, state mid-update or not.
     pub fn lock(&self) -> Guard<'_> {
         let me = unsafe { libc::getpid() } as u32;
         let mut spins = 0u32;
@@ -433,18 +468,7 @@ impl Shared {
         if owner == 0 || owner == me {
             return false;
         }
-        let pid = owner as libc::pid_t;
-        let no_such = unsafe { libc::kill(pid, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        // A zombie still answers `kill`. If it is our child (the launcher's
-        // guests are), look without reaping: whoever reaps it still can.
-        let dead_child = !no_such
-            && unsafe {
-                let mut info: libc::siginfo_t = std::mem::zeroed();
-                let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
-                libc::waitid(libc::P_PID, owner, &raw mut info, flags) == 0 && info.si_pid == pid
-            };
-        let gone = no_such || dead_child;
+        let gone = !process_lives(owner as libc::pid_t);
         gone && self
             .lock
             .compare_exchange(owner, me, Ordering::Acquire, Ordering::Relaxed)
@@ -467,7 +491,6 @@ impl Shared {
         unsafe { __ulock_wake(PARK_OP, self.park_word(id), 0) };
     }
 
-    /// Sleep until thread `id`'s park word differs from `seen`.
     /// The replacement seed once the run's reseed time has passed (seed
     /// bisection). Read without the lock: it is set at a hand-off, and those
     /// who ask are scheduled threads, which run one at a time after it.
@@ -481,6 +504,7 @@ impl Shared {
         unsafe { (*state).threads[id].in_park.load(Ordering::Acquire) != 0 }
     }
 
+    /// Sleep until thread `id`'s park word differs from `seen`.
     pub fn park(&self, id: usize, seen: u32) {
         let state = self.state.get();
         let in_park = unsafe { &(*state).threads[id].in_park };
@@ -569,6 +593,7 @@ impl State {
         self.wake_io();
         if parent != NO_PROC {
             self.procs[parent as usize].child_deaths += 1;
+            self.procs[parent as usize].last_dead_child = victim;
             self.wake_all(parent, WAIT_KEY);
         }
         self.register_restart(victim, KILLED_STATUS);
@@ -837,7 +862,7 @@ impl State {
     /// Deadlines that have passed are handled before the choice; when
     /// nothing is runnable the clock jumps to the earliest deadline.
     fn pick(&mut self) -> Option<usize> {
-        if self.reseed_at != 0 && !self.reseeded && self.clock_ns >= self.reseed_at {
+        if self.reseed_at != 0 && !self.reseeded && self.clock_ns + 1 >= self.reseed_at {
             self.reseeded = true;
             self.rng = Rng::seed_from_u64(self.reseed_with);
             self.fault_rng = Rng::seed_from_u64(self.reseed_with ^ 0xFA17_FA17_FA17_FA17);
@@ -935,6 +960,7 @@ impl State {
             let parent = self.procs[pid as usize].parent;
             if parent != NO_PROC {
                 self.procs[parent as usize].child_deaths += 1;
+                self.procs[parent as usize].last_dead_child = pid;
                 self.wake_all(parent, WAIT_KEY);
             }
         }

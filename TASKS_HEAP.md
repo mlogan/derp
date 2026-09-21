@@ -8,7 +8,13 @@ Plan: `IMPLEMENTATION_PLAN_HEAP.md`. Branch `mlogan-seeded-heap`.
   with the run's seed and the process index (`seed_layout`, called before
   the process's first scheduled thread exists). The supervisor's own heap
   keeps the compact layout.
-  - The 4 GB region is 65,536 slabs of 64 KB with a bitmap.
+  - The region is 32 GB of address space at `0x2000_0000_0000` by default
+    and the run's to set: `heap-size:` in the run file, `--heap-size` on
+    the command line (64 MB to 4 TB). It was a fixed 4 GB, where scattered
+    slabs soon left no room for a 32 MB block (`TASKS_REVIEW2.md`). 64 KB
+    slabs, bitmap mapped on the side. Pooled classes take slabs from a
+    window at one end chosen by the seed (a quarter of the region, at most
+    64 GB); runs take the rest.
   - Classes up to 64 KB: a pool of up to 32 candidates per class.
     `malloc` takes the newest candidate half the time (after a `free`,
     the block just freed) and a random one otherwise; `free` adds to the

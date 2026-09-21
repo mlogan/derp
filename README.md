@@ -35,8 +35,9 @@ Options worth knowing:
 ## The run file
 
 ```yaml
-seed: 7                  # optional; the command line overrides these four
+seed: 7                  # optional; the command line overrides these five
 quantum: 1000..10000
+heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
 env: { LOG_LEVEL: debug }   # for every process (guests start from a fixed environment)
@@ -169,6 +170,10 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
 - `SIGCHLD` handlers run at a point of the schedule (the parent's next
   thread to run after the death), not when the kernel sends the signal. A
   signal a guest sends itself is delivered to the calling thread.
+- A guest's heap is 32 GB of address space, of which only touched pages
+  cost memory. `heap-size: 128G` in the run file or `--heap-size` changes
+  it (64 MB to 4 TB). A seeded layout scatters blocks, so leave it roomy:
+  a quarter holds the small size classes and the rest the large blocks.
 - Heap addresses are a function of the seed, and differ between seeds:
   how two blocks compare, and whether `free` then `malloc` returns the
   same block, goes both ways across seeds. A bug that depends on pointer

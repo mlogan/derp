@@ -7,13 +7,15 @@
 //! set that is enough to reproduce the failure and from which no single
 //! site can be dropped. Those are the suspects.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Instant;
 
+use crate::replay::{fan_out, timeout_after, trace_lines, Ending, Replay};
 use crate::rewrite::{Site, SiteKind};
 
-/// A program of the run file
+/// A distinct program of the run file
 pub struct Program {
     /// File name, which is what a mask line and the supervisor go by
     pub name: String,
@@ -23,17 +25,15 @@ pub struct Program {
 }
 
 pub struct Config {
-    pub manifest: PathBuf,
-    pub scratch: PathBuf,
+    pub replay: Replay,
     pub seed: u64,
     pub jobs: u32,
-    /// Options every run gets
-    pub pass: Vec<String>,
-    /// By run-file entry
     pub programs: Vec<Program>,
+    /// Which of `programs` each run-file entry runs
+    pub program_of_entry: Vec<usize>,
 }
 
-/// A load or store of a program: (index in `Config::programs`, yield pc)
+/// A hook site of a program: (index in `Config::programs`, yield pc)
 type Key = (usize, u64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +47,6 @@ pub struct Suspect {
 
 #[derive(Debug)]
 pub struct Found {
-    pub failure: String,
     pub candidates: usize,
     pub runs: u32,
     pub suspects: Vec<Suspect>,
@@ -55,42 +54,10 @@ pub struct Found {
 
 struct Runner<'a> {
     cfg: &'a Config,
-    failure: String,
+    reference: Ending,
     /// The sites being decided on: all of them are masked but the allowed
     universe: BTreeSet<Key>,
     runs: std::sync::atomic::AtomicU32,
-}
-
-struct RunResult {
-    failure: Option<String>,
-    stderr: String,
-}
-
-/// One run in which a switch may happen at the loads and stores in `allowed`
-/// only (None: anywhere). The mask variable is always set, and its value is
-/// as long for every job: the environment's size places the guest's stack.
-fn run(cfg: &Config, job: u32, mask: &str, trace: Option<&Path>) -> RunResult {
-    let dir = cfg.scratch.join("suspects");
-    let mask_path = dir.join(format!("mask.{job:02}"));
-    std::fs::write(&mask_path, mask).expect("writing the mask");
-    let mut cmd = Command::new(std::env::current_exe().expect("own path"));
-    cmd.args(["run", "--capture", "--seed", &cfg.seed.to_string()])
-        .args(&cfg.pass)
-        .arg("--scratch")
-        .arg(dir.join(format!("job{job:02}")))
-        .arg("--manifest")
-        .arg(&cfg.manifest)
-        .env("REWRITE_MASK", &mask_path);
-    match trace {
-        Some(path) => cmd.env("REWRITE_TRACE", path),
-        None => cmd.env_remove("REWRITE_TRACE"),
-    };
-    let out = cmd.output().expect("running rewrite");
-    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    RunResult {
-        failure: crate::bisect::ending(&stderr).failure,
-        stderr,
-    }
 }
 
 impl Runner<'_> {
@@ -103,34 +70,42 @@ impl Runner<'_> {
         text
     }
 
-    /// Whether each of `sets`, allowed alone, still fails the same way.
-    fn test(&self, sets: &[Vec<Key>]) -> Vec<bool> {
-        let jobs = self.cfg.jobs.max(1) as usize;
-        let mut out = vec![false; sets.len()];
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..jobs)
-                .map(|job| {
-                    scope.spawn(move || {
-                        (job..sets.len())
-                            .step_by(jobs)
-                            .map(|i| {
-                                let r =
-                                    run(self.cfg, job as u32 + 1, &self.mask_for(&sets[i]), None);
-                                (i, r.failure.as_deref() == Some(&self.failure))
-                            })
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            for w in workers {
-                for (i, fails) in w.join().expect("test run") {
-                    out[i] = fails;
-                }
-            }
-        });
+    /// How the run ends when a switch may happen at each of `sets` alone.
+    fn endings(&self, sets: &[Vec<Key>]) -> Vec<Ending> {
         self.runs
             .fetch_add(sets.len() as u32, std::sync::atomic::Ordering::Relaxed);
-        out
+        fan_out(self.cfg.jobs, sets.len(), |slot, i| {
+            self.cfg.replay.run(slot, &[], &self.mask_for(&sets[i]))
+        })
+    }
+
+    fn test(&self, sets: &[Vec<Key>]) -> Vec<bool> {
+        self.endings(sets)
+            .iter()
+            .map(|e| e.fails_like(&self.reference))
+            .collect()
+    }
+
+    /// The two runs that must come out as expected before anything is
+    /// concluded: allowed exactly where it switched, the run is the traced
+    /// run, hash and all; allowed nowhere, it is some other run, or the mask
+    /// reached nobody. Returns whether it still fails with none allowed.
+    fn check(&self, traced: &Ending, candidates: &[Key]) -> Result<bool, String> {
+        let e = self.endings(&[candidates.to_vec(), Vec::new()]);
+        if e[0].schedule_hash != traced.schedule_hash {
+            return Err("masking sites the run never switched at changed the run: \
+                        is something outside the schedule at work?"
+                .into());
+        }
+        if !candidates.is_empty() && e[1].schedule_hash == traced.schedule_hash {
+            return Err(
+                "masking every site a quantum ended at changed nothing: the mask did \
+                        not reach the guests, or the run spins in a loop of masked sites \
+                        (the supervisor then says so)"
+                    .into(),
+            );
+        }
+        Ok(e[1].fails_like(&self.reference))
     }
 }
 
@@ -197,20 +172,19 @@ fn symbolize(binary: &Path, addrs: &[u64]) -> Vec<String> {
 
 /// The sites of `among` at which a traced run switched, in order of first
 /// appearance. A process is its run-file entry's program.
-fn switched_at(report: &str, trace: &Path, among: &BTreeSet<Key>) -> Vec<Key> {
-    let entry_of: BTreeMap<String, usize> = report
-        .lines()
-        .filter_map(|l| l.split_once(".entry="))
-        .filter_map(|(p, e)| Some((p.to_string(), e.parse().ok()?)))
-        .collect();
+fn switched_at(cfg: &Config, ending: &Ending, trace: &Path, among: &BTreeSet<Key>) -> Vec<Key> {
     let mut out: Vec<Key> = Vec::new();
-    for line in std::fs::read_to_string(trace).unwrap_or_default().lines() {
+    for (_, line) in trace_lines(trace) {
         let process = line.split(' ').next().unwrap_or_default();
         let site = line
             .split(' ')
             .find_map(|w| w.strip_prefix("site=0x"))
             .and_then(|v| u64::from_str_radix(v, 16).ok());
-        if let (Some(&p), Some(pc)) = (entry_of.get(process), site) {
+        let program = ending
+            .entry_of
+            .get(process)
+            .and_then(|&entry| cfg.program_of_entry.get(entry));
+        if let (Some(&p), Some(pc)) = (program, site) {
             if among.contains(&(p, pc)) && !out.contains(&(p, pc)) {
                 out.push((p, pc));
             }
@@ -220,19 +194,20 @@ fn switched_at(report: &str, trace: &Path, among: &BTreeSet<Key>) -> Vec<Key> {
 }
 
 /// # Errors
-/// When the seed does not fail, or something cannot be run.
-pub fn suspects(cfg: &Config, mut progress: impl FnMut(&str)) -> Result<Found, String> {
-    let dir = cfg.scratch.join("suspects");
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let trace_path = dir.join("reference.trace");
-    let _ = std::fs::remove_file(&trace_path);
-    let reference = run(cfg, 0, "", Some(&trace_path));
-    let Some(failure) = reference.failure else {
+/// When the seed does not fail, or a sanity check of the masking does.
+pub fn suspects(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Found, String> {
+    std::fs::create_dir_all(&cfg.replay.dir).map_err(|e| e.to_string())?;
+    let began = Instant::now();
+    let reference = cfg.replay.run(0, &[], "");
+    cfg.replay.timeout = timeout_after(began.elapsed());
+    let cfg = &*cfg;
+    let Some((entry, status)) = reference.failure.clone() else {
         return Err(format!(
             "seed {} does not fail: nothing to minimise",
             cfg.seed
         ));
     };
+    let trace = cfg.replay.trace_path(0);
 
     let of_kind = |memory: bool| -> BTreeSet<Key> {
         cfg.programs
@@ -246,10 +221,10 @@ pub fn suspects(cfg: &Config, mut progress: impl FnMut(&str)) -> Result<Found, S
             })
             .collect()
     };
-    let memory_sites = of_kind(true);
-    let candidates = switched_at(&reference.stderr, &trace_path, &memory_sites);
+    let (memory_sites, other_sites) = (of_kind(true), of_kind(false));
+    let candidates = switched_at(cfg, &reference, &trace, &memory_sites);
     progress(&format!(
-        "reference: seed {} fails ({failure}); it switched at {} of {} hooked loads and stores",
+        "reference: seed {} fails (entry {entry}: {status}); a quantum ended at {} of {} hooked loads and stores",
         cfg.seed,
         candidates.len(),
         memory_sites.len()
@@ -257,42 +232,23 @@ pub fn suspects(cfg: &Config, mut progress: impl FnMut(&str)) -> Result<Found, S
 
     let mut runner = Runner {
         cfg,
-        failure: failure.clone(),
+        reference: reference.clone(),
         universe: memory_sites.clone(),
         runs: 1.into(),
     };
-    let checks = runner.test(&[candidates.clone(), Vec::new()]);
-    if !checks[0] {
-        return Err(
-            "masking the loads and stores the run never switched at changed it: \
-                    is something outside the schedule at work?"
-                .into(),
-        );
-    }
-    let (considered, minimal) = if checks[1] {
+    let (considered, minimal) = if runner.check(&reference, &candidates)? {
         // The same question of the branches and calls, in the run that has
         // no switch at a load or store
         progress("it fails without a switch at any load or store; trying branches and calls");
-        let all: BTreeSet<Key> = memory_sites.union(&of_kind(false)).copied().collect();
-        runner.universe = all;
-        // The trace file is appended to
-        let _ = std::fs::remove_file(&trace_path);
-        let traced = run(
-            cfg,
-            0,
-            &runner.mask_for(&of_kind(false).into_iter().collect::<Vec<_>>()),
-            Some(&trace_path),
-        );
-        let candidates = switched_at(&traced.stderr, &trace_path, &of_kind(false));
+        runner.universe = memory_sites.union(&other_sites).copied().collect();
+        let all_others: Vec<Key> = other_sites.iter().copied().collect();
+        let traced = cfg.replay.run(0, &[], &runner.mask_for(&all_others));
+        let candidates = switched_at(cfg, &traced, &trace, &other_sites);
         progress(&format!(
-            "that run switched at {} hooked branches and calls",
+            "in that run a quantum ended at {} hooked branches and calls",
             candidates.len()
         ));
-        let checks = runner.test(&[candidates.clone(), Vec::new()]);
-        if !checks[0] {
-            return Err("masking unused branch and call sites changed the run".into());
-        }
-        if checks[1] {
+        if runner.check(&traced, &candidates)? {
             progress(
                 "it fails with no switch at any hooked instruction: blocking calls are enough",
             );
@@ -321,9 +277,7 @@ pub fn suspects(cfg: &Config, mut progress: impl FnMut(&str)) -> Result<Found, S
             });
         }
     }
-    suspects.dedup();
     Ok(Found {
-        failure,
         candidates: considered,
         runs: runner.runs.load(std::sync::atomic::Ordering::Relaxed),
         suspects,

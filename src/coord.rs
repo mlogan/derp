@@ -94,14 +94,25 @@ impl Coordinator {
         &self.path
     }
 
-    /// Delay for traffic between different hosts, in virtual time.
     /// Seed bisection: the streams start over from `with` at time `at`.
     pub fn set_reseed(&self, at: u64, with: u64) {
         let mut s = self.shared.lock();
-        s.reseed_at = at.max(1);
+        s.reseed_at = at.saturating_add(1);
         s.reseed_with = with;
     }
 
+    /// Hand our `REWRITE_TRACE` and `REWRITE_MASK` to the guests.
+    pub fn set_debug_paths(&self) {
+        let mut s = self.shared.lock();
+        if let Ok(path) = std::env::var("REWRITE_TRACE") {
+            shared::set_debug_path(&mut s.trace_path, &path);
+        }
+        if let Ok(path) = std::env::var("REWRITE_MASK") {
+            shared::set_debug_path(&mut s.mask_path, &path);
+        }
+    }
+
+    /// Delay for traffic between different hosts, in virtual time.
     pub fn set_net_latency(&self, ns: u64) {
         self.shared.lock().net.latency_ns = ns;
     }
@@ -169,6 +180,16 @@ impl Coordinator {
         let handoff = self.shared.lock().hand_off(None, 0);
         if let Handoff::Switch { to, .. } = handoff {
             self.shared.unpark(to);
+        }
+    }
+
+    /// The run ends with this death: note when, without passing the baton.
+    pub fn note_last_death(&self, pid: u32) {
+        let mut s = self.shared.lock();
+        let now = s.clock_ns.max(1);
+        let p = &mut s.procs[pid as usize];
+        if p.died_at == 0 {
+            p.died_at = now;
         }
     }
 

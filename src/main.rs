@@ -17,7 +17,7 @@ usage:
   rewrite bench [opts] <prog> [args…]  time native vs rewritten (no supervisor)
   rewrite repeat [opts] <prog> [args…] run N times; exit status, stdout and schedule hash must agree
   rewrite bisect [opts] --manifest FILE  when was the failing seed's failure decided? Replays it
-                                       with the scheduler reseeded at a virtual time, --runs
+                                       with every stream reseeded at a virtual time, --runs
                                        futures per probe (default 20), --jobs at a time (4),
                                        down to --resolution (2ms)
   rewrite suspects [opts] --manifest FILE  which loads and stores does the failing seed need?
@@ -30,8 +30,13 @@ options:
   --seed S                             run seed (default 0)
   --mem-hook-rate R                    0, 1 or a fraction like 1/16 (default 0)
   --quantum LO..HI                     hook events per quantum (default 1000..10000)
-  --reseed-at T --reseed N             from virtual time T on, the scheduler's random streams
-                                       start over from N (what bisect does at each probe)
+  --reseed-at T --reseed N             from virtual time T on, every random stream (schedule,
+                                       faults, heap layout, entropy) starts over from N: what
+                                       bisect does at each probe
+  --heap-size N                        address space of each guest's heap: 32G (default), 512M,
+                                       4T. Only touched pages cost memory
+  --jobs J                             bisect, suspects: runs at a time (default 4)
+  --resolution T                       bisect: stop at an interval this short (default 2ms)
   --no-supervisor                      no scheduling: the dylib only provides the stubs' counter
   --aslr                               leave ASLR on
   --native                             run the original binary without the dylib
@@ -76,6 +81,7 @@ struct Cli {
     scratch: Option<PathBuf>,
     capture: bool,
     net_latency_ns: u64,
+    heap_size: u64,
     reseed_at: Option<u64>,
     reseed: u64,
     jobs: u32,
@@ -109,6 +115,9 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(l), true) = (&m.net_latency, from_file("net-latency")) {
         cli.net_latency_ns = parse_duration_ns(l).ok_or(format!("bad duration {l}"))?;
     }
+    if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
+        cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
+    }
     Ok(cli)
 }
 
@@ -122,6 +131,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         scratch: None,
         capture: false,
         net_latency_ns: 0,
+        heap_size: launch::DEFAULT_HEAP,
         reseed_at: None,
         reseed: 0,
         jobs: 4,
@@ -161,6 +171,11 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
                 cli.given.push("net-latency");
             }
+            "--heap-size" => {
+                let v = take_value(&mut args)?;
+                cli.heap_size = manifest::parse_size(&v).ok_or(format!("bad heap size {v}"))?;
+                cli.given.push("heap-size");
+            }
             "--reseed-at" => {
                 let v = take_value(&mut args)?;
                 cli.reseed_at = Some(parse_duration_ns(&v).ok_or(format!("bad time {v}"))?);
@@ -178,6 +193,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 cli.reseed = take_value(&mut args)?
                     .parse()
                     .map_err(|_| "bad reseed value")?;
+                cli.given.push("reseed");
             }
             "--no-supervisor" => cli.supervisor = false,
             "--aslr" => cli.disable_aslr = false,
@@ -192,6 +208,9 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         args.remove(0);
     }
     cli.rest = args;
+    if cli.given.contains(&"reseed") && cli.reseed_at.is_none() {
+        return Err("--reseed needs --reseed-at: from when?".into());
+    }
     Ok(cli)
 }
 
@@ -221,6 +240,7 @@ fn run_guest(
         args,
         dylib: dylib_for(cli)?,
         disable_aslr: cli.disable_aslr,
+        heap_size: cli.heap_size,
         stdout,
         seed: cli.opts.seed,
         quantum: cli.quantum,
@@ -363,6 +383,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         dylib: dylib_for(cli)?,
         inherit_env: false,
         disable_aslr: cli.disable_aslr,
+        heap_size: cli.heap_size,
         seed: cli.opts.seed,
         quantum: cli.quantum,
         passive: !cli.supervisor,
@@ -459,46 +480,89 @@ fn failed_life(o: &RunOutcome) -> Option<(usize, usize)> {
         .find(|&(_, life)| o.guests[life].exit_code() != Some(0))
 }
 
-/// `rewrite suspects`: the loads and stores a failing seed needs.
-fn suspects(cli: &Cli) -> Fallible<()> {
+/// The run a tool replays: the command line laid over the run file's own
+/// settings, spelled out in full so that every replay is that run.
+fn replay_of(
+    cli: &Cli,
+    tool: &str,
+) -> Fallible<(Cli, manifest::Manifest, rewrite::replay::Replay)> {
+    if cli.native || !cli.supervisor || !cli.disable_aslr {
+        return Err(format!(
+            "{tool} replays supervised runs: --native, --no-supervisor and --aslr do not apply"
+        )
+        .into());
+    }
     let path = cli.manifest.clone().unwrap();
     let m = manifest::parse(&std::fs::read_to_string(&path)?)?;
-    let cli = &with_run_file_settings(cli, &m)?;
+    let cli = with_run_file_settings(cli, &m)?;
+    let pass = vec![
+        "--seed".to_string(),
+        cli.opts.seed.to_string(),
+        "--quantum".to_string(),
+        format!("{}..{}", cli.quantum.0, cli.quantum.1),
+        "--mem-hook-rate".to_string(),
+        format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
+        "--net-latency".to_string(),
+        format!("{}ns", cli.net_latency_ns),
+        "--heap-size".to_string(),
+        cli.heap_size.to_string(),
+    ];
+    let replay = rewrite::replay::Replay {
+        manifest: path,
+        dir: scratch_dir(&cli).join(tool),
+        pass,
+        // Until the reference run has shown how long a run takes
+        timeout: std::time::Duration::from_mins(10),
+    };
+    Ok((cli, m, replay))
+}
+
+/// `rewrite suspects`: the loads and stores a failing seed needs.
+fn suspects(cli: &Cli) -> Fallible<()> {
+    let (cli, m, replay) = replay_of(cli, "suspects")?;
     if cli.opts.mem_rate.0 == 0 {
         return Err("no loads or stores are hooked: give --mem-hook-rate".into());
     }
-    let base = path.parent().unwrap_or(Path::new("."));
-    let mut programs = Vec::new();
+    let base = replay
+        .manifest
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let mut programs: Vec<rewrite::suspects::Program> = Vec::new();
+    let mut program_of_entry = Vec::new();
     for p in &m.processes {
         let original = std::fs::canonicalize(base.join(&p.argv[0]))
             .map_err(|e| format!("{}: {e}", p.argv[0]))?;
+        let known = programs.iter().position(|q| q.original == original);
+        program_of_entry.push(known.unwrap_or(programs.len()));
+        if known.is_some() {
+            continue;
+        }
+        let name = original
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if programs.iter().any(|q| q.name == name) {
+            return Err(format!("two programs are called {name}: a mask goes by file name").into());
+        }
         let rewritten = cached_rewrite(&original, &cli.opts)?;
         let table = std::fs::read_to_string(rewrite::cache::sites_path(&rewritten))
             .map_err(|e| format!("{}: no site table ({e})", rewritten.display()))?;
         programs.push(rewrite::suspects::Program {
-            name: original
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+            name,
             original,
             sites: rw::sites_from_text(&table),
         });
     }
-    let cfg = rewrite::suspects::Config {
-        manifest: path,
-        scratch: scratch_dir(cli),
+    let mut cfg = rewrite::suspects::Config {
+        replay,
         seed: cli.opts.seed,
         jobs: cli.jobs,
-        pass: vec![
-            "--quantum".to_string(),
-            format!("{}..{}", cli.quantum.0, cli.quantum.1),
-            "--mem-hook-rate".to_string(),
-            format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
-        ],
         programs,
+        program_of_entry,
     };
-    let found = rewrite::suspects::suspects(&cfg, |line| println!("{line}"))?;
+    let found = rewrite::suspects::suspects(&mut cfg, |line| println!("{line}"))?;
     println!(
         "{} of {} sites are needed ({} runs):",
         found.suspects.len(),
@@ -506,43 +570,17 @@ fn suspects(cli: &Cli) -> Fallible<()> {
         found.runs
     );
     for s in &found.suspects {
-        println!(
-            "  {} {:#x} {:<5} {}",
-            s.program,
-            s.addr,
-            s.kind.name(),
-            s.location
-        );
-    }
-    for s in &found.suspects {
-        println!(
-            "suspect={} {:#x} {} {}",
-            s.program,
-            s.addr,
-            s.kind.name(),
-            s.location
-        );
+        let (program, kind) = (&s.program, s.kind.name());
+        println!("suspect={program} {:#x} {kind} {}", s.addr, s.location);
     }
     Ok(())
 }
 
 /// `rewrite bisect`: find when the failing seed's failure was decided.
 fn bisect(cli: &Cli) -> Fallible<()> {
-    let mut pass = vec![
-        "--quantum".to_string(),
-        format!("{}..{}", cli.quantum.0, cli.quantum.1),
-        "--mem-hook-rate".to_string(),
-        format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
-    ];
-    if cli.given.contains(&"net-latency") {
-        pass.extend([
-            "--net-latency".to_string(),
-            format!("{}ns", cli.net_latency_ns),
-        ]);
-    }
-    let cfg = rewrite::bisect::Config {
-        manifest: cli.manifest.clone().unwrap(),
-        scratch: scratch_dir(cli),
+    let (cli, _, replay) = replay_of(cli, "bisect")?;
+    let mut cfg = rewrite::bisect::Config {
+        replay,
         seed: cli.opts.seed,
         // `--runs` defaults to what `repeat` wants
         runs: if cli.given.contains(&"runs") {
@@ -552,9 +590,8 @@ fn bisect(cli: &Cli) -> Fallible<()> {
         },
         jobs: cli.jobs,
         resolution_ns: cli.resolution_ns,
-        pass,
     };
-    let found = rewrite::bisect::bisect(&cfg, |line| println!("{line}"))?;
+    let found = rewrite::bisect::bisect(&mut cfg, |line| println!("{line}"))?;
     if !found.trace.is_empty() {
         println!("switches of the failing run in that interval:");
         for line in found.trace.iter().take(60) {
@@ -562,7 +599,7 @@ fn bisect(cli: &Cli) -> Fallible<()> {
         }
     }
     println!("bisect.failure_at_ns={}", found.reference.failure_at);
-    println!("bisect.base={}/{}", found.base.failed, found.base.runs);
+    println!("bisect.base={}/{}", found.base.failed, cfg.runs);
     println!("bisect.probes={}", found.probes.len());
     println!("bisect.lo_ns={}", found.lo_ns);
     println!("bisect.hi_ns={}", found.hi_ns);
@@ -687,7 +724,24 @@ fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
     result
 }
 
+/// Set by `bisect` and `suspects` on the runs they start: a run whose tool
+/// has gone is of no use, and its guests follow it out (`exit_if_orphaned`).
+const EXIT_WITH_PARENT: &str = "REWRITE_EXIT_WITH_PARENT";
+
 fn main() -> ExitCode {
+    if std::env::var_os(EXIT_WITH_PARENT).is_some() {
+        let parent = unsafe { libc::getppid() };
+        // Already adopted by launchd: the tool died before we got here
+        if parent == 1 {
+            unsafe { libc::_exit(1) };
+        }
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if unsafe { libc::getppid() } != parent {
+                unsafe { libc::_exit(1) };
+            }
+        });
+    }
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.is_empty() {
         return fail(USAGE);

@@ -458,14 +458,21 @@ replayed. Plan in `IMPLEMENTATION_PLAN_HEAP.md`, progress in
 `TASKS_HEAP.md`.
 
 **Seed bisection** (branch `mlogan-seed-bisect`, complete): `rewrite
-bisect` replays a failing seed with the scheduler reseeded at a virtual
-time and binary-searches for when the failure was decided. Plan in
+bisect` replays a failing seed with every random stream (schedule, faults,
+heap layout, entropy) reseeded at a virtual time and binary-searches for
+when the failure was decided. Plan in
 `IMPLEMENTATION_PLAN_BISECT.md`, results and limits in `TASKS_BISECT.md`.
 
 **Site minimisation** (branch `mlogan-site-bisect`, complete): `rewrite
 suspects` masks switch points at hooked loads and stores (then branches
 and calls) until no site can be dropped, and names their source lines.
 Plan in `IMPLEMENTATION_PLAN_SUSPECTS.md`, results in `TASKS_SUSPECTS.md`.
+
+**Review of PRs #4 to #10** (branch `mlogan-review-fixes`): findings and
+what was done about each in `TASKS_REVIEW2.md`. Since then the guest heap
+is 32 GB of address space (`heap-size` to change it), guests outlive neither the launcher nor a dead lock
+owner, the supervisor allocates from its own heap, and the trace and mask
+paths reach guests through the shared state, not their environment.
 
 **Next Phase**: Not yet planned
 

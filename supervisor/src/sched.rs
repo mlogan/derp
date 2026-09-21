@@ -14,6 +14,8 @@ use crate::stubdata::Info;
 
 pub struct Config {
     pub seed: u64,
+    /// Bytes of address space for the guest's heap
+    pub heap_size: usize,
     pub quantum_lo: u32,
     pub quantum_hi: u32,
 }
@@ -34,8 +36,13 @@ impl Config {
                 }
             }
         }
+        let heap_size = std::env::var("REWRITE_HEAP")
+            .ok()
+            .and_then(|v| usize::from_str_radix(&v, 16).ok())
+            .unwrap_or(crate::alloc::DEFAULT_SIZE);
         Config {
             seed,
+            heap_size,
             quantum_lo: lo,
             quantum_hi: hi,
         }
@@ -87,7 +94,19 @@ pub fn my_id() -> Option<usize> {
         return None;
     }
     let v = unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) } as usize;
-    (v != 0).then(|| v - 1)
+    (v != 0).then(|| (v & ID_MASK) - 1)
+}
+
+/// The key's value is the id plus one; above it, how many rounds of key
+/// destructors the exiting thread has been through (`thread_teardown`).
+pub const ID_MASK: usize = 0xFFFF_FFFF;
+pub const ROUND_SHIFT: u32 = 32;
+
+/// Keep this thread's identity for another round of key destructors.
+pub fn rearm_identity(id: usize, round: usize) {
+    let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
+    let value = (id + 1) | (round << ROUND_SHIFT);
+    unsafe { libc::pthread_setspecific(key, value as *const c_void) };
 }
 
 /// `my_id().is_some()` for the allocator, which must not touch a Rust
@@ -97,9 +116,23 @@ pub fn on_scheduled_thread() -> bool {
     key != usize::MAX && !unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) }.is_null()
 }
 
+/// A `timespec` as nanoseconds, saturating.
+///
+/// # Safety
+/// `ts` must point to a valid `timespec`.
+pub unsafe fn timespec_ns(ts: *const libc::timespec) -> u64 {
+    ((*ts).tv_sec.max(0) as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((*ts).tv_nsec.max(0) as u64)
+}
+
+/// A run seed made one process's own: every per-process stream starts here.
+pub fn process_seed(seed: u64, proc_index: u32) -> u64 {
+    seed.wrapping_add(u64::from(proc_index).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
 pub fn set_my_id(id: usize) {
-    let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
-    unsafe { libc::pthread_setspecific(key, (id + 1) as *const c_void) };
+    set_identity(Some(id));
     let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
     PORTS.lock().push((port, id));
 }
@@ -116,7 +149,6 @@ extern "C" {
     fn mach_port_deallocate(task: u32, name: u32) -> i32;
 }
 
-/// Whether the thread with this Mach port is one the scheduler runs.
 /// The scheduler's id of the thread with this Mach port, if it runs it.
 pub fn scheduled_thread(port: u32) -> Option<usize> {
     PORTS
@@ -129,15 +161,15 @@ pub fn scheduled_thread(port: u32) -> Option<usize> {
 /// Seed bisection reseeds every random stream at a virtual time. The
 /// scheduler's own are swapped in the shared state; a process's streams
 /// (heap layout, entropy) are its own, and each asks here before it draws.
-/// `done` is the stream's note that it has switched. The answer differs
-/// per process and, through `stream`, per stream.
-pub fn reseed_once(done: &std::sync::atomic::AtomicBool, stream: u64) -> Option<u64> {
+/// `done` is the stream's note that it has switched. The answer is the
+/// process's own; each stream mixes in its constant.
+pub fn reseed_once(done: &std::sync::atomic::AtomicBool) -> Option<u64> {
     if done.load(Ordering::Relaxed) {
         return None;
     }
     let with = shared()?.reseeded_with()?;
     done.store(true, Ordering::Relaxed);
-    Some(with.wrapping_add(u64::from(pid()).wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ stream)
+    Some(process_seed(with, pid()))
 }
 
 /// Whether thread `id` is parked, as opposed to running in real time
@@ -313,7 +345,7 @@ fn scheduler_slot() -> *mut usize {
     (shared::STUB_BASE + shared::SLOT_OFFSET as usize) as *mut usize
 }
 
-fn fatal(msg: &str) -> ! {
+pub fn fatal(msg: &str) -> ! {
     crate::report::log(msg);
     std::process::abort();
 }
@@ -390,7 +422,6 @@ const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
 /// launcher), then park the main thread until it is handed the baton.
 pub fn init(info: Option<Info>, cfg: &Config) {
     *INFO.lock() = info;
-    open_trace();
     if let Some(spins) = std::env::var("REWRITE_PARK_SPINS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -417,14 +448,14 @@ pub fn init(info: Option<Info>, cfg: &Config) {
         }
         Err(_) => start_private_run(cfg),
     };
-    load_mask();
     unsafe { scheduler_slot().write(rewrite_scheduler_yield as *const () as usize) };
     SHARED.store(std::ptr::from_ref(sh).cast_mut(), Ordering::Relaxed);
+    open_trace();
+    load_mask();
     // Its own stream, per process; a `fork` child carries its parent's on
     crate::alloc::seed_layout(
-        cfg.seed
-            .wrapping_add(u64::from(pid()).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-            ^ 0x4845_4150_4845_4150,
+        process_seed(cfg.seed, pid()),
+        cfg.heap_size,
     );
     set_my_id(me);
     wait_for_baton(me);
@@ -456,18 +487,13 @@ pub fn become_forked_child(child: u32) {
     // of the parent may have been inside `set_my_id` at the fork.
     PORTS.force_unlock();
     PORTS.lock().clear();
-    MASK.force_unlock();
     crate::alloc::forked();
     crate::hostfs::forked();
     crate::signals::forked();
     crate::io::forked();
     crate::process::forked();
     crate::kq::forked();
-    crate::determinism::forked(
-        Config::from_env()
-            .seed
-            .wrapping_add(u64::from(child).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-    );
+    crate::determinism::forked(process_seed(Config::from_env().seed, child));
     HOOKS.store(0, Ordering::Relaxed);
     crate::io::IO_WAITS.store(0, Ordering::Relaxed);
     for c in &crate::interpose::COUNTS {
@@ -650,6 +676,9 @@ impl After {
             Handoff::Idle if self.crashed_self => die(),
             Handoff::Idle => false,
             Handoff::Stay => {
+                // Traced too: a quantum ended here, switch or not, and
+                // masking this site would move the run
+                trace_switch(me, me, self.issued, site, self.clock);
                 if self.unsettled {
                     take_up_baton(sh);
                 } else {
@@ -714,10 +743,17 @@ fn wait_out_deaths(sh: &Shared, new_quantum: bool) {
             if new_quantum {
                 install_quantum(s.pending_quantum);
             }
-            let child_died = std::mem::take(&mut s.procs[pid() as usize].child_deaths) > 0;
+            let me = &mut s.procs[pid() as usize];
+            let mut about = None;
+            if me.child_deaths > 0 && crate::signals::takes_sigchld() {
+                me.child_deaths = 0;
+                let child = me.last_dead_child;
+                let status = s.procs[child as usize].exit_status;
+                about = Some((shared::vpid_of(child), status));
+            }
             drop(s);
-            if child_died {
-                crate::signals::deliver_sigchld();
+            if let Some((child, status)) = about {
+                crate::signals::deliver_sigchld(child, status);
             }
             return;
         }
@@ -752,8 +788,21 @@ pub fn wait_for_baton(id: usize) {
 /// the report covers the same four values.
 static TRACE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// A debugging path: the launcher's, from the shared state, in a run that
+/// has one; this process's own environment otherwise.
+fn debug_path(
+    name: &str,
+    field: fn(&shared::State) -> &[u8; shared::DEBUG_PATH_LEN],
+) -> Option<String> {
+    if crate::coord::connected() {
+        with(|s, _| shared::debug_path(field(s))).flatten()
+    } else {
+        std::env::var(name).ok()
+    }
+}
+
 fn open_trace() {
-    let Ok(path) = std::env::var("REWRITE_TRACE") else {
+    let Some(path) = debug_path("REWRITE_TRACE", |s| &s.trace_path) else {
         return;
     };
     let Ok(cpath) = std::ffi::CString::new(path) else {
@@ -811,13 +860,17 @@ pub fn hook_event(site: u64) {
     }
 }
 
-/// Called from the stub's expired path through the register-saving
-/// trampoline, with the guest's registers already preserved.
-/// Return addresses of the stubs at which a switch may not happen, sorted,
-/// as they are in the file (before any slide). See `load_mask`.
-static MASK: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
-static MASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static SLIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Sorted return addresses, as loaded, of this program's stubs at which a
+/// quantum may not end (`REWRITE_MASK`: `<program> <address in the file>`).
+/// Every stub still counts, so a run that never expires at a masked site is
+/// the unmasked run. Set before any hook can expire; read without a lock,
+/// since an expiry may come inside a signal handler.
+static MASK: std::sync::OnceLock<Box<[u64]>> = std::sync::OnceLock::new();
+/// Expiries deferred in a row. A loop of nothing but masked stubs would
+/// otherwise keep the baton for ever.
+static DEFERRED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const MAX_DEFERRED: u32 = 100_000;
+static SAID_MASKED_LOOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" {
     fn _dyld_get_image_vmaddr_slide(index: u32) -> isize;
@@ -826,20 +879,14 @@ extern "C" {
     fn _NSGetExecutablePath(buf: *mut libc::c_char, size: *mut u32) -> libc::c_int;
 }
 
-/// `REWRITE_MASK=<file>` with lines `<program> <return address>`: the hook
-/// sites of this program where the quantum may not end. Site minimisation
-/// uses it to ask whether a failure needs a switch at a given load or
-/// store. Every stub still counts, so a run that never expires at a masked
-/// site is the unmasked run.
 /// Word of a Mach-O header that holds the file type, and an executable's
 const FILETYPE: usize = 3;
 const MH_EXECUTE: u32 = 2;
 
 fn load_mask() {
-    let Ok(path) = std::env::var("REWRITE_MASK") else {
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = debug_path("REWRITE_MASK", |s| &s.mask_path)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+    else {
         return;
     };
     let mut buf = [0 as libc::c_char; 4096];
@@ -849,35 +896,46 @@ fn load_mask() {
     }
     let exe = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
     let file = exe.rsplit('/').next().unwrap_or_default();
-    // The rewritten copy is `<program>.rw<version>-<key>`
-    let program = file.split_once(".rw").map_or(file, |(name, _)| name);
-    let mut pcs: Vec<u64> = text
-        .lines()
-        .filter_map(|l| l.split_once(' '))
-        .filter(|(name, _)| *name == program)
-        .filter_map(|(_, pc)| u64::from_str_radix(pc, 16).ok())
-        .collect();
-    pcs.sort_unstable();
-    MASKED.store(!pcs.is_empty(), Ordering::Relaxed);
-    *MASK.lock() = pcs;
+    let program = file.rfind(shared::CACHE_TAG).map_or(file, |at| &file[..at]);
     // The executable is not image 0 when a library was inserted ahead of it
     let slide = (0..unsafe { _dyld_image_count() })
         .find(|&i| unsafe {
             let header = _dyld_get_image_header(i);
             !header.is_null() && *header.add(FILETYPE) == MH_EXECUTE
         })
-        .map_or(0, |i| unsafe { _dyld_get_image_vmaddr_slide(i) });
-    SLIDE.store(slide as u64, Ordering::Relaxed);
+        .map_or(0, |i| unsafe { _dyld_get_image_vmaddr_slide(i) }) as u64;
+    // A program's name may hold spaces; an address cannot
+    let mut pcs: Vec<u64> = text
+        .lines()
+        .filter_map(|l| l.rsplit_once(' '))
+        .filter(|(name, _)| *name == program)
+        .filter_map(|(_, pc)| u64::from_str_radix(pc, 16).ok())
+        .map(|pc| pc.wrapping_add(slide))
+        .collect();
+    pcs.sort_unstable();
+    let _ = MASK.set(pcs.into_boxed_slice());
 }
 
 fn masked(stub_pc: u64) -> bool {
-    MASKED.load(Ordering::Relaxed)
-        && MASK
-            .lock()
-            .binary_search(&stub_pc.wrapping_sub(SLIDE.load(Ordering::Relaxed)))
-            .is_ok()
+    if MASK
+        .get()
+        .is_none_or(|m| m.binary_search(&stub_pc).is_err())
+    {
+        DEFERRED.store(0, Ordering::Relaxed);
+        return false;
+    }
+    if DEFERRED.fetch_add(1, Ordering::Relaxed) < MAX_DEFERRED {
+        return true;
+    }
+    if !SAID_MASKED_LOOP.swap(true, Ordering::Relaxed) {
+        crate::report::log("a loop of masked sites never reaches another hook; switching at one");
+    }
+    DEFERRED.store(0, Ordering::Relaxed);
+    false
 }
 
+/// Called from the stub's expired path through the register-saving
+/// trampoline, with the guest's registers already preserved.
 #[no_mangle]
 pub extern "C" fn rewrite_yield_impl(stub_pc: u64) {
     if masked(stub_pc) {

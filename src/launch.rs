@@ -20,6 +20,8 @@ pub struct Launch {
     pub args: Vec<OsString>,
     pub dylib: Option<PathBuf>,
     pub disable_aslr: bool,
+    /// Bytes of address space for each guest's heap
+    pub heap_size: u64,
     /// Redirect the guest's stdout to this file (created or truncated)
     pub stdout: Option<PathBuf>,
     pub seed: u64,
@@ -33,6 +35,11 @@ pub struct Launch {
 
 /// Tells the supervisor to set up the stubs' region and nothing else
 pub const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
+
+/// Address space of a guest's heap unless the run says otherwise. Only
+/// touched pages cost memory; it bounds what a guest can have live, and a
+/// seeded layout wants room to scatter blocks in.
+pub const DEFAULT_HEAP: u64 = 32 << 30;
 
 pub const DEFAULT_QUANTUM: (u32, u32) = (1000, 10000);
 
@@ -115,6 +122,8 @@ pub struct Run {
     /// an unrecorded input, and their total length moves the guest's stack.
     pub inherit_env: bool,
     pub disable_aslr: bool,
+    /// Bytes of address space for each guest's heap
+    pub heap_size: u64,
     pub seed: u64,
     pub quantum: (u32, u32),
     /// Rewritten binaries need the dylib for the region their stubs
@@ -201,7 +210,7 @@ fn spawn(
     // The supervisor's own debugging switches, which a guest that does not
     // inherit our environment would otherwise never see
     if !run.inherit_env {
-        for name in ["REWRITE_TRACE", "REWRITE_PARK_SPINS", "REWRITE_MASK"] {
+        for name in ["REWRITE_PARK_SPINS"] {
             if let Ok(value) = std::env::var(name) {
                 env.push(CString::new(format!("{name}={value}")).unwrap());
             }
@@ -575,6 +584,11 @@ fn only_daemons_left(run: &Run, procs: &[Tracked]) -> bool {
 /// The environment that makes a guest process `proc_index` of the run.
 fn guest_env(run: &Run, coord: Option<(&Coordinator, u32)>) -> Vec<(String, String)> {
     let mut env = vec![("REWRITE_SEED".to_string(), run.seed.to_string())];
+    // As wide whatever the size: the environment's length places the stack
+    env.push((
+        "REWRITE_HEAP".to_string(),
+        format!("{:016x}", run.heap_size),
+    ));
     if run.passive {
         env.push((PASSIVE_VAR.into(), "1".into()));
     }
@@ -697,6 +711,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     }
     if let Some(c) = coord {
         c.set_net_latency(run.net_latency_ns);
+        c.set_debug_paths();
         if let Some((at, with)) = run.reseed {
             c.set_reseed(at, with);
         }
@@ -779,6 +794,9 @@ fn supervise_started(
             let status = procs[index].status.unwrap_or(0);
             let restarting = coord.is_some_and(|c| c.will_restart(index as u32, status));
             if !restarting && only_daemons_left(run, procs) {
+                if let Some(coord) = coord {
+                    coord.note_last_death(index as u32);
+                }
                 end_run(procs);
                 break;
             }
@@ -844,6 +862,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         dylib: cfg.dylib.clone(),
         inherit_env: true,
         disable_aslr: cfg.disable_aslr,
+        heap_size: cfg.heap_size,
         seed: cfg.seed,
         quantum: cfg.quantum,
         passive: cfg.passive,

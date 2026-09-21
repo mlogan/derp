@@ -29,7 +29,8 @@ schedule.
 
 - The 4 GB region is 65,536 slabs of 64 KB; a bitmap says which are taken.
 - A size class up to 64 KB gets a slab at a random free index when it needs
-  one, and carves it into slots. Every class keeps a pool of up to 64
+  one, and carves it into slots. Every class keeps a pool of up to 64 (as
+  built: 32, and slabs come from a 64 GB window of a 1 TB region)
   candidate blocks; `malloc` draws one at random, `free` returns a block to
   the pool (to an overflow list when the pool is full), and an empty pool
   is refilled from the overflow list, then from a new slab whose slots are

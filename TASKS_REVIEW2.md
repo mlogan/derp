@@ -100,7 +100,60 @@ after the fix; those guests are now `tests/programs/edge_*.c`,
   (anyone's child) while `kill` still succeeds; the lock takeover and the
   orphan check both go by it.
 
+## Second pass (2026-09-21)
+
+Items from the reports that the first pass had not taken:
+
+- Supervisor: the 1 ms real wait on a running owner's unfair lock gives
+  up with a fatal report after 30 s; a fired one-shot outside
+  registration leaves `Kq::external`; closing a descriptor purges kqueue
+  entries whoever closes it; the mask is a slice set once and read
+  without a lock.
+- Allocator: a slab whose blocks are all free goes back to the window,
+  unless its blocks are most of what its class has free (freeing and
+  allocating one block in turn would otherwise take and release a slab
+  every time). Free blocks off the pool are on a doubly linked list so
+  that a slab's blocks can be taken out. The first-fit fallback jumps past
+  taken slabs. The supervisor's own heap reuses the best-fitting large
+  block and gives freed large blocks' pages back (`MADV_FREE`). Cost: the
+  allocation benchmark went from 0.124 s to 0.142 s (native libmalloc
+  0.193 s); `loops 3` is unchanged at 1.75x.
+- bisect: the base rate is measured with a reseed before the first
+  hand-off (it kept the original first choice of thread); the futures per
+  probe grow with the base rate (x2 above 25%, x4 above 50%); both ends of
+  the interval are measured again with other futures, and the output says
+  when they disagree.
+- Tools: `--native`, `--no-supervisor` and `--aslr` are refused by
+  `bisect` and `suspects`; `--reseed` needs `--reseed-at`; a run started
+  by a tool exits when the tool is gone, and its guests follow.
+- `suspects` prints one `suspect=` line per site.
+- Tests: the `suspects` tests require `atos`; a run file's `quantum:`
+  reaches `bisect` (its reference fails at the plain run's nanosecond); a
+  killed `bisect` leaves no guest behind. That test failed once, the
+  first time it ran alongside the others, and passed 13 times since; the
+  one race found (a run started as its tool died would never notice) is
+  closed. Its failure message now lists what is left running.
+- One constant per per-process stream, and `reseed_once` without one.
+  A `timespec` helper. Three long comments trimmed.
+
+Faults injected by the run file draw their first crash time when a
+process is registered, before any reseed: a probe at time 0 keeps those
+first crash times. Later ones are drawn from the reseeded stream.
+
+## Open
+
+- **`execve` with the scheduler lock held by a thread without the baton.**
+  The lock word names a pid that lives on in the new image, so it is never
+  taken over and the run hangs. Found by reading, not reproduced. Needs
+  the lock released or taken around the exec, or a generation beside the
+  pid.
+- **`suspects` and a guest's own children.** A child a guest forks runs
+  the same program, so a mask reaches it by name, but its sites are never
+  candidates: the trace names processes by run-file entry, and a child has
+  none. A failure that needs a switch inside such a child fails the first
+  sanity check with a misleading message. Needs processes mapped to
+  programs through the launcher's spawn records.
+
 Not done, by choice: reuse order of two freed blocks (A5), streams
-restarting after `execve` (A8), the larger refactors, a fired one-shot
-external registration staying in `Kq::external`, and `execve` with a
-non-baton thread inside the scheduler lock.
+restarting after `execve` (A8), and the larger refactors (a `Layout` enum
+for `Heap`, splitting `my_kevent` and `main.rs`).

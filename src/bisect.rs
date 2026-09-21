@@ -49,7 +49,8 @@ pub struct Found {
     pub trace: Vec<String>,
 }
 
-fn ending(stderr: &str) -> Ending {
+#[must_use]
+pub fn ending(stderr: &str) -> Ending {
     let field = |key: &str| {
         stderr
             .lines()

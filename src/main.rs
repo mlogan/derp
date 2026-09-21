@@ -20,6 +20,9 @@ usage:
                                        with the scheduler reseeded at a virtual time, --runs
                                        futures per probe (default 20), --jobs at a time (4),
                                        down to --resolution (2ms)
+  rewrite suspects [opts] --manifest FILE  which loads and stores does the failing seed need?
+                                       Masks switch points at hooked loads and stores until
+                                       none can be dropped, and names their source lines
   rewrite run|repeat [opts] --manifest FILE
                                        several processes under one scheduler; see below
 options:
@@ -456,6 +459,73 @@ fn failed_life(o: &RunOutcome) -> Option<(usize, usize)> {
         .find(|&(_, life)| o.guests[life].exit_code() != Some(0))
 }
 
+/// `rewrite suspects`: the loads and stores a failing seed needs.
+fn suspects(cli: &Cli) -> Fallible<()> {
+    let path = cli.manifest.clone().unwrap();
+    let m = manifest::parse(&std::fs::read_to_string(&path)?)?;
+    let cli = &with_run_file_settings(cli, &m)?;
+    if cli.opts.mem_rate.0 == 0 {
+        return Err("no loads or stores are hooked: give --mem-hook-rate".into());
+    }
+    let base = path.parent().unwrap_or(Path::new("."));
+    let mut programs = Vec::new();
+    for p in &m.processes {
+        let original = std::fs::canonicalize(base.join(&p.argv[0]))
+            .map_err(|e| format!("{}: {e}", p.argv[0]))?;
+        let rewritten = cached_rewrite(&original, &cli.opts)?;
+        let table = std::fs::read_to_string(rewrite::cache::sites_path(&rewritten))
+            .map_err(|e| format!("{}: no site table ({e})", rewritten.display()))?;
+        programs.push(rewrite::suspects::Program {
+            name: original
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            original,
+            sites: rw::sites_from_text(&table),
+        });
+    }
+    let cfg = rewrite::suspects::Config {
+        manifest: path,
+        scratch: scratch_dir(cli),
+        seed: cli.opts.seed,
+        jobs: cli.jobs,
+        pass: vec![
+            "--quantum".to_string(),
+            format!("{}..{}", cli.quantum.0, cli.quantum.1),
+            "--mem-hook-rate".to_string(),
+            format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
+        ],
+        programs,
+    };
+    let found = rewrite::suspects::suspects(&cfg, |line| println!("{line}"))?;
+    println!(
+        "{} of {} sites are needed ({} runs):",
+        found.suspects.len(),
+        found.candidates,
+        found.runs
+    );
+    for s in &found.suspects {
+        println!(
+            "  {} {:#x} {:<5} {}",
+            s.program,
+            s.addr,
+            s.kind.name(),
+            s.location
+        );
+    }
+    for s in &found.suspects {
+        println!(
+            "suspect={} {:#x} {} {}",
+            s.program,
+            s.addr,
+            s.kind.name(),
+            s.location
+        );
+    }
+    Ok(())
+}
+
 /// `rewrite bisect`: find when the failing seed's failure was decided.
 fn bisect(cli: &Cli) -> Fallible<()> {
     let mut pass = vec![
@@ -663,6 +733,9 @@ fn main() -> ExitCode {
         }
         Some("bisect") if rest.is_empty() && cli.manifest.is_some() => {
             bisect(&cli).map(|()| ExitCode::SUCCESS)
+        }
+        Some("suspects") if rest.is_empty() && cli.manifest.is_some() => {
+            suspects(&cli).map(|()| ExitCode::SUCCESS)
         }
         Some("bench") if !rest.is_empty() => bench(cli, &rest).map(|()| ExitCode::SUCCESS),
         Some("repeat") if rest.is_empty() != cli.manifest.is_none() => {

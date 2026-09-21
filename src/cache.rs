@@ -28,7 +28,16 @@ pub fn rewrite_file(input: &Path, output: &Path, opts: &Options) -> Fallible<rw:
 fn rewrite_without_symbols(input: &Path, output: &Path, opts: &Options) -> Fallible<rw::Stats> {
     let r = rw::rewrite(&read_macho(input)?, opts)?;
     write_exe(output, &r.image)?;
+    std::fs::write(sites_path(output), rw::sites_to_text(&r.sites))?;
     Ok(r.stats)
+}
+
+/// Where the site table of a rewritten file is kept
+#[must_use]
+pub fn sites_path(rewritten: &Path) -> PathBuf {
+    let mut name = rewritten.as_os_str().to_owned();
+    name.push(".sites");
+    PathBuf::from(name)
 }
 
 fn with_dsym_suffix(path: &Path) -> PathBuf {
@@ -106,7 +115,7 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
         .map_or(0, |d| d.as_nanos());
     let mtime = format!("{mtime}-{}", meta.len());
     let name = format!(
-        "{}.rw2-{}-{}of{}-{mtime}",
+        "{}.rw3-{}-{}of{}-{mtime}",
         input.file_name().unwrap_or_default().to_string_lossy(),
         opts.seed,
         opts.mem_rate.0,
@@ -124,6 +133,8 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
             NEXT_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let stats = rewrite_without_symbols(input, &tmp, opts)?;
+        // The table first: a rewritten file that exists has one
+        std::fs::rename(sites_path(&tmp), sites_path(&out))?;
         std::fs::rename(&tmp, &out)?;
         eprintln!(
             "rewrite: {} sites hooked -> {}",

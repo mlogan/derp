@@ -15,3 +15,4 @@ pub mod rng;
 #[path = "../supervisor/src/shared.rs"]
 pub mod shared;
 pub mod stub;
+pub mod suspects;

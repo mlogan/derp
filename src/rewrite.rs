@@ -107,6 +107,75 @@ pub struct Rewritten {
     /// Unsigned image; pass through `macho::adhoc_sign` after writing
     pub image: Vec<u8>,
     pub stats: Stats,
+    pub sites: Vec<Site>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiteKind {
+    Branch,
+    Call,
+    Load,
+    Store,
+}
+
+/// One hooked instruction
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Site {
+    /// Where the stub's expiry path returns to: what the supervisor sees
+    /// when a quantum runs out here, and what a schedule trace calls `site`
+    pub yield_pc: u64,
+    /// The original instruction
+    pub addr: u64,
+    pub kind: SiteKind,
+}
+
+impl SiteKind {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            SiteKind::Branch => "branch",
+            SiteKind::Call => "call",
+            SiteKind::Load => "load",
+            SiteKind::Store => "store",
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<SiteKind> {
+        [
+            SiteKind::Branch,
+            SiteKind::Call,
+            SiteKind::Load,
+            SiteKind::Store,
+        ]
+        .into_iter()
+        .find(|k| k.name() == name)
+    }
+}
+
+/// The site table as text, one `<yield pc> <address> <kind>` per line.
+#[must_use]
+pub fn sites_to_text(sites: &[Site]) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    for s in sites {
+        let _ = writeln!(out, "{:x} {:x} {}", s.yield_pc, s.addr, s.kind.name());
+    }
+    out
+}
+
+#[must_use]
+pub fn sites_from_text(text: &str) -> Vec<Site> {
+    text.lines()
+        .filter_map(|l| {
+            let mut w = l.split(' ');
+            Some(Site {
+                yield_pc: u64::from_str_radix(w.next()?, 16).ok()?,
+                addr: u64::from_str_radix(w.next()?, 16).ok()?,
+                kind: SiteKind::from_name(w.next()?)?,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -155,6 +224,7 @@ struct Builder {
     text_addr: u64,
     code: Vec<u32>,
     patches: Vec<(u64, u32)>,
+    sites: Vec<Site>,
 }
 
 impl Builder {
@@ -226,6 +296,18 @@ impl Builder {
         self.emit(0);
         self.emit(stub::BLR_X0);
         let skip = self.pc();
+        let kind = match tail {
+            // In the A64 load/store encodings bit 22 is set for a load
+            Tail::Replay(word) if word & (1 << 22) != 0 => SiteKind::Load,
+            Tail::Replay(_) => SiteKind::Store,
+            _ if call => SiteKind::Call,
+            _ => SiteKind::Branch,
+        };
+        self.sites.push(Site {
+            yield_pc: skip,
+            addr: site,
+            kind,
+        });
         self.code[skip_at] =
             stub::cbz(true, 0, false, self.text_addr + (skip_at * 4) as u64, skip).unwrap();
         self.emit(stub::LDR_X30_POST);
@@ -279,6 +361,7 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
         text_addr: layout.text_addr + HEADER_SIZE,
         code: Vec::new(),
         patches: Vec::new(),
+        sites: Vec::new(),
     };
     let mut stats = Stats::default();
     let mut rng = Rng::seed_from_u64(opts.seed);
@@ -416,7 +499,11 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
     stub_text.extend(b.code.iter().flat_map(|w| w.to_le_bytes()));
     stats.stub_bytes = stub_text.len();
     let image = m.emit(&b.patches, &stub_text)?;
-    Ok(Rewritten { image, stats })
+    Ok(Rewritten {
+        image,
+        stats,
+        sites: b.sites,
+    })
 }
 
 /// Scan without emitting: the statistics only.

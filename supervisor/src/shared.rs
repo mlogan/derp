@@ -400,22 +400,55 @@ impl Shared {
         }
     }
 
+    /// The lock word holds its owner's real pid. A process can be killed
+    /// with the lock held (the launcher kills what is left at the end of a
+    /// run; a crash is a `SIGKILL`), and a lock nobody can release would
+    /// wedge everyone, the launcher included. A waiter that finds the owner
+    /// gone takes the lock over. The state may be mid-update then; the
+    /// alternative is a run that never ends.
     pub fn lock(&self) -> Guard<'_> {
+        let me = unsafe { libc::getpid() } as u32;
         let mut spins = 0u32;
         while self
             .lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             std::hint::spin_loop();
             spins = spins.wrapping_add(1);
             // Critical sections are microseconds long: this many spins
             // means the holder may have died with the lock
+            if spins.is_multiple_of(1 << 16) && self.take_over_from_the_dead(me) {
+                break;
+            }
             if spins.is_multiple_of(1 << 22) {
                 self.exit_if_orphaned();
             }
         }
         Guard { shared: self }
+    }
+
+    fn take_over_from_the_dead(&self, me: u32) -> bool {
+        let owner = self.lock.load(Ordering::Relaxed);
+        if owner == 0 || owner == me {
+            return false;
+        }
+        let pid = owner as libc::pid_t;
+        let no_such = unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        // A zombie still answers `kill`. If it is our child (the launcher's
+        // guests are), look without reaping: whoever reaps it still can.
+        let dead_child = !no_such
+            && unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                let flags = libc::WEXITED | libc::WNOHANG | libc::WNOWAIT;
+                libc::waitid(libc::P_PID, owner, &raw mut info, flags) == 0 && info.si_pid == pid
+            };
+        let gone = no_such || dead_child;
+        gone && self
+            .lock
+            .compare_exchange(owner, me, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     }
 
     pub fn counter(&self) -> *mut i64 {
@@ -951,6 +984,62 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A shared mapping with a lock in it, as the run's state is
+    fn shared_mapping() -> &'static Shared {
+        let mem = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                Shared::SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(mem, libc::MAP_FAILED);
+        unsafe { Shared::init(mem.cast(), 1, 1000, 10000) }
+    }
+
+    #[test]
+    fn a_lock_whose_owner_died_is_taken_over() {
+        let sh = shared_mapping();
+        for reap_first in [true, false] {
+            let child = unsafe { libc::fork() };
+            if child == 0 {
+                std::mem::forget(sh.lock());
+                unsafe { libc::_exit(0) };
+            }
+            // The child is dead, reaped or still a zombie, with the lock
+            let mut status = 0;
+            let flags = if reap_first { 0 } else { libc::WNOWAIT };
+            if reap_first {
+                assert_eq!(
+                    unsafe { libc::waitpid(child, &raw mut status, flags) },
+                    child
+                );
+            } else {
+                let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                let rc = unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        child as u32,
+                        &raw mut info,
+                        libc::WEXITED | flags,
+                    )
+                };
+                assert_eq!(rc, 0);
+            }
+            assert_eq!(sh.lock.load(Ordering::Relaxed), child as u32);
+            let guard = sh.lock();
+            assert_eq!(sh.lock.load(Ordering::Relaxed), std::process::id());
+            drop(guard);
+            assert_eq!(sh.lock.load(Ordering::Relaxed), 0);
+            if !reap_first {
+                unsafe { libc::waitpid(child, &raw mut status, 0) };
+            }
+        }
+    }
 
     #[test]
     fn stubs_can_reach_the_counter() {

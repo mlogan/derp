@@ -384,10 +384,12 @@ impl MachO {
                 "__LINKEDIT is not last in the file".into(),
             ));
         }
+        // Sites that cannot reach the segment are left alone; a program
+        // none of whose text can is not worth rewriting
         let text_addr = linkedit.vmaddr;
-        if text_addr.abs_diff(text.vmaddr) >= 128 << 20 {
+        if text_addr.abs_diff(text.vmaddr + text.vmsize) >= crate::stub::B_RANGE as u64 {
             return Err(Error::BadLayout(
-                "stub segment is out of b range of __TEXT".into(),
+                "stub segment is out of b range of all of __TEXT".into(),
             ));
         }
         Ok(Layout { text_addr })

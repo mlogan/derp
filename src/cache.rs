@@ -150,8 +150,16 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
         // The table first: a rewritten file that exists has one
         std::fs::rename(sites_path(&tmp), sites_path(&out))?;
         std::fs::rename(&tmp, &out)?;
+        let unreachable = if stats.unreachable_sites > 0 {
+            format!(
+                " ({} out of a b's reach, left alone)",
+                stats.unreachable_sites
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
-            "rewrite: {} sites hooked -> {}",
+            "rewrite: {} sites hooked{unreachable} -> {}",
             stats.branch_sites + stats.call_sites + stats.mem_sites,
             out.display()
         );

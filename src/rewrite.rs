@@ -67,6 +67,9 @@ pub struct Stats {
     pub call_sites: usize,
     pub mem_candidates: usize,
     pub mem_sites: usize,
+    /// Sites a `b` could not reach from, or a trampoline reach a target
+    /// from: left alone (programs of over about 120 MB)
+    pub unreachable_sites: usize,
     pub exclusive_words: usize,
     pub data_in_code_words: usize,
     pub skipped_blr_x30: usize,
@@ -95,8 +98,11 @@ impl std::fmt::Display for Stats {
         )?;
         writeln!(
             f,
-            "skipped: exclusive_words={} data_in_code_words={} blr_x30={}",
-            self.exclusive_words, self.data_in_code_words, self.skipped_blr_x30
+            "skipped: exclusive_words={} data_in_code_words={} blr_x30={} unreachable={}",
+            self.exclusive_words,
+            self.data_in_code_words,
+            self.skipped_blr_x30,
+            self.unreachable_sites
         )?;
         writeln!(f, "stub_bytes={}", self.stub_bytes)?;
         write!(f, "mem_site_addrs=")?;
@@ -210,7 +216,12 @@ impl From<macho::Error> for Error {
 
 /// What the stub does after the counter check
 enum Tail {
-    Jump(u64),
+    /// `island`: the site is a call or a tail call, so x16 may be used to
+    /// reach a far target, as a linker's branch island would
+    Jump {
+        target: u64,
+        island: bool,
+    },
     Indirect(u8),
     /// Re-execute the displaced word, then continue after the site
     Replay(u32),
@@ -229,6 +240,8 @@ struct Builder {
     text_addr: u64,
     /// Address of the shared body
     common: u64,
+    /// Sites left alone because a `b` could not reach
+    unreachable: usize,
     code: Vec<u32>,
     patches: Vec<(u64, u32)>,
     sites: Vec<Site>,
@@ -285,8 +298,32 @@ impl Builder {
     }
 
     /// Emit one trampoline for `site` and record the site patch. `call`
-    /// means the site keeps a `bl` so x30 is set by hardware.
-    fn stub(&mut self, site: u64, guard: Guard, call: bool, tail: Tail) -> Result<(), Error> {
+    /// means the site keeps a `bl` so x30 is set by hardware. Returns
+    /// false, having emitted nothing, when the site cannot reach its
+    /// trampoline or the trampoline its target: a program of over about
+    /// 120 MB has such sites, and they stay as they are.
+    fn stub(&mut self, site: u64, guard: Guard, call: bool, tail: Tail) -> Result<bool, Error> {
+        let mark = (self.code.len(), self.patches.len(), self.sites.len());
+        match self.stub_or_far(site, guard, call, tail) {
+            Ok(()) => Ok(true),
+            Err(Error::OutOfRange { .. }) => {
+                self.code.truncate(mark.0);
+                self.patches.truncate(mark.1);
+                self.sites.truncate(mark.2);
+                self.unreachable += 1;
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn stub_or_far(
+        &mut self,
+        site: u64,
+        guard: Guard,
+        call: bool,
+        tail: Tail,
+    ) -> Result<(), Error> {
         let start = self.pc();
         let site_word = if call {
             stub::bl(site, start)
@@ -316,10 +353,19 @@ impl Builder {
         let yield_pc = self.pc();
         self.emit(stub::LDR_X30_POST);
         match tail {
-            Tail::Jump(target) => {
-                let w = b_to(self.pc(), target)?;
-                self.emit(w);
-            }
+            Tail::Jump { target, island } => match b_to(self.pc(), target) {
+                Ok(w) => self.emit(w),
+                // A callee may be anywhere in the text; the other hooked
+                // branches stay inside their function
+                Err(e) if !island => return Err(e),
+                Err(_) => {
+                    let page = stub::adrp(16, self.pc(), target)
+                        .ok_or(Error::OutOfRange { site, target })?;
+                    self.emit(page);
+                    self.emit(stub::add_imm(16, 16, (target & 0xFFF) as u32));
+                    self.emit(stub::br(16));
+                }
+            },
             Tail::Indirect(rn) => self.emit(stub::br(rn)),
             Tail::Replay(word) => {
                 self.emit(word);
@@ -398,6 +444,7 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
     let mut b = Builder {
         text_addr: layout.text_addr + HEADER_SIZE,
         common: 0,
+        unreachable: 0,
         code: Vec::new(),
         patches: Vec::new(),
         sites: Vec::new(),
@@ -455,30 +502,36 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
                 stats.exclusive_words += 1;
                 continue;
             }
+            let jump = |target: u64, island: bool| Tail::Jump { target, island };
             match classes[i] {
                 Class::B { target } if target <= pc => {
-                    stats.branch_sites += 1;
-                    b.stub(pc, Guard::None, false, Tail::Jump(target))?;
+                    // Outside the function it is a tail call
+                    let island = target < start || target >= end;
+                    if b.stub(pc, Guard::None, false, jump(target, island))? {
+                        stats.branch_sites += 1;
+                    }
                 }
                 Class::Bl { target } => {
-                    stats.call_sites += 1;
-                    b.stub(pc, Guard::None, true, Tail::Jump(target))?;
+                    if b.stub(pc, Guard::None, true, jump(target, true))? {
+                        stats.call_sites += 1;
+                    }
                 }
                 Class::Blr { rn } => {
                     if rn == 30 {
                         stats.skipped_blr_x30 += 1;
-                    } else {
+                    } else if b.stub(pc, Guard::None, true, Tail::Indirect(rn))? {
                         stats.call_sites += 1;
-                        b.stub(pc, Guard::None, true, Tail::Indirect(rn))?;
                     }
                 }
                 Class::Br { rn } => {
-                    stats.branch_sites += 1;
-                    b.stub(pc, Guard::None, false, Tail::Indirect(rn))?;
+                    if b.stub(pc, Guard::None, false, Tail::Indirect(rn))? {
+                        stats.branch_sites += 1;
+                    }
                 }
                 Class::BCond { cond, target } if target <= pc => {
-                    stats.branch_sites += 1;
-                    b.stub(pc, Guard::Cond(cond), false, Tail::Jump(target))?;
+                    if b.stub(pc, Guard::Cond(cond), false, jump(target, false))? {
+                        stats.branch_sites += 1;
+                    }
                 }
                 Class::Cbz {
                     sf,
@@ -486,13 +539,10 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
                     nonzero,
                     target,
                 } if target <= pc => {
-                    stats.branch_sites += 1;
-                    b.stub(
-                        pc,
-                        Guard::Cbz { sf, rt, nonzero },
-                        false,
-                        Tail::Jump(target),
-                    )?;
+                    let guard = Guard::Cbz { sf, rt, nonzero };
+                    if b.stub(pc, guard, false, jump(target, false))? {
+                        stats.branch_sites += 1;
+                    }
                 }
                 Class::Tbz {
                     rt,
@@ -500,13 +550,10 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
                     nonzero,
                     target,
                 } if target <= pc => {
-                    stats.branch_sites += 1;
-                    b.stub(
-                        pc,
-                        Guard::Tbz { rt, bit, nonzero },
-                        false,
-                        Tail::Jump(target),
-                    )?;
+                    let guard = Guard::Tbz { rt, bit, nonzero };
+                    if b.stub(pc, guard, false, jump(target, false))? {
+                        stats.branch_sites += 1;
+                    }
                 }
                 Class::Mem { base } => {
                     if (base == SP || base == FP) && !stack_tainted {
@@ -517,10 +564,11 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
                         continue;
                     }
                     let roll = rng.below(u64::from(rate_den));
-                    if roll < u64::from(rate_num) {
+                    if roll < u64::from(rate_num)
+                        && b.stub(pc, Guard::None, false, Tail::Replay(words[i]))?
+                    {
                         stats.mem_sites += 1;
                         stats.mem_site_addrs.push(pc);
-                        b.stub(pc, Guard::None, false, Tail::Replay(words[i]))?;
                     }
                 }
                 _ => {}
@@ -528,6 +576,7 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
         }
     }
 
+    stats.unreachable_sites = b.unreachable;
     let mut stub_text = vec![0u8; HEADER_SIZE as usize];
     let put = |d: &mut [u8], off: u32, v: u64| {
         d[off as usize..off as usize + 8].copy_from_slice(&v.to_le_bytes());

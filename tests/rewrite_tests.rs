@@ -228,3 +228,23 @@ fn allocator_corners() {
         );
     }
 }
+
+/// A constant table in the text that the function table lists without a
+/// symbol (hand-written assembly keeps round constants that way): its words
+/// decode as instructions, one as a backward `b`, and must not be hooked.
+#[test]
+fn an_unnamed_constant_table_in_the_text_is_left_alone() {
+    let dir = common::scratch_dir("asm_table");
+    let exe = common::build_c("asm_table", &dir, &[]);
+    let rw_path = dir.join("asm_table.rw");
+    let stats = rewrite_to(&exe, &rw_path, &Options::default());
+    assert_eq!(stats.unnamed_entries, 1, "{stats}");
+    assert!(stats.call_sites > 0, "{stats}");
+
+    let (native, expected) = run(&exe, &[], None, 0);
+    assert_eq!(native.exit_code(), Some(0));
+    assert_eq!(expected, "7 12648209782\n");
+    let (supervised, text) = run(&rw_path, &[], Some(common::supervisor_dylib()), 0);
+    assert_eq!(supervised.exit_code(), Some(0));
+    assert_eq!(text, expected);
+}

@@ -156,6 +156,7 @@ pub const COUNT_NAMES: [&str; 10] = [
 /// Not quite exact: libc++'s `std::atomic::wait` is a ulock wait from a
 /// system library that a guest thread ends. A guest that uses it from C++
 /// would hold the baton in the kernel for the wake that cannot come.
+#[inline(never)]
 fn system_wait(caller: usize) -> bool {
     if !crate::process::in_system_library(caller) {
         return false;

@@ -70,6 +70,9 @@ pub struct Stats {
     /// Sites a `b` could not reach from, or a trampoline reach a target
     /// from: left alone (programs of over about 120 MB)
     pub unreachable_sites: usize,
+    /// Function-table entries without a symbol, left alone (constant
+    /// tables in hand-written assembly)
+    pub unnamed_entries: usize,
     pub exclusive_words: usize,
     pub data_in_code_words: usize,
     pub skipped_blr_x30: usize,
@@ -98,11 +101,12 @@ impl std::fmt::Display for Stats {
         )?;
         writeln!(
             f,
-            "skipped: exclusive_words={} data_in_code_words={} blr_x30={} unreachable={}",
+            "skipped: exclusive_words={} data_in_code_words={} blr_x30={} unreachable={} unnamed_entries={}",
             self.exclusive_words,
             self.data_in_code_words,
             self.skipped_blr_x30,
-            self.unreachable_sites
+            self.unreachable_sites,
+            self.unnamed_entries
         )?;
         writeln!(f, "stub_bytes={}", self.stub_bytes)?;
         write!(f, "mem_site_addrs=")?;
@@ -216,8 +220,8 @@ impl From<macho::Error> for Error {
 
 /// What the stub does after the counter check
 enum Tail {
-    /// `island`: the site is a call or a tail call, so x16 may be used to
-    /// reach a far target, as a linker's branch island would
+    /// `island`: the site is a call, so x16 may be used to reach a far
+    /// target, as a linker's branch island would
     Jump {
         target: u64,
         island: bool,
@@ -422,13 +426,29 @@ fn b_to(site: u64, target: u64) -> Result<u32, Error> {
 }
 
 /// Function ranges from `LC_FUNCTION_STARTS`, clipped to `__text`
-fn function_ranges(m: &MachO) -> Result<Vec<(u64, u64)>, Error> {
+/// The functions to hook: `(start, end)` from the function table, and how
+/// many entries were passed over. An entry without a symbol is an atom the
+/// assembler made without a name: a constant table in hand-written
+/// assembly, which the table lists like a function (blst keeps the SHA-256
+/// round constants in front of its SHA-256 routine, and one of them
+/// decodes as a backward `b`). Compiled functions always have a symbol
+/// while the file has any, so such entries are left alone when symbols
+/// name at least half of the table; a stripped file hooks everything.
+fn function_ranges(m: &MachO) -> Result<(Vec<(u64, u64)>, usize), Error> {
     let text = m.text_section()?;
     let end = text.addr + text.size;
     let starts = m.function_starts()?;
+    let symbols = m.symbol_addresses();
+    let named = |s: u64| symbols.binary_search(&s).is_ok();
+    let mostly_named = starts.iter().filter(|&&s| named(s)).count() * 2 >= starts.len();
     let mut out = Vec::with_capacity(starts.len());
+    let mut unnamed = 0;
     for (i, &s) in starts.iter().enumerate() {
         if s < text.addr || s >= end {
+            continue;
+        }
+        if mostly_named && !named(s) {
+            unnamed += 1;
             continue;
         }
         let e = starts.get(i + 1).copied().unwrap_or(end).min(end);
@@ -436,7 +456,7 @@ fn function_ranges(m: &MachO) -> Result<Vec<(u64, u64)>, Error> {
             out.push((s, e));
         }
     }
-    Ok(out)
+    Ok((out, unnamed))
 }
 
 pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
@@ -459,7 +479,9 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
         .map(|&(a, len, _)| (a, a + u64::from(len)))
         .collect();
 
-    for (start, end) in function_ranges(m)? {
+    let (ranges, unnamed) = function_ranges(m)?;
+    stats.unnamed_entries = unnamed;
+    for (start, end) in ranges {
         stats.functions += 1;
         let n = ((end - start) / 4) as usize;
         let words: Vec<u32> = (0..n)
@@ -505,9 +527,11 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
             let jump = |target: u64, island: bool| Tail::Jump { target, island };
             match classes[i] {
                 Class::B { target } if target <= pc => {
-                    // Outside the function it is a tail call
-                    let island = target < start || target >= end;
-                    if b.stub(pc, Guard::None, false, jump(target, island))? {
+                    // Not an island even out of its function: hand-written
+                    // assembly (blst, aws-lc) jumps between what the
+                    // function table calls functions with x16 live, and a
+                    // tail call is not told from that
+                    if b.stub(pc, Guard::None, false, jump(target, false))? {
                         stats.branch_sites += 1;
                     }
                 }

@@ -333,6 +333,31 @@ impl MachO {
         Ok(out)
     }
 
+    /// Addresses of the symbols defined in a section (`N_SECT`, debug stabs
+    /// left out), sorted; empty for a stripped file.
+    pub fn symbol_addresses(&self) -> Vec<u64> {
+        const N_STAB: u8 = 0xE0;
+        const N_TYPE: u8 = 0x0E;
+        const N_SECT: u8 = 0x0E;
+        let Some(c) = self.command(LC_SYMTAB) else {
+            return Vec::new();
+        };
+        let (symoff, nsyms) = (
+            u32_at(&c.bytes, 8).unwrap_or(0) as usize,
+            u32_at(&c.bytes, 12).unwrap_or(0) as usize,
+        );
+        let mut out: Vec<u64> = (0..nsyms)
+            .filter_map(|i| {
+                let entry = self.data.get(symoff + i * 16..symoff + i * 16 + 16)?;
+                let n_type = entry[4];
+                (n_type & N_STAB == 0 && n_type & N_TYPE == N_SECT).then(|| u64_at(entry, 8))?
+            })
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// `(addr, length, kind)` entries from `LC_DATA_IN_CODE`.
     pub fn data_in_code(&self) -> Vec<(u64, u16, u16)> {
         let Some((off, size)) = self.linkedit_data(LC_DATA_IN_CODE) else {

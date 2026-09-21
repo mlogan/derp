@@ -81,6 +81,25 @@ the log is `DIR/net/sui.log.2027-01-15` (the virtual clock's date).
 9. **`pthread_threadid_np`** of a scheduled thread is its index in the run
    (kernel thread ids are system-wide).
 
+## Build sizes and reach (2026-09-22)
+
+| build | code (`__text`) | `__TEXT` | sites hooked | unreachable |
+|---|---|---|---|---|
+| `sui` release | 106 MB | 131 MB | 2.47 M | 65 k (2.5%) |
+| `sui` release-lto (21 min) | 85 MB | 99 MB | 2.04 M | 2 |
+| `sui` debug | 291 MB | 400 MB | 368 k | 7.5 M (95%) |
+| `sui-node` debug | 180 MB | 246 MB | 1.46 M | 3.4 M (70%) |
+| `sui-node` `--profile simulator` (opt-level 1, debug assertions, 5 min) | 79 MB | 113 MB | 2.07 M | 10.6 k (0.5%) |
+
+The debug `sui` still runs and repeats (two runs of `sui start`: same
+hash, same logs), but with hooks in the last 12 MB of its code only:
+almost no preemption, so not a build to find races with. `sui-node` at
+opt-level 1 is the practical debug target. No arm64 instruction reaches
+further than a `b` in one word; for true `-O0` builds the way is room
+inside the text at link time (generated `.space` objects placed by an
+`-order_file` every 100 MB), which the rewriter would fill with
+trampolines. Not built.
+
 ## Known residual
 
 On some runs one trace line differs: the quantum expires at a different

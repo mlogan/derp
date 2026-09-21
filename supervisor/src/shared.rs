@@ -494,7 +494,6 @@ impl Shared {
         unsafe { __ulock_wake(PARK_OP, self.park_word(id), 0) };
     }
 
-    /// Sleep until thread `id`'s park word differs from `seen`.
     /// The replacement seed once the run's reseed time has passed (seed
     /// bisection). Read without the lock: it is set at a hand-off, and those
     /// who ask are scheduled threads, which run one at a time after it.
@@ -508,6 +507,7 @@ impl Shared {
         unsafe { (*state).threads[id].in_park.load(Ordering::Acquire) != 0 }
     }
 
+    /// Sleep until thread `id`'s park word differs from `seen`.
     pub fn park(&self, id: usize, seen: u32) {
         let state = self.state.get();
         let in_park = unsafe { &(*state).threads[id].in_park };

@@ -1,11 +1,12 @@
-//! Deterministic allocator behind the interposed `malloc` family. Heap
-//! layout is a function of the call sequence alone: one region at a fixed
-//! address, bump allocation, intrusive per-class free lists. libmalloc's
-//! per-CPU magazines would otherwise make addresses depend on the core a
-//! thread happened to run on.
+//! The allocator behind the interposed `malloc` family, and the
+//! supervisor's own. A guest's heap layout is a function of its call
+//! sequence and the seed: one region at a fixed address, size classes,
+//! blocks placed by a seeded stream so that pointer order varies between
+//! seeds and never within one. libmalloc's per-CPU magazines would make
+//! addresses depend on the core a thread happened to run on.
 //!
-//! Pointers outside the region (allocated before this dylib loaded, or by
-//! this dylib itself) are forwarded to the real functions.
+//! Pointers outside both regions (allocated before this dylib loaded, or by
+//! a thread the scheduler does not run) go to the real functions.
 
 use std::ffi::c_void;
 
@@ -61,7 +62,7 @@ struct Heap {
     /// from the seed (see `draw`)
     guests: bool,
     /// Seeded before the first scheduled thread allocates; None keeps the
-    /// compact layout (the supervisor's own heap, and unit tests of it)
+    /// compact layout (the supervisor's own heap)
     rng: Option<crate::rng::Rng>,
     /// Bitmap of taken slabs, mapped when the layout is seeded (an address)
     slabs: usize,

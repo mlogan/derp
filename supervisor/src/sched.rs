@@ -109,9 +109,13 @@ pub fn on_scheduled_thread() -> bool {
     key != usize::MAX && !unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) }.is_null()
 }
 
+/// A run seed made one process's own: every per-process stream starts here.
+pub fn process_seed(seed: u64, proc_index: u32) -> u64 {
+    seed.wrapping_add(u64::from(proc_index).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
 pub fn set_my_id(id: usize) {
-    let key = ID_KEY.load(Ordering::Relaxed) as libc::pthread_key_t;
-    unsafe { libc::pthread_setspecific(key, (id + 1) as *const c_void) };
+    set_identity(Some(id));
     let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
     PORTS.lock().push((port, id));
 }
@@ -128,7 +132,6 @@ extern "C" {
     fn mach_port_deallocate(task: u32, name: u32) -> i32;
 }
 
-/// Whether the thread with this Mach port is one the scheduler runs.
 /// The scheduler's id of the thread with this Mach port, if it runs it.
 pub fn scheduled_thread(port: u32) -> Option<usize> {
     PORTS
@@ -149,7 +152,7 @@ pub fn reseed_once(done: &std::sync::atomic::AtomicBool, stream: u64) -> Option<
     }
     let with = shared()?.reseeded_with()?;
     done.store(true, Ordering::Relaxed);
-    Some(with.wrapping_add(u64::from(pid()).wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ stream)
+    Some(process_seed(with, pid()) ^ stream)
 }
 
 /// Whether thread `id` is parked, as opposed to running in real time
@@ -433,11 +436,7 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     open_trace();
     load_mask();
     // Its own stream, per process; a `fork` child carries its parent's on
-    crate::alloc::seed_layout(
-        cfg.seed
-            .wrapping_add(u64::from(pid()).wrapping_mul(0x9E37_79B9_7F4A_7C15))
-            ^ 0x4845_4150_4845_4150,
-    );
+    crate::alloc::seed_layout(process_seed(cfg.seed, pid()) ^ 0x4845_4150_4845_4150);
     set_my_id(me);
     wait_for_baton(me);
 }
@@ -475,11 +474,7 @@ pub fn become_forked_child(child: u32) {
     crate::io::forked();
     crate::process::forked();
     crate::kq::forked();
-    crate::determinism::forked(
-        Config::from_env()
-            .seed
-            .wrapping_add(u64::from(child).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-    );
+    crate::determinism::forked(process_seed(Config::from_env().seed, child));
     HOOKS.store(0, Ordering::Relaxed);
     crate::io::IO_WAITS.store(0, Ordering::Relaxed);
     for c in &crate::interpose::COUNTS {

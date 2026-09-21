@@ -6,8 +6,8 @@
 //! scheduler's, in virtual time, because what ends it (socket traffic, a
 //! user event another thread triggers) comes from scheduled threads. Only a
 //! kqueue whose every registration belongs to the outside world waits in
-//! the kernel. Level-triggered, `EV_CLEAR` and
-//! `EV_ONESHOT` and `EV_DISPATCH` registrations and `EV_RECEIPT` are modelled.
+//! the kernel. Level-triggered, `EV_CLEAR`, `EV_ONESHOT` and `EV_DISPATCH`
+//! registrations are modelled, and `EV_RECEIPT`.
 //!
 //! A kqueue is not inherited by `fork`, so the child starts with an empty
 //! registry (`forked`).

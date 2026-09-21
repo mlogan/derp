@@ -94,7 +94,6 @@ impl Coordinator {
         &self.path
     }
 
-    /// Delay for traffic between different hosts, in virtual time.
     /// Seed bisection: the streams start over from `with` at time `at`.
     pub fn set_reseed(&self, at: u64, with: u64) {
         let mut s = self.shared.lock();
@@ -113,6 +112,7 @@ impl Coordinator {
         }
     }
 
+    /// Delay for traffic between different hosts, in virtual time.
     pub fn set_net_latency(&self, ns: u64) {
         self.shared.lock().net.latency_ns = ns;
     }

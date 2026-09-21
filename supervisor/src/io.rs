@@ -182,13 +182,7 @@ fn write_managed(fd: c_int, buf: *const c_void, n: usize, real: impl Fn() -> isi
     if managed(fd) {
         return write_all(fd, buf.cast(), n);
     }
-    let r = real();
-    // Also from a thread we do not schedule (a signal handler's self-pipe
-    // write lands on whichever thread the kernel chose)
-    if r > 0 && is_guest_object(fd) {
-        wake_io();
-    }
-    r
+    sent(fd, real())
 }
 
 /// Scatter read from a virtual socket: fill the buffers in order and
@@ -310,11 +304,7 @@ unsafe fn writev_managed(
         return writev_virtual(fd, sock, iov, n);
     }
     if !managed(fd) {
-        let r = real();
-        if r > 0 && is_guest_object(fd) {
-            wake_io();
-        }
-        return r;
+        return sent(fd, real());
     }
     let mut total = 0isize;
     for v in std::slice::from_raw_parts(iov, n.max(0) as usize) {

@@ -17,7 +17,7 @@ usage:
   rewrite bench [opts] <prog> [args…]  time native vs rewritten (no supervisor)
   rewrite repeat [opts] <prog> [args…] run N times; exit status, stdout and schedule hash must agree
   rewrite bisect [opts] --manifest FILE  when was the failing seed's failure decided? Replays it
-                                       with the scheduler reseeded at a virtual time, --runs
+                                       with every stream reseeded at a virtual time, --runs
                                        futures per probe (default 20), --jobs at a time (4),
                                        down to --resolution (2ms)
   rewrite suspects [opts] --manifest FILE  which loads and stores does the failing seed need?
@@ -30,8 +30,11 @@ options:
   --seed S                             run seed (default 0)
   --mem-hook-rate R                    0, 1 or a fraction like 1/16 (default 0)
   --quantum LO..HI                     hook events per quantum (default 1000..10000)
-  --reseed-at T --reseed N             from virtual time T on, the scheduler's random streams
-                                       start over from N (what bisect does at each probe)
+  --reseed-at T --reseed N             from virtual time T on, every random stream (schedule,
+                                       faults, heap layout, entropy) starts over from N: what
+                                       bisect does at each probe
+  --jobs J                             bisect, suspects: runs at a time (default 4)
+  --resolution T                       bisect: stop at an interval this short (default 2ms)
   --no-supervisor                      no scheduling: the dylib only provides the stubs' counter
   --aslr                               leave ASLR on
   --native                             run the original binary without the dylib

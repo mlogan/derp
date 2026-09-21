@@ -349,12 +349,18 @@ fn cond_wait_until(
 // Try, and wait in the scheduler for an unlock instead. Writers are not
 // preferred over readers; who gets the lock next is the scheduler's draw.
 
-extern "C" fn my_pthread_rwlock_rdlock(l: *mut libc::pthread_rwlock_t) -> c_int {
+/// Take a rwlock one way or the other: try, and wait in the scheduler for
+/// an unlock while it is busy.
+fn rwlock_wait(
+    l: *mut libc::pthread_rwlock_t,
+    real: unsafe extern "C" fn(*mut libc::pthread_rwlock_t) -> c_int,
+    attempt: unsafe extern "C" fn(*mut libc::pthread_rwlock_t) -> c_int,
+) -> c_int {
     if my_id().is_none() {
-        return unsafe { libc::pthread_rwlock_rdlock(l) };
+        return unsafe { real(l) };
     }
     loop {
-        let rc = unsafe { libc::pthread_rwlock_tryrdlock(l) };
+        let rc = unsafe { attempt(l) };
         if rc != libc::EBUSY {
             return rc;
         }
@@ -363,18 +369,20 @@ extern "C" fn my_pthread_rwlock_rdlock(l: *mut libc::pthread_rwlock_t) -> c_int 
     }
 }
 
+extern "C" fn my_pthread_rwlock_rdlock(l: *mut libc::pthread_rwlock_t) -> c_int {
+    rwlock_wait(
+        l,
+        libc::pthread_rwlock_rdlock,
+        libc::pthread_rwlock_tryrdlock,
+    )
+}
+
 extern "C" fn my_pthread_rwlock_wrlock(l: *mut libc::pthread_rwlock_t) -> c_int {
-    if my_id().is_none() {
-        return unsafe { libc::pthread_rwlock_wrlock(l) };
-    }
-    loop {
-        let rc = unsafe { libc::pthread_rwlock_trywrlock(l) };
-        if rc != libc::EBUSY {
-            return rc;
-        }
-        count(C_MUTEX);
-        sched::yield_baton(State::Blocked(l as usize), l as usize as u64);
-    }
+    rwlock_wait(
+        l,
+        libc::pthread_rwlock_wrlock,
+        libc::pthread_rwlock_trywrlock,
+    )
 }
 
 extern "C" fn my_pthread_rwlock_unlock(l: *mut libc::pthread_rwlock_t) -> c_int {

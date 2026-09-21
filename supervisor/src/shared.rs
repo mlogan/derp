@@ -10,7 +10,7 @@
 
 use std::cell::UnsafeCell;
 use std::ffi::{c_int, c_void};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::rng::Rng;
 
@@ -146,6 +146,10 @@ pub const COORD_FD: i32 = 240;
 pub const MSG_SPAWN: u8 = 1;
 pub const MSG_SPAWNED: u8 = 2;
 pub const MSG_REPORT: u8 = 3;
+/// Payload: the executable's path. Sent once a process holds the baton for
+/// the first time, so the launcher knows every process's program, a
+/// guest's own children and a new image after `execve` included.
+pub const MSG_IMAGE: u8 = 4;
 
 pub fn vpid_of(proc_index: u32) -> i32 {
     VPID_BASE + proc_index as i32
@@ -310,9 +314,13 @@ pub struct Shared {
     /// Hook events left in the quantum. The stubs decrement it without the
     /// lock: only the baton holder runs guest code.
     counter: UnsafeCell<i64>,
-    lock: AtomicU32,
+    /// `owner_word` of the holder, 0 when free
+    lock: AtomicU64,
     /// Real pid of the launcher, or 0 for a run that has none
     launcher: AtomicI32,
+    /// Wakes a signal handler could not make (see `defer_wake`): pairs of
+    /// (process index, key + 1), 0 when empty
+    deferred: [AtomicU64; 2 * DEFERRED_WAKES],
     state: UnsafeCell<State>,
 }
 
@@ -337,7 +345,23 @@ impl std::ops::DerefMut for Guard<'_> {
 
 impl Drop for Guard<'_> {
     fn drop(&mut self) {
-        self.shared.lock.store(0, Ordering::Release);
+        // Wakes a signal handler left to us, with the state consistent again
+        let sh = self.shared;
+        for i in 0..DEFERRED_WAKES {
+            let key = sh.deferred[2 * i + 1].load(Ordering::Acquire);
+            if key == 0 {
+                continue;
+            }
+            let pid = sh.deferred[2 * i].load(Ordering::Acquire) as u32;
+            sh.deferred[2 * i + 1].store(0, Ordering::Release);
+            let state = unsafe { &mut *sh.state.get() };
+            if key - 1 == DEFERRED_IO {
+                state.wake_io();
+            } else {
+                state.wake_all(pid, key - 1);
+            }
+        }
+        sh.lock.store(0, Ordering::Release);
     }
 }
 
@@ -360,6 +384,23 @@ extern "C" {
     fn __ulock_wait2(op: u32, addr: *mut c_void, value: u64, timeout_ns: u64, value2: u64)
         -> c_int;
     fn __ulock_wake(op: u32, addr: *mut c_void, wake_value: u64) -> c_int;
+    fn pthread_mach_thread_np(t: libc::pthread_t) -> u32;
+}
+
+const DEFERRED_WAKES: usize = 8;
+/// The key `defer_wake` stores for an I/O wake
+pub const DEFERRED_IO: u64 = u64::MAX - 1;
+
+/// What the lock word says of this thread: pid above, Mach thread port
+/// below. A word naming this thread is this thread inside the lock, which
+/// only a signal handler can see.
+fn owner_word() -> u64 {
+    let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
+    (unsafe { libc::getpid() } as u64) << 32 | u64::from(port)
+}
+
+fn owner_pid(word: u64) -> libc::pid_t {
+    (word >> 32) as libc::pid_t
 }
 
 const UL_COMPARE_AND_WAIT_SHARED: u32 = 3;
@@ -438,17 +479,31 @@ impl Shared {
         }
     }
 
-    /// The word holds the owner's real pid: a process killed with the lock
-    /// held (end of run, a crash) would wedge everyone, so a waiter takes it
-    /// over from a dead owner, state mid-update or not.
+    /// The word names the owner's pid and thread: a process killed with the
+    /// lock held (end of run, a crash) would wedge everyone, so a waiter
+    /// takes it over from a dead owner, state mid-update or not; and a
+    /// signal handler on the holding thread must not wait for itself.
     pub fn lock(&self) -> Guard<'_> {
-        let me = unsafe { libc::getpid() } as u32;
+        self.lock_unless_reentrant().unwrap_or_else(|| {
+            let msg = "the scheduler lock was taken again by the thread holding it";
+            unsafe { libc::write(2, msg.as_ptr().cast(), msg.len()) };
+            std::process::abort()
+        })
+    }
+
+    /// None when this thread holds the lock already: a signal handler
+    /// interrupted the critical section.
+    pub fn lock_unless_reentrant(&self) -> Option<Guard<'_>> {
+        let me = owner_word();
         let mut spins = 0u32;
         while self
             .lock
             .compare_exchange_weak(0, me, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
+            if self.lock.load(Ordering::Relaxed) == me {
+                return None;
+            }
             std::hint::spin_loop();
             spins = spins.wrapping_add(1);
             // Critical sections are microseconds long: this many spins
@@ -460,15 +515,43 @@ impl Shared {
                 self.exit_if_orphaned();
             }
         }
-        Guard { shared: self }
+        Some(Guard { shared: self })
     }
 
-    fn take_over_from_the_dead(&self, me: u32) -> bool {
+    /// A wake that a signal handler on the lock's holder cannot make now:
+    /// the holder makes it as it leaves the lock. Lost if all slots are
+    /// taken, which eight handlers deep is not.
+    pub fn defer_wake(&self, pid: u32, key: u64) {
+        for i in 0..DEFERRED_WAKES {
+            let slot = &self.deferred[2 * i + 1];
+            if slot
+                .compare_exchange(0, key.wrapping_add(1), Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.deferred[2 * i].store(u64::from(pid), Ordering::Release);
+                return;
+            }
+        }
+    }
+
+    /// Before a new image's first lock: `execve` keeps the pid and kills
+    /// the other threads, so a word naming this pid is one of them caught
+    /// inside the lock, and nothing of this image can hold it yet.
+    pub fn reclaim_after_exec(&self) {
+        let word = self.lock.load(Ordering::Relaxed);
+        if word != 0 && owner_pid(word) == unsafe { libc::getpid() } {
+            let _ = self
+                .lock
+                .compare_exchange(word, 0, Ordering::Acquire, Ordering::Relaxed);
+        }
+    }
+
+    fn take_over_from_the_dead(&self, me: u64) -> bool {
         let owner = self.lock.load(Ordering::Relaxed);
-        if owner == 0 || owner == me {
+        if owner == 0 || owner_pid(owner) == owner_pid(me) {
             return false;
         }
-        let gone = !process_lives(owner as libc::pid_t);
+        let gone = !process_lives(owner_pid(owner));
         gone && self
             .lock
             .compare_exchange(owner, me, Ordering::Acquire, Ordering::Relaxed)
@@ -1064,15 +1147,57 @@ mod tests {
                 };
                 assert_eq!(rc, 0);
             }
-            assert_eq!(sh.lock.load(Ordering::Relaxed), child as u32);
+            assert_eq!(owner_pid(sh.lock.load(Ordering::Relaxed)), child);
             let guard = sh.lock();
-            assert_eq!(sh.lock.load(Ordering::Relaxed), std::process::id());
+            assert_eq!(sh.lock.load(Ordering::Relaxed), owner_word());
             drop(guard);
             assert_eq!(sh.lock.load(Ordering::Relaxed), 0);
             if !reap_first {
                 unsafe { libc::waitpid(child, &raw mut status, 0) };
             }
         }
+    }
+
+    /// After `execve` the lock word may name our own pid: a thread of the old
+    /// image died inside the lock.
+    #[test]
+    fn a_lock_word_naming_our_own_pid_is_stale_at_start() {
+        let sh = shared_mapping();
+        // A thread of ours that is gone
+        sh.lock
+            .store(u64::from(std::process::id()) << 32 | 7, Ordering::Relaxed);
+        sh.reclaim_after_exec();
+        let guard = sh.lock();
+        assert_eq!(sh.lock.load(Ordering::Relaxed), owner_word());
+        drop(guard);
+        // Held by someone else: not ours to reclaim
+        sh.lock.store(1 << 32 | 7, Ordering::Relaxed);
+        sh.reclaim_after_exec();
+        assert_eq!(sh.lock.load(Ordering::Relaxed), 1 << 32 | 7);
+        sh.lock.store(0, Ordering::Relaxed);
+    }
+
+    /// A signal handler on the thread inside the lock: it must not wait for
+    /// itself, and a wake it wants is made when the holder lets go.
+    #[test]
+    fn the_holding_thread_sees_its_own_lock_and_defers_a_wake() {
+        let sh = shared_mapping();
+        let guard = sh.lock();
+        assert!(sh.lock_unless_reentrant().is_none());
+        // Someone to wake: a thread blocked on key 42 of process 0
+        let id = {
+            let state = unsafe { &mut *sh.state.get() };
+            let p = state.add_proc(0, NO_PROC);
+            let id = state.add_thread(p);
+            state.threads[id].state = T_BLOCKED;
+            state.threads[id].key = 42;
+            id
+        };
+        sh.defer_wake(0, 42);
+        assert_eq!(unsafe { &*sh.state.get() }.threads[id].state, T_BLOCKED);
+        drop(guard);
+        assert_eq!(unsafe { &*sh.state.get() }.threads[id].state, T_RUNNABLE);
+        assert_eq!(sh.lock.load(Ordering::Relaxed), 0);
     }
 
     #[test]

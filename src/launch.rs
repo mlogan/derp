@@ -73,6 +73,10 @@ pub struct Outcome {
     /// Raw wait status; use the helpers below
     pub status: i32,
     pub report: Report,
+    /// The executable the process ran and the original it was rewritten
+    /// from; None for a run without the supervisor
+    pub image: Option<PathBuf>,
+    pub program: Option<PathBuf>,
 }
 
 impl Outcome {
@@ -164,6 +168,10 @@ struct Tracked {
     pid: libc::pid_t,
     status: Option<i32>,
     report: String,
+    /// What it ran, once it said (`MSG_IMAGE`): the executable, and the
+    /// original that was rewritten into it
+    image: Option<PathBuf>,
+    program: Option<PathBuf>,
 }
 
 extern "C" {
@@ -297,6 +305,8 @@ impl Tracked {
             pid,
             status: None,
             report: String::new(),
+            image: None,
+            program: None,
         }
     }
 
@@ -558,6 +568,8 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
             Outcome {
                 status: c.status.unwrap_or(0),
                 report,
+                image: c.image,
+                program: c.program,
             }
         })
         .collect();
@@ -828,7 +840,13 @@ fn handle_frame(
         shared::MSG_SPAWNED if frame.payload.len() == 8 => {
             let child = u32::from_le_bytes(frame.payload[..4].try_into().unwrap()) as usize;
             let pid = i32::from_le_bytes(frame.payload[4..].try_into().unwrap());
-            track(procs, child, Tracked::new(pid, None));
+            // A fork runs the parent's program; a spawn says its own soon
+            let (image, program) = procs
+                .get(frame.proc_index as usize)
+                .map_or((None, None), |p| (p.image.clone(), p.program.clone()));
+            let mut tracked = Tracked::new(pid, None);
+            (tracked.image, tracked.program) = (image, program);
+            track(procs, child, tracked);
             if !events.watch_exit(pid, child) {
                 procs[child].status = Some(0);
                 gone.push(child);
@@ -839,6 +857,15 @@ fn handle_frame(
             if let Some(p) = procs.get_mut(frame.proc_index as usize) {
                 p.report = String::from_utf8_lossy(&frame.payload).into_owned();
             }
+        }
+        shared::MSG_IMAGE => {
+            if let Some(p) = procs.get_mut(frame.proc_index as usize) {
+                let image = PathBuf::from(std::ffi::OsStr::from_bytes(&frame.payload));
+                p.program =
+                    Some(crate::cache::original_of(&image).unwrap_or_else(|| image.clone()));
+                p.image = Some(image);
+            }
+            channel.reply(0, &[]);
         }
         other => eprintln!("rewrite: unknown frame type {other} from a guest"),
     }

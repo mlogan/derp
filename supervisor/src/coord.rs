@@ -50,6 +50,20 @@ fn read_exact(buf: &mut [u8]) -> bool {
 }
 
 /// Send a request and wait for the reply: the payload, or an errno.
+/// Tell the launcher which executable this process runs.
+pub fn announce_image() {
+    extern "C" {
+        fn _NSGetExecutablePath(buf: *mut libc::c_char, size: *mut u32) -> libc::c_int;
+    }
+    let mut buf = [0 as libc::c_char; 4096];
+    let mut size = buf.len() as u32;
+    if unsafe { _NSGetExecutablePath(buf.as_mut_ptr(), &raw mut size) } != 0 {
+        return;
+    }
+    let path = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_bytes();
+    let _ = call(shared::MSG_IMAGE, path);
+}
+
 fn call(kind: u8, payload: &[u8]) -> Result<Vec<u8>, i32> {
     if !connected() || !send(kind, payload) {
         return Err(libc::EIO);

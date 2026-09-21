@@ -3,7 +3,20 @@
 
 use std::path::{Path, PathBuf};
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use crate::macho::{self, MachO};
+
+/// Rewritten path to original, for every rewrite this process has made or
+/// found in the cache: the launcher reports a guest's program by what it
+/// ran, and that is the rewritten file.
+static ORIGINALS: Mutex<Option<HashMap<PathBuf, PathBuf>>> = Mutex::new(None);
+
+#[must_use]
+pub fn original_of(rewritten: &Path) -> Option<PathBuf> {
+    ORIGINALS.lock().ok()?.as_ref()?.get(rewritten).cloned()
+}
 use crate::rewrite::{self as rw, Options};
 
 pub type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
@@ -145,5 +158,9 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
     }
     // Also on a cache hit: the program may have gained a dSYM since
     link_debug_symbols(input, &out);
+    if let Ok(mut map) = ORIGINALS.lock() {
+        map.get_or_insert_with(HashMap::new)
+            .insert(out.clone(), input.to_path_buf());
+    }
     Ok(out)
 }

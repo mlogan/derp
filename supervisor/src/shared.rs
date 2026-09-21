@@ -146,6 +146,10 @@ pub const COORD_FD: i32 = 240;
 pub const MSG_SPAWN: u8 = 1;
 pub const MSG_SPAWNED: u8 = 2;
 pub const MSG_REPORT: u8 = 3;
+/// Payload: the executable's path. Sent once a process holds the baton for
+/// the first time, so the launcher knows every process's program, a
+/// guest's own children and a new image after `execve` included.
+pub const MSG_IMAGE: u8 = 4;
 
 pub fn vpid_of(proc_index: u32) -> i32 {
     VPID_BASE + proc_index as i32

@@ -29,6 +29,9 @@ pub struct Ending {
     pub last_status: BTreeMap<usize, String>,
     /// Which entry each process was a life of, by `p<N>`
     pub entry_of: BTreeMap<String, usize>,
+    /// What each process ran, by `p<N>`: the original program, and the
+    /// executable made from it
+    pub program_of: BTreeMap<String, (PathBuf, PathBuf)>,
     pub timed_out: bool,
 }
 
@@ -57,6 +60,12 @@ impl Ending {
                         if let Ok(entry) = value.parse() {
                             e.entry_of.insert(process.to_string(), entry);
                         }
+                    } else if let Some(process) = key.strip_suffix(".program") {
+                        let entry = e.program_of.entry(process.to_string()).or_default();
+                        entry.0 = PathBuf::from(value);
+                    } else if let Some(process) = key.strip_suffix(".image") {
+                        let entry = e.program_of.entry(process.to_string()).or_default();
+                        entry.1 = PathBuf::from(value);
                     }
                 }
             }

@@ -267,3 +267,45 @@ fn two_entries_of_one_program_share_their_sites() {
         "{text}"
     );
 }
+
+/// The racy line is in a child the guest starts, which no run-file entry
+/// names. Processes are matched to programs by what the run's report says
+/// each ran, so the child's sites are candidates like any other's.
+#[test]
+fn the_suspects_may_be_in_a_guests_own_child() {
+    have_atos();
+    let (dir, _, scratch) = setup("suspects_child");
+    common::build_c("parent_of", &dir, &[]);
+    let manifest = dir.join("child.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - parent_of lost_update\n",
+    )
+    .unwrap();
+    let seed = failing_seed(&scratch, &manifest);
+    let out = rewrite_cmd(
+        &["suspects", "--seed", &seed.to_string()],
+        &scratch,
+        &manifest,
+    )
+    .output()
+    .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let suspects: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("suspect="))
+        .collect();
+    assert!(!suspects.is_empty() && suspects.len() <= 2, "{text}");
+    for s in &suspects {
+        assert!(s.starts_with("lost_update "), "not the child's: {s}");
+        assert!(
+            s.ends_with("lost_update.c:19)"),
+            "not the racy line: {s}\n{text}"
+        );
+    }
+}

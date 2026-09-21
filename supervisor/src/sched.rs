@@ -453,12 +453,11 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     open_trace();
     load_mask();
     // Its own stream, per process; a `fork` child carries its parent's on
-    crate::alloc::seed_layout(
-        process_seed(cfg.seed, pid()),
-        cfg.heap_size,
-    );
+    crate::alloc::seed_layout(process_seed(cfg.seed, pid()), cfg.heap_size);
     set_my_id(me);
     wait_for_baton(me);
+    // With the baton: only its holder talks to the launcher
+    crate::coord::announce_image();
 }
 
 /// In the child of a `fork`: become process `child`, whose main thread the

@@ -85,7 +85,9 @@ same host directory; what it needs to remember it has to have written
 there. Its captured stdout continues in the same file. `on-failure` means a
 signal or a non-zero exit. The run's exit status is that of each entry's
 last life. The report counts `run.crashes_injected` and `run.restarts`,
-and `p<i>.entry` says which run-file entry process `i` was a life of.
+and `p<i>.entry` says which run-file entry process `i` was a life of;
+`p<i>.program` and `p<i>.image` say what it ran, children a guest started
+included.
 
 `restart-delay` may not be zero, and it and `max-restarts` need a restart
 policy. Only run-file entries are restarted, not a guest's own children. A

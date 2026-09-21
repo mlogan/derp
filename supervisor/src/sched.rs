@@ -417,6 +417,7 @@ pub fn init(info: Option<Info>, cfg: &Config) {
         }
         Err(_) => start_private_run(cfg),
     };
+    load_mask();
     unsafe { scheduler_slot().write(rewrite_scheduler_yield as *const () as usize) };
     SHARED.store(std::ptr::from_ref(sh).cast_mut(), Ordering::Relaxed);
     // Its own stream, per process; a `fork` child carries its parent's on
@@ -455,6 +456,7 @@ pub fn become_forked_child(child: u32) {
     // of the parent may have been inside `set_my_id` at the fork.
     PORTS.force_unlock();
     PORTS.lock().clear();
+    MASK.force_unlock();
     crate::alloc::forked();
     crate::hostfs::forked();
     crate::signals::forked();
@@ -811,8 +813,79 @@ pub fn hook_event(site: u64) {
 
 /// Called from the stub's expired path through the register-saving
 /// trampoline, with the guest's registers already preserved.
+/// Return addresses of the stubs at which a switch may not happen, sorted,
+/// as they are in the file (before any slide). See `load_mask`.
+static MASK: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+static MASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SLIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+extern "C" {
+    fn _dyld_get_image_vmaddr_slide(index: u32) -> isize;
+    fn _dyld_image_count() -> u32;
+    fn _dyld_get_image_header(index: u32) -> *const u32;
+    fn _NSGetExecutablePath(buf: *mut libc::c_char, size: *mut u32) -> libc::c_int;
+}
+
+/// `REWRITE_MASK=<file>` with lines `<program> <return address>`: the hook
+/// sites of this program where the quantum may not end. Site minimisation
+/// uses it to ask whether a failure needs a switch at a given load or
+/// store. Every stub still counts, so a run that never expires at a masked
+/// site is the unmasked run.
+/// Word of a Mach-O header that holds the file type, and an executable's
+const FILETYPE: usize = 3;
+const MH_EXECUTE: u32 = 2;
+
+fn load_mask() {
+    let Ok(path) = std::env::var("REWRITE_MASK") else {
+        return;
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let mut buf = [0 as libc::c_char; 4096];
+    let mut size = buf.len() as u32;
+    if unsafe { _NSGetExecutablePath(buf.as_mut_ptr(), &raw mut size) } != 0 {
+        return;
+    }
+    let exe = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
+    let file = exe.rsplit('/').next().unwrap_or_default();
+    // The rewritten copy is `<program>.rw<version>-<key>`
+    let program = file.split_once(".rw").map_or(file, |(name, _)| name);
+    let mut pcs: Vec<u64> = text
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(name, _)| *name == program)
+        .filter_map(|(_, pc)| u64::from_str_radix(pc, 16).ok())
+        .collect();
+    pcs.sort_unstable();
+    MASKED.store(!pcs.is_empty(), Ordering::Relaxed);
+    *MASK.lock() = pcs;
+    // The executable is not image 0 when a library was inserted ahead of it
+    let slide = (0..unsafe { _dyld_image_count() })
+        .find(|&i| unsafe {
+            let header = _dyld_get_image_header(i);
+            !header.is_null() && *header.add(FILETYPE) == MH_EXECUTE
+        })
+        .map_or(0, |i| unsafe { _dyld_get_image_vmaddr_slide(i) });
+    SLIDE.store(slide as u64, Ordering::Relaxed);
+}
+
+fn masked(stub_pc: u64) -> bool {
+    MASKED.load(Ordering::Relaxed)
+        && MASK
+            .lock()
+            .binary_search(&stub_pc.wrapping_sub(SLIDE.load(Ordering::Relaxed)))
+            .is_ok()
+}
+
 #[no_mangle]
 pub extern "C" fn rewrite_yield_impl(stub_pc: u64) {
+    if masked(stub_pc) {
+        // Not here: one more event, so the switch falls on the next hook
+        settle_hooks();
+        install_quantum(1);
+        return;
+    }
     with(|s, _| s.expiries += 1);
     if my_id().is_some() {
         yield_baton(State::Runnable, stub_pc);

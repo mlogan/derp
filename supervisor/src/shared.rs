@@ -468,6 +468,14 @@ impl Shared {
     }
 
     /// Sleep until thread `id`'s park word differs from `seen`.
+    /// The replacement seed once the run's reseed time has passed (seed
+    /// bisection). Read without the lock: it is set at a hand-off, and those
+    /// who ask are scheduled threads, which run one at a time after it.
+    pub fn reseeded_with(&self) -> Option<u64> {
+        let state = self.state.get();
+        unsafe { (*state).reseeded.then(|| (*state).reseed_with) }
+    }
+
     pub fn is_parked(&self, id: usize) -> bool {
         let state = self.state.get();
         unsafe { (*state).threads[id].in_park.load(Ordering::Acquire) != 0 }

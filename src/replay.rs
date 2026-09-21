@@ -116,6 +116,7 @@ impl Replay {
             .arg(&self.manifest)
             .env("REWRITE_MASK", &mask_path)
             .env("REWRITE_TRACE", &trace)
+            .env("REWRITE_EXIT_WITH_PARENT", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()

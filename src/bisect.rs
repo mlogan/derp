@@ -29,6 +29,7 @@ pub struct Config {
 #[derive(Debug)]
 pub struct Probe {
     pub at_ns: u64,
+    pub runs: u32,
     pub failed: u32,
     /// Futures that failed some other way, or hung
     pub otherwise: u32,
@@ -43,13 +44,17 @@ pub struct Found {
     pub lo_ns: u64,
     pub hi_ns: u64,
     pub trace: Vec<String>,
+    /// The endpoints measured again with other futures disagree
+    pub unsure: bool,
 }
 
-/// `cfg.runs` futures from time `at`: how many end as the reference did.
-fn probe(cfg: &Config, reference: &Ending, at: u64) -> Probe {
-    let endings = fan_out(cfg.jobs, cfg.runs as usize, |slot, k| {
-        // Replacement seeds differ per probe as well: no future twice
-        let with = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (k as u64 + 1);
+/// `runs` futures from time `at`: how many end as the reference did.
+/// `round` picks another set of replacement seeds for the same time.
+fn probe(cfg: &Config, reference: &Ending, at: u64, runs: u32, round: u64) -> Probe {
+    let endings = fan_out(cfg.jobs, runs as usize, |slot, k| {
+        let with = at.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ round.wrapping_mul(0xD1B5_4A32_D192_ED03)
+            ^ (k as u64 + 1);
         let extra = [
             "--reseed-at".into(),
             format!("{at}ns"),
@@ -65,9 +70,24 @@ fn probe(cfg: &Config, reference: &Ending, at: u64) -> Probe {
         .count() as u32;
     Probe {
         at_ns: at,
+        runs,
         failed,
         otherwise,
     }
+}
+
+fn say(p: &Probe, what: &str) -> String {
+    let other = if p.otherwise > 0 {
+        format!(", {} end some other way", p.otherwise)
+    } else {
+        String::new()
+    };
+    format!(
+        "probe {:>12}: {:>3} of {} fail{other}  {what}",
+        ms(p.at_ns),
+        p.failed,
+        p.runs
+    )
 }
 
 /// # Errors
@@ -96,20 +116,8 @@ pub fn bisect(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Found,
         ms(reference.failure_at)
     ));
 
-    let say = |p: &Probe, what: &str| {
-        let other = if p.otherwise > 0 {
-            format!(", {} end some other way", p.otherwise)
-        } else {
-            String::new()
-        };
-        format!(
-            "probe {:>12}: {:>3} of {} fail{other}  {what}",
-            ms(p.at_ns),
-            p.failed,
-            cfg.runs
-        )
-    };
-    let base = probe(cfg, &reference, 1);
+    // Reseeded before the first hand-off: nothing of the reference is left
+    let base = probe(cfg, &reference, 0, cfg.runs, 0);
     progress(&format!(
         "base rate: {} of {} futures from the start fail the same way",
         base.failed, cfg.runs
@@ -121,26 +129,38 @@ pub fn bisect(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Found,
             base.failed, cfg.runs
         ));
     }
+    // The nearer the base rate is to certainty, the less a probe tells
+    let runs = cfg.runs
+        * match base.failed * 4 / cfg.runs {
+            0 => 1,
+            1 => 2,
+            _ => 4,
+        };
+    if runs > cfg.runs {
+        progress(&format!("the base rate is high: {runs} futures per probe"));
+    }
+    let base_failed = base.failed * runs / cfg.runs;
     // Halfway between what any run does and certainty
-    let threshold = (base.failed + cfg.runs).div_ceil(2);
+    let threshold = (base_failed + runs).div_ceil(2);
+    let decided = |p: &Probe| p.failed >= threshold;
 
     // Is it decided at all before the process dies?
     let resolution = cfg.resolution_ns.max(1);
-    let end = reference.failure_at.saturating_sub(resolution).max(1);
-    let last = probe(cfg, &reference, end);
+    let end = reference.failure_at.saturating_sub(resolution);
+    let last = probe(cfg, &reference, end, runs, 0);
     let mut probes = Vec::new();
     let (mut lo, mut lo_failed, mut hi, mut hi_failed);
-    if last.failed >= threshold {
+    if decided(&last) {
         progress(&say(&last, "decided by then"));
-        (lo, lo_failed, hi, hi_failed) = (1, base.failed, end, Some(last.failed));
+        (lo, lo_failed, hi, hi_failed) = (0, base_failed, end, Some(last.failed));
     } else {
         progress(&say(&last, "still open"));
         (lo, lo_failed, hi, hi_failed) = (end, last.failed, reference.failure_at, None);
     }
     probes.push(last);
     while hi - lo > resolution {
-        let p = probe(cfg, &reference, lo + (hi - lo) / 2);
-        if p.failed >= threshold {
+        let p = probe(cfg, &reference, lo + (hi - lo) / 2, runs, 0);
+        if decided(&p) {
             progress(&say(&p, "decided by then"));
             (hi, hi_failed) = (p.at_ns, Some(p.failed));
         } else {
@@ -149,16 +169,40 @@ pub fn bisect(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Found,
         }
         probes.push(p);
     }
+
+    // A wrong turn anywhere leaves an interval whose ends do not hold up:
+    // measure them again with futures not used before
+    let mut unsure = false;
+    for (at, expect) in [(lo, false), (hi, true)] {
+        if (at == 0 && !expect) || (at == hi && hi_failed.is_none()) {
+            continue;
+        }
+        let again = probe(cfg, &reference, at, runs, 1);
+        let holds = decided(&again) == expect;
+        progress(&say(
+            &again,
+            if holds {
+                "again, agrees"
+            } else {
+                "again, DISAGREES"
+            },
+        ));
+        unsure |= !holds;
+        probes.push(again);
+    }
+
     let after = hi_failed.map_or_else(
         || "it is only decided as the process dies".to_string(),
         |n| format!("{n} after"),
     );
     progress(&format!(
-        "the failure is decided between {} and {} ({lo_failed} of {} fail before, {after})",
+        "the failure is decided between {} and {} ({lo_failed} of {runs} fail before, {after})",
         ms(lo),
         ms(hi),
-        cfg.runs
     ));
+    if unsure {
+        progress("the step is not sharp at this many futures: try more --runs");
+    }
 
     let trace = trace_lines(&cfg.replay.trace_path(0))
         .into_iter()
@@ -172,5 +216,6 @@ pub fn bisect(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Found,
         lo_ns: lo,
         hi_ns: hi,
         trace,
+        unsure,
     })
 }

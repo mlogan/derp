@@ -173,14 +173,17 @@ fn bisection_replays_the_run_file_as_run_does() {
     common::build_c("latent", &dir, &[]);
     common::build_c("sleeper", &dir, &[]);
     let manifest = dir.join("daemon.yaml");
+    let settings = "quantum: 1000..9000\n";
     let with_daemon = "hosts:\n  - name: a\n    processes:\n      - latent\n\
                        \x20     - argv: [sleeper, \"100000\", \"1000\"]\n        daemon: true\n";
-    std::fs::write(&manifest, with_daemon).unwrap();
+    std::fs::write(&manifest, format!("{settings}{with_daemon}")).unwrap();
     let scratch = dir.join("scratch");
     let seed = failing_seed(&scratch, &manifest);
 
-    // The seed from the file, none on the command line
-    std::fs::write(&manifest, format!("seed: {seed}\n{with_daemon}")).unwrap();
+    // The seed and quantum from the file, none on the command line
+    std::fs::write(&manifest, format!("seed: {seed}\n{settings}{with_daemon}")).unwrap();
+    let plain = rewrite(&["run", "--capture"], &scratch, &manifest);
+    let plain = common::report_fields(&String::from_utf8_lossy(&plain.stderr));
     let out = rewrite(&["bisect"], &scratch, &manifest);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();
     assert!(
@@ -194,12 +197,71 @@ fn bisection_replays_the_run_file_as_run_does() {
     );
     let f = common::report_fields(&text);
     let num = |k: &str| f[k].parse::<u64>().unwrap();
+    // The same run: the plain run's failure, to the nanosecond
+    assert_eq!(f["bisect.failure_at_ns"], plain["run.failure_at"], "{text}");
     assert!(num("bisect.failure_at_ns") > 100_000_000, "{text}");
     assert!(
         num("bisect.hi_ns") < num("bisect.failure_at_ns") / 2,
         "{text}"
     );
     assert!(num("bisect.probes") >= 5, "{text}");
+}
+
+/// A tool that is killed takes its runs, and their guests, with it.
+#[test]
+fn a_killed_tool_leaves_no_run_behind() {
+    let dir = common::scratch_dir("bisect_killed");
+    // A name no other test's guests have
+    let exe = common::build_c("latent", &dir, &[]);
+    let own = dir.join("latent_of_a_killed_tool");
+    std::fs::copy(&exe, &own).unwrap();
+    let manifest = dir.join("killed.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - latent_of_a_killed_tool\n",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let seed = failing_seed(&scratch, &manifest);
+    let mut tool = common::rewrite_cmd(
+        &["bisect", "--runs", "400", "--seed", &seed.to_string()],
+        &[],
+        &scratch,
+        &manifest,
+    )
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null())
+    .spawn()
+    .unwrap();
+    let running = || {
+        Command::new("pgrep")
+            .args(["-f", "latent_of_a_killed_tool"])
+            .output()
+            .is_ok_and(|o| !o.stdout.is_empty())
+    };
+    let began = std::time::Instant::now();
+    while !running() {
+        assert!(began.elapsed().as_secs() < 30, "no run started");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    tool.kill().unwrap();
+    tool.wait().unwrap();
+    let began = std::time::Instant::now();
+    while running() {
+        if began.elapsed().as_secs() >= 10 {
+            let ps = Command::new("ps")
+                .args(["-axo", "pid,ppid,stat,command"])
+                .output()
+                .unwrap();
+            let left: Vec<String> = String::from_utf8_lossy(&ps.stdout)
+                .lines()
+                .filter(|l| l.contains("latent_of_a_killed") || l.contains("killed.yaml"))
+                .map(str::to_string)
+                .collect();
+            panic!("runs outlived their tool: {left:#?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Failures decided by a draw from a per-process stream, not by the

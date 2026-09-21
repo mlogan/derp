@@ -298,11 +298,7 @@ extern "C" fn my_pthread_cond_timedwait(
     };
     count(C_COND);
     // The deadline is absolute on the (virtual) realtime clock
-    let abs = unsafe {
-        ((*ts).tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add((*ts).tv_nsec as u64)
-    };
+    let abs = unsafe { sched::timespec_ns(ts) };
     let deadline = abs.saturating_sub(crate::determinism::REALTIME_BASE_NS);
     cond_wait_until(c, m, me, deadline)
 }
@@ -317,11 +313,7 @@ extern "C" fn my_pthread_cond_timedwait_relative_np(
         return unsafe { pthread_cond_timedwait_relative_np(c, m, ts) };
     };
     count(C_COND);
-    let rel = unsafe {
-        ((*ts).tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add((*ts).tv_nsec as u64)
-    };
+    let rel = unsafe { sched::timespec_ns(ts) };
     cond_wait_until(c, m, me, sched::now().saturating_add(rel))
 }
 
@@ -457,25 +449,19 @@ fn unfair_owner(value: u64) -> Option<usize> {
     sched::scheduled_thread(owner).or_else(|| sched::scheduled_thread(owner | 3))
 }
 
-/// A contended unfair lock. Who holds it decides what the wait is:
-/// - a thread outside the schedule: the kernel's wait, which its unlock ends;
-/// - one of ours that is parked: it holds the lock until it runs again, so
-///   the baton goes on;
-/// - one of ours that is running in real time without the baton (starting
-///   up, or between a hand-off and its park, inside the system libraries):
-///   it lets go by itself in a moment. Whether we caught it holding the
-///   lock is real-time luck and must not show in the schedule, so that is
-///   waited out in the kernel as well.
+/// A contended unfair lock, as the baton holder sees it: an owner that is
+/// parked holds it until it runs again, so the baton goes on; any other
+/// owner lets go in real time, which must not show in the schedule.
 fn unfair_wait(op: u32, addr: *mut c_void, value: u64, real: impl Fn() -> c_int) -> c_int {
     const LOOK_AGAIN_NS: u64 = 1_000_000;
+    // A running owner of ours blocked on something a parked thread holds
+    // would never let go
+    const GIVE_UP_AFTER: u32 = 30_000;
     let wide = ulock_is_wide(op);
-    // Only the baton holder's waits are the schedule's business. Another of
-    // our threads gets here from the system libraries (the allocator's own
-    // lock, say) while it starts up or after it has handed the baton on.
     if !sched::baton_is_mine() {
         return real();
     }
-    loop {
+    for _ in 0..GIVE_UP_AFTER {
         match unfair_owner(value) {
             None => return real(),
             Some(owner) if sched::is_parked(owner) => {
@@ -497,6 +483,10 @@ fn unfair_wait(op: u32, addr: *mut c_void, value: u64, real: impl Fn() -> c_int)
             }
         }
     }
+    sched::fatal(
+        "an os_unfair_lock held by a running thread of ours was not released in 30 s \
+         (is its owner waiting for a parked thread?)",
+    )
 }
 
 extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int {
@@ -707,11 +697,7 @@ extern "C" fn my_nanosleep(req: *const libc::timespec, rem: *mut libc::timespec)
         return unsafe { libc::nanosleep(req, rem) };
     }
     count(C_YIELD);
-    let ns = unsafe {
-        ((*req).tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add((*req).tv_nsec as u64)
-    };
+    let ns = unsafe { sched::timespec_ns(req) };
     sleep_ns(ns);
     if !rem.is_null() {
         unsafe {

@@ -193,6 +193,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 cli.reseed = take_value(&mut args)?
                     .parse()
                     .map_err(|_| "bad reseed value")?;
+                cli.given.push("reseed");
             }
             "--no-supervisor" => cli.supervisor = false,
             "--aslr" => cli.disable_aslr = false,
@@ -207,6 +208,9 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         args.remove(0);
     }
     cli.rest = args;
+    if cli.given.contains(&"reseed") && cli.reseed_at.is_none() {
+        return Err("--reseed needs --reseed-at: from when?".into());
+    }
     Ok(cli)
 }
 
@@ -482,6 +486,12 @@ fn replay_of(
     cli: &Cli,
     tool: &str,
 ) -> Fallible<(Cli, manifest::Manifest, rewrite::replay::Replay)> {
+    if cli.native || !cli.supervisor || !cli.disable_aslr {
+        return Err(format!(
+            "{tool} replays supervised runs: --native, --no-supervisor and --aslr do not apply"
+        )
+        .into());
+    }
     let path = cli.manifest.clone().unwrap();
     let m = manifest::parse(&std::fs::read_to_string(&path)?)?;
     let cli = with_run_file_settings(cli, &m)?;
@@ -560,22 +570,8 @@ fn suspects(cli: &Cli) -> Fallible<()> {
         found.runs
     );
     for s in &found.suspects {
-        println!(
-            "  {} {:#x} {:<5} {}",
-            s.program,
-            s.addr,
-            s.kind.name(),
-            s.location
-        );
-    }
-    for s in &found.suspects {
-        println!(
-            "suspect={} {:#x} {} {}",
-            s.program,
-            s.addr,
-            s.kind.name(),
-            s.location
-        );
+        let (program, kind) = (&s.program, s.kind.name());
+        println!("suspect={program} {:#x} {kind} {}", s.addr, s.location);
     }
     Ok(())
 }
@@ -728,7 +724,24 @@ fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
     result
 }
 
+/// Set by `bisect` and `suspects` on the runs they start: a run whose tool
+/// has gone is of no use, and its guests follow it out (`exit_if_orphaned`).
+const EXIT_WITH_PARENT: &str = "REWRITE_EXIT_WITH_PARENT";
+
 fn main() -> ExitCode {
+    if std::env::var_os(EXIT_WITH_PARENT).is_some() {
+        let parent = unsafe { libc::getppid() };
+        // Already adopted by launchd: the tool died before we got here
+        if parent == 1 {
+            unsafe { libc::_exit(1) };
+        }
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if unsafe { libc::getppid() } != parent {
+                unsafe { libc::_exit(1) };
+            }
+        });
+    }
     let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
     if args.is_empty() {
         return fail(USAGE);

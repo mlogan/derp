@@ -116,6 +116,16 @@ pub fn on_scheduled_thread() -> bool {
     key != usize::MAX && !unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) }.is_null()
 }
 
+/// A `timespec` as nanoseconds, saturating.
+///
+/// # Safety
+/// `ts` must point to a valid `timespec`.
+pub unsafe fn timespec_ns(ts: *const libc::timespec) -> u64 {
+    ((*ts).tv_sec.max(0) as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add((*ts).tv_nsec.max(0) as u64)
+}
+
 /// A run seed made one process's own: every per-process stream starts here.
 pub fn process_seed(seed: u64, proc_index: u32) -> u64 {
     seed.wrapping_add(u64::from(proc_index).wrapping_mul(0x9E37_79B9_7F4A_7C15))
@@ -151,15 +161,15 @@ pub fn scheduled_thread(port: u32) -> Option<usize> {
 /// Seed bisection reseeds every random stream at a virtual time. The
 /// scheduler's own are swapped in the shared state; a process's streams
 /// (heap layout, entropy) are its own, and each asks here before it draws.
-/// `done` is the stream's note that it has switched. The answer differs
-/// per process and, through `stream`, per stream.
-pub fn reseed_once(done: &std::sync::atomic::AtomicBool, stream: u64) -> Option<u64> {
+/// `done` is the stream's note that it has switched. The answer is the
+/// process's own; each stream mixes in its constant.
+pub fn reseed_once(done: &std::sync::atomic::AtomicBool) -> Option<u64> {
     if done.load(Ordering::Relaxed) {
         return None;
     }
     let with = shared()?.reseeded_with()?;
     done.store(true, Ordering::Relaxed);
-    Some(process_seed(with, pid()) ^ stream)
+    Some(process_seed(with, pid()))
 }
 
 /// Whether thread `id` is parked, as opposed to running in real time
@@ -335,7 +345,7 @@ fn scheduler_slot() -> *mut usize {
     (shared::STUB_BASE + shared::SLOT_OFFSET as usize) as *mut usize
 }
 
-fn fatal(msg: &str) -> ! {
+pub fn fatal(msg: &str) -> ! {
     crate::report::log(msg);
     std::process::abort();
 }
@@ -444,7 +454,7 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     load_mask();
     // Its own stream, per process; a `fork` child carries its parent's on
     crate::alloc::seed_layout(
-        process_seed(cfg.seed, pid()) ^ 0x4845_4150_4845_4150,
+        process_seed(cfg.seed, pid()),
         cfg.heap_size,
     );
     set_my_id(me);
@@ -477,7 +487,6 @@ pub fn become_forked_child(child: u32) {
     // of the parent may have been inside `set_my_id` at the fork.
     PORTS.force_unlock();
     PORTS.lock().clear();
-    MASK.force_unlock();
     crate::alloc::forked();
     crate::hostfs::forked();
     crate::signals::forked();
@@ -851,12 +860,12 @@ pub fn hook_event(site: u64) {
     }
 }
 
-/// Return addresses, as loaded, of this program's stubs at which a quantum
-/// may not end (`REWRITE_MASK`, lines of `<program> <address in the file>`).
-/// Site minimisation asks with it whether a failure needs a switch at a
-/// given site. Every stub still counts, so a run that never expires at a
-/// masked site is the unmasked run. Sorted; empty without a mask.
-static MASK: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+/// Sorted return addresses, as loaded, of this program's stubs at which a
+/// quantum may not end (`REWRITE_MASK`: `<program> <address in the file>`).
+/// Every stub still counts, so a run that never expires at a masked site is
+/// the unmasked run. Set before any hook can expire; read without a lock,
+/// since an expiry may come inside a signal handler.
+static MASK: std::sync::OnceLock<Box<[u64]>> = std::sync::OnceLock::new();
 /// Expiries deferred in a row. A loop of nothing but masked stubs would
 /// otherwise keep the baton for ever.
 static DEFERRED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -904,11 +913,14 @@ fn load_mask() {
         .map(|pc| pc.wrapping_add(slide))
         .collect();
     pcs.sort_unstable();
-    *MASK.lock() = pcs;
+    let _ = MASK.set(pcs.into_boxed_slice());
 }
 
 fn masked(stub_pc: u64) -> bool {
-    if MASK.lock().binary_search(&stub_pc).is_err() {
+    if MASK
+        .get()
+        .is_none_or(|m| m.binary_search(&stub_pc).is_err())
+    {
         DEFERRED.store(0, Ordering::Relaxed);
         return false;
     }

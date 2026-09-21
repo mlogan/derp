@@ -32,6 +32,14 @@ fn failing_seed(scratch: &Path, manifest: &Path) -> u64 {
 
 use common::report_fields as fields;
 
+/// `atos` comes with the command line tools that build the test programs
+fn have_atos() {
+    assert!(
+        Command::new("atos").arg("-h").output().is_ok(),
+        "atos is missing: install the Xcode command line tools"
+    );
+}
+
 #[test]
 fn the_site_table_names_every_hooked_instruction() {
     let dir = common::scratch_dir("suspects_table");
@@ -140,10 +148,7 @@ fn a_mask_moves_switches_and_nothing_else() {
 
 #[test]
 fn the_suspects_are_on_the_racy_line() {
-    if Command::new("atos").arg("-h").output().is_err() {
-        eprintln!("skipped: no atos");
-        return;
-    }
+    have_atos();
     let (_, manifest, scratch) = setup("suspects_race");
     let seed = failing_seed(&scratch, &manifest);
     let out = rewrite_cmd(
@@ -189,10 +194,7 @@ fn the_suspects_are_on_the_racy_line() {
 /// the answer is inside the function called between the read and the write.
 #[test]
 fn a_failure_that_needs_no_memory_switch_is_traced_to_a_branch_or_call() {
-    if Command::new("atos").arg("-h").output().is_err() {
-        eprintln!("skipped: no atos");
-        return;
-    }
+    have_atos();
     let dir = common::scratch_dir("suspects_latent");
     common::build_c("latent", &dir, &["-g"]);
     let manifest = dir.join("latent.yaml");
@@ -233,10 +235,7 @@ fn a_failure_that_needs_no_memory_switch_is_traced_to_a_branch_or_call() {
 /// program, and the site is a suspect once.
 #[test]
 fn two_entries_of_one_program_share_their_sites() {
-    if Command::new("atos").arg("-h").output().is_err() {
-        eprintln!("skipped: no atos");
-        return;
-    }
+    have_atos();
     let (dir, _, scratch) = setup("suspects_twice");
     let manifest = dir.join("twice.yaml");
     std::fs::write(

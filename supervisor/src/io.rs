@@ -336,9 +336,8 @@ fn close_managed(fd: c_int, real: impl Fn() -> c_int) -> c_int {
     if fd == shared::COORD_FD && crate::coord::connected() {
         return 0;
     }
-    if my_id().is_some() {
-        crate::kq::closed(fd);
-    }
+    // Whoever closes it: a stale entry would stand in for a new kqueue
+    crate::kq::closed(fd);
     if let Some(sock) = crate::net::lookup(fd) {
         let rc = real();
         if rc == 0 {

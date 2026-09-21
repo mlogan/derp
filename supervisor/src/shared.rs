@@ -280,9 +280,9 @@ pub struct State {
     /// Crash times come from their own stream, so that adding faults to a
     /// run does not shift the choice of threads
     fault_rng: Rng,
-    /// Seed bisection: at the first hand-off at or after this virtual time
-    /// (0: never) the scheduler's streams start over from `reseed_with`.
-    /// Until then the run is the plain run of its seed.
+    /// Seed bisection: one more than the virtual time (0: never) from whose
+    /// first hand-off on every stream starts over from `reseed_with`. Until
+    /// then the run is the plain run of its seed.
     pub reseed_at: u64,
     pub reseed_with: u64,
     pub reseeded: bool,
@@ -438,12 +438,9 @@ impl Shared {
         }
     }
 
-    /// The lock word holds its owner's real pid. A process can be killed
-    /// with the lock held (the launcher kills what is left at the end of a
-    /// run; a crash is a `SIGKILL`), and a lock nobody can release would
-    /// wedge everyone, the launcher included. A waiter that finds the owner
-    /// gone takes the lock over. The state may be mid-update then; the
-    /// alternative is a run that never ends.
+    /// The word holds the owner's real pid: a process killed with the lock
+    /// held (end of run, a crash) would wedge everyone, so a waiter takes it
+    /// over from a dead owner, state mid-update or not.
     pub fn lock(&self) -> Guard<'_> {
         let me = unsafe { libc::getpid() } as u32;
         let mut spins = 0u32;
@@ -865,7 +862,7 @@ impl State {
     /// Deadlines that have passed are handled before the choice; when
     /// nothing is runnable the clock jumps to the earliest deadline.
     fn pick(&mut self) -> Option<usize> {
-        if self.reseed_at != 0 && !self.reseeded && self.clock_ns >= self.reseed_at {
+        if self.reseed_at != 0 && !self.reseeded && self.clock_ns + 1 >= self.reseed_at {
             self.reseeded = true;
             self.rng = Rng::seed_from_u64(self.reseed_with);
             self.fault_rng = Rng::seed_from_u64(self.reseed_with ^ 0xFA17_FA17_FA17_FA17);

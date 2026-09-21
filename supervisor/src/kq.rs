@@ -394,8 +394,7 @@ pub unsafe extern "C" fn my_kevent(
         return 0;
     }
     let out = std::slice::from_raw_parts_mut(events, nevents as usize);
-    let timeout_ns = (!timeout.is_null())
-        .then(|| (*timeout).tv_sec as u64 * 1_000_000_000 + (*timeout).tv_nsec as u64);
+    let timeout_ns = (!timeout.is_null()).then(|| sched::timespec_ns(timeout));
     let deadline = timeout_ns.map(|t| sched::now() + t);
     loop {
         let mut n = {
@@ -415,6 +414,16 @@ pub unsafe extern "C" fn my_kevent(
                 &raw const zero,
             );
             if got > 0 {
+                // A one-shot registration that fired is gone from the kernel
+                let fired = &out[n..n + got as usize];
+                if fired.iter().any(|e| e.flags & libc::EV_ONESHOT != 0) {
+                    let mut kqs = KQS.lock();
+                    if let Some(k) = kqs.0.iter_mut().find(|k| k.fds.contains(&kq)) {
+                        for e in fired.iter().filter(|e| e.flags & libc::EV_ONESHOT != 0) {
+                            k.external.retain(|&x| x != (e.ident, e.filter));
+                        }
+                    }
+                }
                 n += got as usize;
             }
         }

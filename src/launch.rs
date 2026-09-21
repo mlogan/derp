@@ -201,7 +201,7 @@ fn spawn(
     // The supervisor's own debugging switches, which a guest that does not
     // inherit our environment would otherwise never see
     if !run.inherit_env {
-        for name in ["REWRITE_TRACE", "REWRITE_PARK_SPINS", "REWRITE_MASK"] {
+        for name in ["REWRITE_PARK_SPINS"] {
             if let Ok(value) = std::env::var(name) {
                 env.push(CString::new(format!("{name}={value}")).unwrap());
             }
@@ -697,6 +697,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     }
     if let Some(c) = coord {
         c.set_net_latency(run.net_latency_ns);
+        c.set_debug_paths();
         if let Some((at, with)) = run.reseed {
             c.set_reseed(at, with);
         }
@@ -779,6 +780,9 @@ fn supervise_started(
             let status = procs[index].status.unwrap_or(0);
             let restarting = coord.is_some_and(|c| c.will_restart(index as u32, status));
             if !restarting && only_daemons_left(run, procs) {
+                if let Some(coord) = coord {
+                    coord.note_last_death(index as u32);
+                }
                 end_run(procs);
                 break;
             }

@@ -459,46 +459,81 @@ fn failed_life(o: &RunOutcome) -> Option<(usize, usize)> {
         .find(|&(_, life)| o.guests[life].exit_code() != Some(0))
 }
 
-/// `rewrite suspects`: the loads and stores a failing seed needs.
-fn suspects(cli: &Cli) -> Fallible<()> {
+/// The run a tool replays: the command line laid over the run file's own
+/// settings, spelled out in full so that every replay is that run.
+fn replay_of(
+    cli: &Cli,
+    tool: &str,
+) -> Fallible<(Cli, manifest::Manifest, rewrite::replay::Replay)> {
     let path = cli.manifest.clone().unwrap();
     let m = manifest::parse(&std::fs::read_to_string(&path)?)?;
-    let cli = &with_run_file_settings(cli, &m)?;
+    let cli = with_run_file_settings(cli, &m)?;
+    let pass = vec![
+        "--seed".to_string(),
+        cli.opts.seed.to_string(),
+        "--quantum".to_string(),
+        format!("{}..{}", cli.quantum.0, cli.quantum.1),
+        "--mem-hook-rate".to_string(),
+        format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
+        "--net-latency".to_string(),
+        format!("{}ns", cli.net_latency_ns),
+    ];
+    let replay = rewrite::replay::Replay {
+        manifest: path,
+        dir: scratch_dir(&cli).join(tool),
+        pass,
+        // Until the reference run has shown how long a run takes
+        timeout: std::time::Duration::from_mins(10),
+    };
+    Ok((cli, m, replay))
+}
+
+/// `rewrite suspects`: the loads and stores a failing seed needs.
+fn suspects(cli: &Cli) -> Fallible<()> {
+    let (cli, m, replay) = replay_of(cli, "suspects")?;
     if cli.opts.mem_rate.0 == 0 {
         return Err("no loads or stores are hooked: give --mem-hook-rate".into());
     }
-    let base = path.parent().unwrap_or(Path::new("."));
-    let mut programs = Vec::new();
+    let base = replay
+        .manifest
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let mut programs: Vec<rewrite::suspects::Program> = Vec::new();
+    let mut program_of_entry = Vec::new();
     for p in &m.processes {
         let original = std::fs::canonicalize(base.join(&p.argv[0]))
             .map_err(|e| format!("{}: {e}", p.argv[0]))?;
+        let known = programs.iter().position(|q| q.original == original);
+        program_of_entry.push(known.unwrap_or(programs.len()));
+        if known.is_some() {
+            continue;
+        }
+        let name = original
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        if programs.iter().any(|q| q.name == name) {
+            return Err(format!("two programs are called {name}: a mask goes by file name").into());
+        }
         let rewritten = cached_rewrite(&original, &cli.opts)?;
         let table = std::fs::read_to_string(rewrite::cache::sites_path(&rewritten))
             .map_err(|e| format!("{}: no site table ({e})", rewritten.display()))?;
         programs.push(rewrite::suspects::Program {
-            name: original
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+            name,
             original,
             sites: rw::sites_from_text(&table),
         });
     }
-    let cfg = rewrite::suspects::Config {
-        manifest: path,
-        scratch: scratch_dir(cli),
+    let mut cfg = rewrite::suspects::Config {
+        replay,
         seed: cli.opts.seed,
         jobs: cli.jobs,
-        pass: vec![
-            "--quantum".to_string(),
-            format!("{}..{}", cli.quantum.0, cli.quantum.1),
-            "--mem-hook-rate".to_string(),
-            format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
-        ],
         programs,
+        program_of_entry,
     };
-    let found = rewrite::suspects::suspects(&cfg, |line| println!("{line}"))?;
+    let found = rewrite::suspects::suspects(&mut cfg, |line| println!("{line}"))?;
     println!(
         "{} of {} sites are needed ({} runs):",
         found.suspects.len(),
@@ -528,21 +563,9 @@ fn suspects(cli: &Cli) -> Fallible<()> {
 
 /// `rewrite bisect`: find when the failing seed's failure was decided.
 fn bisect(cli: &Cli) -> Fallible<()> {
-    let mut pass = vec![
-        "--quantum".to_string(),
-        format!("{}..{}", cli.quantum.0, cli.quantum.1),
-        "--mem-hook-rate".to_string(),
-        format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
-    ];
-    if cli.given.contains(&"net-latency") {
-        pass.extend([
-            "--net-latency".to_string(),
-            format!("{}ns", cli.net_latency_ns),
-        ]);
-    }
-    let cfg = rewrite::bisect::Config {
-        manifest: cli.manifest.clone().unwrap(),
-        scratch: scratch_dir(cli),
+    let (cli, _, replay) = replay_of(cli, "bisect")?;
+    let mut cfg = rewrite::bisect::Config {
+        replay,
         seed: cli.opts.seed,
         // `--runs` defaults to what `repeat` wants
         runs: if cli.given.contains(&"runs") {
@@ -552,9 +575,8 @@ fn bisect(cli: &Cli) -> Fallible<()> {
         },
         jobs: cli.jobs,
         resolution_ns: cli.resolution_ns,
-        pass,
     };
-    let found = rewrite::bisect::bisect(&cfg, |line| println!("{line}"))?;
+    let found = rewrite::bisect::bisect(&mut cfg, |line| println!("{line}"))?;
     if !found.trace.is_empty() {
         println!("switches of the failing run in that interval:");
         for line in found.trace.iter().take(60) {
@@ -562,7 +584,7 @@ fn bisect(cli: &Cli) -> Fallible<()> {
         }
     }
     println!("bisect.failure_at_ns={}", found.reference.failure_at);
-    println!("bisect.base={}/{}", found.base.failed, found.base.runs);
+    println!("bisect.base={}/{}", found.base.failed, cfg.runs);
     println!("bisect.probes={}", found.probes.len());
     println!("bisect.lo_ns={}", found.lo_ns);
     println!("bisect.hi_ns={}", found.hi_ns);

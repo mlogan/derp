@@ -390,7 +390,6 @@ const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
 /// launcher), then park the main thread until it is handed the baton.
 pub fn init(info: Option<Info>, cfg: &Config) {
     *INFO.lock() = info;
-    open_trace();
     if let Some(spins) = std::env::var("REWRITE_PARK_SPINS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -417,9 +416,10 @@ pub fn init(info: Option<Info>, cfg: &Config) {
         }
         Err(_) => start_private_run(cfg),
     };
-    load_mask();
     unsafe { scheduler_slot().write(rewrite_scheduler_yield as *const () as usize) };
     SHARED.store(std::ptr::from_ref(sh).cast_mut(), Ordering::Relaxed);
+    open_trace();
+    load_mask();
     // Its own stream, per process; a `fork` child carries its parent's on
     crate::alloc::seed_layout(
         cfg.seed
@@ -650,6 +650,9 @@ impl After {
             Handoff::Idle if self.crashed_self => die(),
             Handoff::Idle => false,
             Handoff::Stay => {
+                // Traced too: a quantum ended here, switch or not, and
+                // masking this site would move the run
+                trace_switch(me, me, self.issued, site, self.clock);
                 if self.unsettled {
                     take_up_baton(sh);
                 } else {
@@ -752,8 +755,21 @@ pub fn wait_for_baton(id: usize) {
 /// the report covers the same four values.
 static TRACE_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// A debugging path: the launcher's, from the shared state, in a run that
+/// has one; this process's own environment otherwise.
+fn debug_path(
+    name: &str,
+    field: fn(&shared::State) -> &[u8; shared::DEBUG_PATH_LEN],
+) -> Option<String> {
+    if crate::coord::connected() {
+        with(|s, _| shared::debug_path(field(s))).flatten()
+    } else {
+        std::env::var(name).ok()
+    }
+}
+
 fn open_trace() {
-    let Ok(path) = std::env::var("REWRITE_TRACE") else {
+    let Some(path) = debug_path("REWRITE_TRACE", |s| &s.trace_path) else {
         return;
     };
     let Ok(cpath) = std::ffi::CString::new(path) else {
@@ -811,13 +827,17 @@ pub fn hook_event(site: u64) {
     }
 }
 
-/// Called from the stub's expired path through the register-saving
-/// trampoline, with the guest's registers already preserved.
-/// Return addresses of the stubs at which a switch may not happen, sorted,
-/// as they are in the file (before any slide). See `load_mask`.
+/// Return addresses, as loaded, of this program's stubs at which a quantum
+/// may not end (`REWRITE_MASK`, lines of `<program> <address in the file>`).
+/// Site minimisation asks with it whether a failure needs a switch at a
+/// given site. Every stub still counts, so a run that never expires at a
+/// masked site is the unmasked run. Sorted; empty without a mask.
 static MASK: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
-static MASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static SLIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Expiries deferred in a row. A loop of nothing but masked stubs would
+/// otherwise keep the baton for ever.
+static DEFERRED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const MAX_DEFERRED: u32 = 100_000;
+static SAID_MASKED_LOOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" {
     fn _dyld_get_image_vmaddr_slide(index: u32) -> isize;
@@ -826,20 +846,14 @@ extern "C" {
     fn _NSGetExecutablePath(buf: *mut libc::c_char, size: *mut u32) -> libc::c_int;
 }
 
-/// `REWRITE_MASK=<file>` with lines `<program> <return address>`: the hook
-/// sites of this program where the quantum may not end. Site minimisation
-/// uses it to ask whether a failure needs a switch at a given load or
-/// store. Every stub still counts, so a run that never expires at a masked
-/// site is the unmasked run.
 /// Word of a Mach-O header that holds the file type, and an executable's
 const FILETYPE: usize = 3;
 const MH_EXECUTE: u32 = 2;
 
 fn load_mask() {
-    let Ok(path) = std::env::var("REWRITE_MASK") else {
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = debug_path("REWRITE_MASK", |s| &s.mask_path)
+        .and_then(|path| std::fs::read_to_string(path).ok())
+    else {
         return;
     };
     let mut buf = [0 as libc::c_char; 4096];
@@ -849,35 +863,43 @@ fn load_mask() {
     }
     let exe = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }.to_string_lossy();
     let file = exe.rsplit('/').next().unwrap_or_default();
-    // The rewritten copy is `<program>.rw<version>-<key>`
-    let program = file.split_once(".rw").map_or(file, |(name, _)| name);
-    let mut pcs: Vec<u64> = text
-        .lines()
-        .filter_map(|l| l.split_once(' '))
-        .filter(|(name, _)| *name == program)
-        .filter_map(|(_, pc)| u64::from_str_radix(pc, 16).ok())
-        .collect();
-    pcs.sort_unstable();
-    MASKED.store(!pcs.is_empty(), Ordering::Relaxed);
-    *MASK.lock() = pcs;
+    let program = file.rfind(shared::CACHE_TAG).map_or(file, |at| &file[..at]);
     // The executable is not image 0 when a library was inserted ahead of it
     let slide = (0..unsafe { _dyld_image_count() })
         .find(|&i| unsafe {
             let header = _dyld_get_image_header(i);
             !header.is_null() && *header.add(FILETYPE) == MH_EXECUTE
         })
-        .map_or(0, |i| unsafe { _dyld_get_image_vmaddr_slide(i) });
-    SLIDE.store(slide as u64, Ordering::Relaxed);
+        .map_or(0, |i| unsafe { _dyld_get_image_vmaddr_slide(i) }) as u64;
+    // A program's name may hold spaces; an address cannot
+    let mut pcs: Vec<u64> = text
+        .lines()
+        .filter_map(|l| l.rsplit_once(' '))
+        .filter(|(name, _)| *name == program)
+        .filter_map(|(_, pc)| u64::from_str_radix(pc, 16).ok())
+        .map(|pc| pc.wrapping_add(slide))
+        .collect();
+    pcs.sort_unstable();
+    *MASK.lock() = pcs;
 }
 
 fn masked(stub_pc: u64) -> bool {
-    MASKED.load(Ordering::Relaxed)
-        && MASK
-            .lock()
-            .binary_search(&stub_pc.wrapping_sub(SLIDE.load(Ordering::Relaxed)))
-            .is_ok()
+    if MASK.lock().binary_search(&stub_pc).is_err() {
+        DEFERRED.store(0, Ordering::Relaxed);
+        return false;
+    }
+    if DEFERRED.fetch_add(1, Ordering::Relaxed) < MAX_DEFERRED {
+        return true;
+    }
+    if !SAID_MASKED_LOOP.swap(true, Ordering::Relaxed) {
+        crate::report::log("a loop of masked sites never reaches another hook; switching at one");
+    }
+    DEFERRED.store(0, Ordering::Relaxed);
+    false
 }
 
+/// Called from the stub's expired path through the register-saving
+/// trampoline, with the guest's registers already preserved.
 #[no_mangle]
 pub extern "C" fn rewrite_yield_impl(stub_pc: u64) {
     if masked(stub_pc) {

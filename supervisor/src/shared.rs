@@ -90,6 +90,26 @@ pub struct Faults {
     pub crashes_left: u32,
 }
 
+pub const DEBUG_PATH_LEN: usize = 1024;
+
+/// What the cache puts between a program's file name and the key of its
+/// rewritten copy
+pub const CACHE_TAG: &str = ".rw3-";
+
+/// Store `path` in one of the state's path fields; too long is not stored.
+pub fn set_debug_path(field: &mut [u8; DEBUG_PATH_LEN], path: &str) {
+    if path.len() < DEBUG_PATH_LEN {
+        field[..path.len()].copy_from_slice(path.as_bytes());
+        field[path.len()] = 0;
+    }
+}
+
+#[must_use]
+pub fn debug_path(field: &[u8; DEBUG_PATH_LEN]) -> Option<String> {
+    let len = field.iter().position(|&b| b == 0)?;
+    (len > 0).then(|| String::from_utf8_lossy(&field[..len]).into_owned())
+}
+
 /// Raw wait status of a process that died of `SIGKILL`
 const KILLED_STATUS: i32 = 9;
 
@@ -250,6 +270,11 @@ pub struct State {
     pub reseed_at: u64,
     pub reseed_with: u64,
     pub reseeded: bool,
+    /// The launcher's `REWRITE_TRACE` and `REWRITE_MASK`, NUL-terminated.
+    /// Here and not in the guests' environment: its size places a guest's
+    /// stack, and a run must not move because it is being looked at.
+    pub trace_path: [u8; DEBUG_PATH_LEN],
+    pub mask_path: [u8; DEBUG_PATH_LEN],
     pub crashes_injected: u64,
     pub restarts: u64,
     /// Restarts that were due but found the process or thread table full;

@@ -297,8 +297,7 @@ impl Builder {
         self.emit(stub::BLR_X0);
         let skip = self.pc();
         let kind = match tail {
-            // In the A64 load/store encodings bit 22 is set for a load
-            Tail::Replay(word) if word & (1 << 22) != 0 => SiteKind::Load,
+            Tail::Replay(word) if is_load(word) => SiteKind::Load,
             Tail::Replay(_) => SiteKind::Store,
             _ if call => SiteKind::Call,
             _ => SiteKind::Branch,
@@ -330,6 +329,19 @@ impl Builder {
             self.emit(b_to(fallthrough, site + 4)?);
         }
         Ok(())
+    }
+}
+
+/// Whether a hooked memory instruction reads. In most A64 load/store
+/// encodings bit 22 says so; the integer register forms (bits 29:27 = 111,
+/// V = 0) have a two-bit opc in 23:22 where 10 and 11 are the sign-extending
+/// loads.
+fn is_load(word: u32) -> bool {
+    let integer_register_form = (word >> 27) & 7 == 7 && word & (1 << 26) == 0;
+    if integer_register_form {
+        (word >> 22) & 3 != 0
+    } else {
+        word & (1 << 22) != 0
     }
 }
 

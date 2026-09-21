@@ -3,7 +3,6 @@
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -21,38 +20,17 @@ fn setup(name: &str) -> (PathBuf, PathBuf, PathBuf) {
     (dir.clone(), manifest, dir.join("scratch"))
 }
 
+const HOOKS: [&str; 2] = ["--mem-hook-rate", "1"];
+
 fn rewrite_cmd(args: &[&str], scratch: &Path, manifest: &Path) -> Command {
-    let mut cmd = Command::new(common::rewrite_bin());
-    cmd.args(args)
-        .args(["--mem-hook-rate", "1", "--scratch"])
-        .arg(scratch)
-        .arg("--manifest")
-        .arg(manifest);
-    cmd
+    common::rewrite_cmd(args, &HOOKS, scratch, manifest)
 }
 
 fn failing_seed(scratch: &Path, manifest: &Path) -> u64 {
-    (1..=100)
-        .find(|seed| {
-            !rewrite_cmd(
-                &["run", "--capture", "--seed", &seed.to_string()],
-                scratch,
-                manifest,
-            )
-            .output()
-            .unwrap()
-            .status
-            .success()
-        })
-        .expect("no seed of 100 loses an update")
+    common::failing_and_passing_seed(&HOOKS, scratch, manifest).0
 }
 
-fn fields(text: &str) -> BTreeMap<String, String> {
-    text.lines()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
+use common::report_fields as fields;
 
 #[test]
 fn the_site_table_names_every_hooked_instruction() {
@@ -118,8 +96,10 @@ fn a_mask_moves_switches_and_nothing_else() {
         .filter_map(|e| Some(e.ok()?.path()))
         .find(|p| {
             let name = p.file_name().unwrap().to_string_lossy().into_owned();
-            name.starts_with(&format!("lost_update.rw3-{seed}-1of1-"))
-                && p.extension().is_some_and(|e| e == "sites")
+            name.starts_with(&format!(
+                "lost_update{}{seed}-1of1-",
+                rewrite::shared::CACHE_TAG
+            )) && p.extension().is_some_and(|e| e == "sites")
         })
         .expect("site table of the cached rewrite");
     let memory: Vec<u64> = sites_from_text(&std::fs::read_to_string(table).unwrap())
@@ -247,4 +227,44 @@ fn a_failure_that_needs_no_memory_switch_is_traced_to_a_branch_or_call() {
             "{s}"
         );
     }
+}
+
+/// Two entries that run the same binary share its sites: a mask goes by
+/// program, and the site is a suspect once.
+#[test]
+fn two_entries_of_one_program_share_their_sites() {
+    if Command::new("atos").arg("-h").output().is_err() {
+        eprintln!("skipped: no atos");
+        return;
+    }
+    let (dir, _, scratch) = setup("suspects_twice");
+    let manifest = dir.join("twice.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - lost_update\n      - lost_update\n",
+    )
+    .unwrap();
+    let seed = failing_seed(&scratch, &manifest);
+    let out = rewrite_cmd(
+        &["suspects", "--seed", &seed.to_string()],
+        &scratch,
+        &manifest,
+    )
+    .output()
+    .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let suspects: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.strip_prefix("suspect="))
+        .collect();
+    assert!(!suspects.is_empty() && suspects.len() <= 2, "{text}");
+    assert!(
+        suspects.iter().all(|s| s.contains("lost_update.c:19)")),
+        "{text}"
+    );
 }

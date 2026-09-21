@@ -3,44 +3,19 @@
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
 const RUN_FILE: &str = "hosts:\n  - name: a\n    processes:\n      - latent\n";
 
 fn rewrite(args: &[&str], scratch: &Path, manifest: &Path) -> std::process::Output {
-    common::supervisor_dylib();
-    Command::new(common::rewrite_bin())
-        .args(args)
-        .arg("--scratch")
-        .arg(scratch)
-        .arg("--manifest")
-        .arg(manifest)
+    common::rewrite_cmd(args, &[], scratch, manifest)
         .output()
         .expect("rewrite")
 }
 
-fn fields(text: &str) -> BTreeMap<String, String> {
-    text.lines()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect()
-}
-
-/// The first seed on which the guest aborts
 fn failing_seed(scratch: &Path, manifest: &Path) -> u64 {
-    (1..=200)
-        .find(|seed| {
-            !rewrite(
-                &["run", "--capture", "--seed", &seed.to_string()],
-                scratch,
-                manifest,
-            )
-            .status
-            .success()
-        })
-        .expect("no seed of 200 loses an update")
+    common::failing_and_passing_seed(&[], scratch, manifest).0
 }
 
 fn switches(trace: &Path) -> Vec<(u64, String)> {
@@ -76,7 +51,7 @@ fn a_reseeded_run_is_the_plain_run_until_the_reseed() {
             .unwrap();
         (
             switches(&trace),
-            fields(&String::from_utf8_lossy(&out.stderr)),
+            common::report_fields(&String::from_utf8_lossy(&out.stderr)),
         )
     };
     let at = 60_000_000;
@@ -121,7 +96,7 @@ fn bisection_points_at_the_race_and_not_at_the_assert() {
         "{text}{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let f = fields(&text);
+    let f = common::report_fields(&text);
     let num = |k: &str| {
         f[k].parse::<u64>()
             .unwrap_or_else(|_| panic!("{k} in {text}"))
@@ -135,7 +110,7 @@ fn bisection_points_at_the_race_and_not_at_the_assert() {
     // The guest says when its window was, on its own clock, which runs a
     // fixed offset ahead of the run's: its last line and the run's failure
     // time are the same moment.
-    let said = std::fs::read_to_string(scratch.join("bisect/reference/stdout.0")).unwrap();
+    let said = std::fs::read_to_string(scratch.join("bisect/slot00/stdout.0")).unwrap();
     let last_number = |l: &str| l.rsplit(' ').next().unwrap().parse::<u64>().unwrap();
     let offset = last_number(said.lines().last().unwrap()) - failed_at;
     let windows: Vec<(u64, u64)> = said
@@ -173,16 +148,7 @@ fn a_seed_that_passes_has_nothing_to_bisect() {
     let manifest = dir.join("latent.yaml");
     std::fs::write(&manifest, RUN_FILE).unwrap();
     let scratch = dir.join("scratch");
-    let failing = failing_seed(&scratch, &manifest);
-    let passing = (1..=200).find(|&s| s != failing).unwrap();
-    let ok = rewrite(
-        &["run", "--capture", "--seed", &passing.to_string()],
-        &scratch,
-        &manifest,
-    );
-    if !ok.status.success() {
-        return;
-    }
+    let (_, passing) = common::failing_and_passing_seed(&[], &scratch, &manifest);
     let out = rewrite(
         &["bisect", "--seed", &passing.to_string()],
         &scratch,
@@ -190,6 +156,50 @@ fn a_seed_that_passes_has_nothing_to_bisect() {
     );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("does not fail"));
+    let out = rewrite(
+        &["bisect", "--seed", "1", "--runs", "0"],
+        &scratch,
+        &manifest,
+    );
+    assert!(String::from_utf8_lossy(&out.stderr).contains("needs futures"));
+}
+
+/// The run bisected is the run `rewrite run` makes of the same file: the
+/// file's own `seed:` counts, and a daemon that outlives the failing entry
+/// does not hide when that entry died.
+#[test]
+fn bisection_replays_the_run_file_as_run_does() {
+    let dir = common::scratch_dir("bisect_runfile");
+    common::build_c("latent", &dir, &[]);
+    common::build_c("sleeper", &dir, &[]);
+    let manifest = dir.join("daemon.yaml");
+    let with_daemon = "hosts:\n  - name: a\n    processes:\n      - latent\n\
+                       \x20     - argv: [sleeper, \"100000\", \"1000\"]\n        daemon: true\n";
+    std::fs::write(&manifest, with_daemon).unwrap();
+    let scratch = dir.join("scratch");
+    let seed = failing_seed(&scratch, &manifest);
+
+    // The seed from the file, none on the command line
+    std::fs::write(&manifest, format!("seed: {seed}\n{with_daemon}")).unwrap();
+    let out = rewrite(&["bisect"], &scratch, &manifest);
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    assert!(
+        out.status.success(),
+        "{text}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains(&format!("reference: seed {seed} fails")),
+        "{text}"
+    );
+    let f = common::report_fields(&text);
+    let num = |k: &str| f[k].parse::<u64>().unwrap();
+    assert!(num("bisect.failure_at_ns") > 100_000_000, "{text}");
+    assert!(
+        num("bisect.hi_ns") < num("bisect.failure_at_ns") / 2,
+        "{text}"
+    );
+    assert!(num("bisect.probes") >= 5, "{text}");
 }
 
 /// Failures decided by a draw from a per-process stream, not by the
@@ -221,7 +231,7 @@ fn bisection_finds_a_draw_from_a_process_stream() {
             "{mode}: {text}{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        let f = fields(&text);
+        let f = common::report_fields(&text);
         let num = |k: &str| {
             f[k].parse::<u64>()
                 .unwrap_or_else(|_| panic!("{k} in {text}"))
@@ -232,7 +242,7 @@ fn bisection_finds_a_draw_from_a_process_stream() {
             num("bisect.failure_at_ns"),
         );
 
-        let said = std::fs::read_to_string(scratch.join("bisect/reference/stdout.0")).unwrap();
+        let said = std::fs::read_to_string(scratch.join("bisect/slot00/stdout.0")).unwrap();
         let numbers =
             |l: &str| -> Vec<u64> { l.split(' ').filter_map(|w| w.parse().ok()).collect() };
         let offset = numbers(said.lines().last().unwrap()).pop().unwrap() - failed_at;

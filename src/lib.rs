@@ -10,6 +10,7 @@ pub mod hostdir;
 pub mod launch;
 pub mod macho;
 pub mod manifest;
+pub mod replay;
 pub mod rewrite;
 pub mod rng;
 #[path = "../supervisor/src/shared.rs"]

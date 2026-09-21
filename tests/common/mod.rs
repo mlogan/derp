@@ -229,3 +229,51 @@ pub fn build_kv(out_dir: &Path) -> PathBuf {
     std::fs::rename(&fresh, &out).unwrap();
     out
 }
+
+/// `key=value` lines of a report or of a tool's output
+pub fn report_fields(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
+/// `rewrite <args> <extra> --scratch … --manifest …`
+pub fn rewrite_cmd(args: &[&str], extra: &[&str], scratch: &Path, manifest: &Path) -> Command {
+    supervisor_dylib();
+    let mut cmd = Command::new(rewrite_bin());
+    cmd.args(args)
+        .args(extra)
+        .arg("--scratch")
+        .arg(scratch)
+        .arg("--manifest")
+        .arg(manifest);
+    cmd
+}
+
+/// The first seed from 1 on which the run fails with a guest's own status
+/// (not a launcher error), and a seed on which it passes.
+pub fn failing_and_passing_seed(extra: &[&str], scratch: &Path, manifest: &Path) -> (u64, u64) {
+    let (mut failing, mut passing) = (None, None);
+    for seed in 1..=200u64 {
+        let out = rewrite_cmd(
+            &["run", "--capture", "--seed", &seed.to_string()],
+            extra,
+            scratch,
+            manifest,
+        )
+        .output()
+        .unwrap();
+        let report = String::from_utf8_lossy(&out.stderr).into_owned();
+        if out.status.success() {
+            passing.get_or_insert(seed);
+        } else {
+            assert!(report.contains("run.failure="), "seed {seed}: {report}");
+            failing.get_or_insert(seed);
+        }
+        if let (Some(f), Some(p)) = (failing, passing) {
+            return (f, p);
+        }
+    }
+    panic!("200 seeds: failing {failing:?}, passing {passing:?}");
+}

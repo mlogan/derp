@@ -6,8 +6,8 @@
 //! scheduler's, in virtual time, because what ends it (socket traffic, a
 //! user event another thread triggers) comes from scheduled threads. Only a
 //! kqueue whose every registration belongs to the outside world waits in
-//! the kernel. Level-triggered, `EV_CLEAR` and
-//! `EV_ONESHOT` and `EV_DISPATCH` registrations and `EV_RECEIPT` are modelled.
+//! the kernel. Level-triggered, `EV_CLEAR`, `EV_ONESHOT` and `EV_DISPATCH`
+//! registrations are modelled, and `EV_RECEIPT`.
 //!
 //! A kqueue is not inherited by `fork`, so the child starts with an empty
 //! registry (`forked`).
@@ -40,6 +40,16 @@ struct Kq {
     /// Registrations only the world outside the run can fire (a descriptor
     /// that is no guest's, a signal, a kernel timer), as (ident, filter)
     external: Vec<(usize, i16)>,
+    /// Idents of the user events registered: a scheduled thread's `kevent`
+    /// triggers them, so a wait on them is the scheduler's
+    user_events: Vec<usize>,
+}
+
+/// A change of a call that wants receipts
+enum Step {
+    /// A virtual registration's, with the receipt the kernel would give
+    Ours(libc::kevent),
+    Kernels(libc::kevent),
 }
 
 struct Registry(Vec<Kq>);
@@ -64,8 +74,12 @@ pub fn closed(fd: c_int) {
     }
     kqs.0.retain(|k| !k.fds.is_empty());
     for k in &mut kqs.0 {
+        // Only these filters' idents are descriptors; a timer's or a
+        // process's may equal `fd` by chance
+        let of_a_descriptor =
+            |f: i16| [libc::EVFILT_READ, libc::EVFILT_WRITE, libc::EVFILT_VNODE].contains(&f);
         k.external
-            .retain(|&(ident, filter)| ident != fd as usize || filter == libc::EVFILT_SIGNAL);
+            .retain(|&(ident, filter)| ident != fd as usize || !of_a_descriptor(filter));
         k.regs.retain(|r| r.fd != fd);
         k.guest_objects.retain(|&o| o != fd);
     }
@@ -81,6 +95,10 @@ pub fn duplicated(fd: c_int, new: c_int) {
 
 pub unsafe extern "C" fn my_kqueue() -> c_int {
     let fd = libc::kqueue();
+    if fd >= 0 {
+        // A stale entry under this number, closed where we did not see it
+        closed(fd);
+    }
     if fd >= 0 && my_id().is_some() {
         // Known from birth, so that duplicates made before its first
         // `kevent` are known too
@@ -96,6 +114,7 @@ impl Kq {
             regs: Vec::new(),
             guest_objects: Vec::new(),
             external: Vec::new(),
+            user_events: Vec::new(),
         }
     }
 }
@@ -172,6 +191,10 @@ fn change(kq: &mut Kq, ev: &libc::kevent, sock: u32) {
     }
     if ev.flags & libc::EV_ENABLE != 0 {
         reg.enabled = true;
+        // The kernel looks again on enable: unread data fires once more
+        if reg.flags & libc::EV_DISPATCH != 0 {
+            reg.seen = None;
+        }
     }
     if ev.flags & libc::EV_DISABLE != 0 {
         reg.enabled = false;
@@ -242,8 +265,8 @@ pub unsafe extern "C" fn my_kevent(
     };
     // Split the changes: ours, and the kernel's
     let mut real_changes: Vec<libc::kevent> = Vec::new();
-    // What the kernel would answer to our share of `EV_RECEIPT` changes
-    let mut receipts: Vec<libc::kevent> = Vec::new();
+    // The changes in the order given, for a call that wants receipts
+    let mut ordered: Vec<Step> = Vec::new();
     let wants_receipts = changes.iter().any(|ev| ev.flags & libc::EV_RECEIPT != 0);
     let (ours, outside) = {
         let mut kqs = KQS.lock();
@@ -260,11 +283,11 @@ pub unsafe extern "C" fn my_kevent(
                 Some(sock) if io => {
                     change(k, ev, sock);
                     if ev.flags & libc::EV_RECEIPT != 0 {
-                        receipts.push(libc::kevent {
+                        ordered.push(Step::Ours(libc::kevent {
                             flags: ev.flags | libc::EV_ERROR,
                             data: 0,
                             ..*ev
-                        });
+                        }));
                     }
                 }
                 _ => {
@@ -274,18 +297,28 @@ pub unsafe extern "C" fn my_kevent(
                     }
                     // A user event is triggered by a `kevent` call, which
                     // in a run only a scheduled thread makes
-                    if !guest_object && ev.filter != libc::EVFILT_USER {
+                    let deleted = ev.flags & libc::EV_DELETE != 0;
+                    if ev.filter == libc::EVFILT_USER {
+                        k.user_events.retain(|&i| i != ev.ident);
+                        if !deleted {
+                            k.user_events.push(ev.ident);
+                        }
+                    } else if !guest_object {
                         let key = (ev.ident, ev.filter);
                         k.external.retain(|&e| e != key);
-                        if ev.flags & libc::EV_DELETE == 0 {
+                        if !deleted {
                             k.external.push(key);
                         }
                     }
                     real_changes.push(*ev);
+                    ordered.push(Step::Kernels(*ev));
                 }
             }
         }
-        let ours = !k.regs.is_empty() || !k.guest_objects.is_empty() || k.external.is_empty();
+        let ours = !k.regs.is_empty()
+            || !k.guest_objects.is_empty()
+            || !k.user_events.is_empty()
+            || k.external.is_empty();
         (ours, !k.external.is_empty())
     };
     if !ours && !wants_receipts {
@@ -297,34 +330,47 @@ pub unsafe extern "C" fn my_kevent(
         tv_nsec: 0,
     };
     if wants_receipts {
-        // A call with receipts reports on its changes and never waits
+        // A call with receipts reports on its changes, in their order, and
+        // never waits. The kernel's are asked for one change at a time, with
+        // room for that receipt alone, so that no pending event comes back
+        // in a receipt's place.
         let room = if events.is_null() {
             0
         } else {
             nevents.max(0) as usize
         };
-        let out = std::slice::from_raw_parts_mut(events, room);
+        let out: &mut [libc::kevent] = if room == 0 {
+            &mut []
+        } else {
+            std::slice::from_raw_parts_mut(events, room)
+        };
         let mut n = 0;
-        if !real_changes.is_empty() {
-            let rc = libc::kevent(
-                kq,
-                real_changes.as_ptr(),
-                real_changes.len() as c_int,
-                out.as_mut_ptr(),
-                room as c_int,
-                &raw const zero,
-            );
-            if rc < 0 {
-                return rc;
+        for step in ordered {
+            match step {
+                Step::Ours(receipt) if n < room => {
+                    out[n] = receipt;
+                    n += 1;
+                }
+                Step::Ours(_) => {}
+                Step::Kernels(ev) => {
+                    let wants = ev.flags & libc::EV_RECEIPT != 0 && n < room;
+                    let rc = libc::kevent(
+                        kq,
+                        &raw const ev,
+                        1,
+                        out[n..].as_mut_ptr(),
+                        c_int::from(wants),
+                        &raw const zero,
+                    );
+                    if rc < 0 {
+                        return rc;
+                    }
+                    n += rc as usize;
+                }
             }
-            n = rc as usize;
-            crate::io::wake_io();
         }
-        for r in receipts {
-            if n < room {
-                out[n] = r;
-                n += 1;
-            }
+        if !real_changes.is_empty() {
+            crate::io::wake_io();
         }
         return n as c_int;
     }
@@ -348,8 +394,7 @@ pub unsafe extern "C" fn my_kevent(
         return 0;
     }
     let out = std::slice::from_raw_parts_mut(events, nevents as usize);
-    let timeout_ns = (!timeout.is_null())
-        .then(|| (*timeout).tv_sec as u64 * 1_000_000_000 + (*timeout).tv_nsec as u64);
+    let timeout_ns = (!timeout.is_null()).then(|| sched::timespec_ns(timeout));
     let deadline = timeout_ns.map(|t| sched::now() + t);
     loop {
         let mut n = {
@@ -369,6 +414,16 @@ pub unsafe extern "C" fn my_kevent(
                 &raw const zero,
             );
             if got > 0 {
+                // A one-shot registration that fired is gone from the kernel
+                let fired = &out[n..n + got as usize];
+                if fired.iter().any(|e| e.flags & libc::EV_ONESHOT != 0) {
+                    let mut kqs = KQS.lock();
+                    if let Some(k) = kqs.0.iter_mut().find(|k| k.fds.contains(&kq)) {
+                        for e in fired.iter().filter(|e| e.flags & libc::EV_ONESHOT != 0) {
+                            k.external.retain(|&x| x != (e.ident, e.filter));
+                        }
+                    }
+                }
                 n += got as usize;
             }
         }

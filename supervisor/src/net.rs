@@ -507,6 +507,7 @@ pub unsafe extern "C" fn my_recv(fd: c_int, buf: *mut c_void, n: usize, flags: c
     sched::hook_event(sched::SITE_NET);
     match lookup(fd) {
         Some(sock) => recv_fd(fd, sock, buf.cast(), n, flags),
+        None if flags & libc::MSG_DONTWAIT != 0 => libc::recv(fd, buf, n, flags),
         None => crate::io::when_readable(fd, || unsafe { libc::recv(fd, buf, n, flags) }),
     }
 }
@@ -537,6 +538,9 @@ pub unsafe extern "C" fn my_recvfrom(
 ) -> isize {
     sched::hook_event(sched::SITE_NET);
     let Some(sock) = lookup(fd) else {
+        if flags & libc::MSG_DONTWAIT != 0 {
+            return libc::recvfrom(fd, buf, n, flags, addr, len);
+        }
         return crate::io::when_readable(fd, || unsafe {
             libc::recvfrom(fd, buf, n, flags, addr, len)
         });

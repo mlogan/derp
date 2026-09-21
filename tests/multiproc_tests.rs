@@ -1514,3 +1514,65 @@ fn sigchld_is_delivered_at_a_point_of_the_schedule() {
         r.fields["run.schedule_hash"]
     );
 }
+
+/// Small programs from a review, each of which behaved differently under
+/// the supervisor than natively: a kqueue holding a user event next to a
+/// signal registration, a timer whose ident equals a closed descriptor, a
+/// receipt call with no event list, `recv(MSG_DONTWAIT)` on a socket pair,
+/// a `SIGCHLD` blocked around `fork`, the handler's `siginfo` and
+/// `SA_RESETHAND`, and `kill(getpid())` with the signal blocked in the
+/// caller. What they print natively is what they must print here.
+#[test]
+fn edge_cases_behave_as_they_do_natively() {
+    let dir = common::scratch_dir("edges");
+    for name in [
+        "kquser",
+        "kqtimer",
+        "kqnull",
+        "dontwait",
+        "chldblock",
+        "chldinfo",
+        "selfkill",
+    ] {
+        let program = format!("edge_{name}");
+        let exe = common::build_c(&program, &dir, &[]);
+        let native = Command::new(&exe).output().unwrap();
+        assert!(native.status.success(), "{name} natively");
+        let manifest = dir.join(format!("{name}.yaml"));
+        std::fs::write(
+            &manifest,
+            format!("hosts:\n  - name: a\n    processes:\n      - {program}\n"),
+        )
+        .unwrap();
+        for seed in 1..=3 {
+            let r = run_manifest(&manifest, &dir.join("scratch"), seed, 1);
+            assert_eq!(
+                r.stdout[0],
+                String::from_utf8_lossy(&native.stdout),
+                "{name}, seed {seed}"
+            );
+        }
+    }
+}
+
+/// A guest's heap is 32 GB of address space unless the run says otherwise,
+/// in the run file or on the command line, which wins.
+#[test]
+fn the_heap_size_is_the_runs_to_set() {
+    let dir = common::scratch_dir("heap_size");
+    common::build_c("heap_limit", &dir, &[]);
+    let scratch = dir.join("scratch");
+    let manifest = dir.join("heap.yaml");
+    let processes = "hosts:\n  - name: a\n    processes:\n      - heap_limit\n";
+    let (roomy, tight) = ("100 MB: ok\n1000 MB: ok\n", "100 MB: ok\n1000 MB: null\n");
+
+    std::fs::write(&manifest, processes).unwrap();
+    assert_eq!(run_manifest(&manifest, &scratch, 1, 1).stdout[0], roomy);
+    let small = run_manifest_with(&manifest, &scratch, 1, 1, &["--heap-size", "256M"]);
+    assert_eq!(small.stdout[0], tight);
+
+    std::fs::write(&manifest, format!("heap-size: 256M\n{processes}")).unwrap();
+    assert_eq!(run_manifest(&manifest, &scratch, 1, 1).stdout[0], tight);
+    let large = run_manifest_with(&manifest, &scratch, 1, 1, &["--heap-size", "8G"]);
+    assert_eq!(large.stdout[0], roomy);
+}

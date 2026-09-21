@@ -165,8 +165,21 @@ extern "C" fn trampoline(p: *mut c_void) -> *mut c_void {
 /// Runs during the exiting thread's TSD cleanup, after dyld's thread-local
 /// destructors (its key is older than ours), so guest destructors ran with
 /// the baton. Marks the thread exited and hands the baton on.
+/// The fourth and last round of key destructors libpthread makes
+const LAST_ROUND: usize = 3;
+
 pub extern "C" fn thread_teardown(value: *mut c_void) {
-    let id = value as usize - 1;
+    let id = (value as usize & sched::ID_MASK) - 1;
+    // Our key is older than any of the guest's, so we are called first in
+    // each round of destructors, and the guest's would run after we have
+    // given the baton away: guest code outside the schedule. libpthread
+    // makes up to four rounds while values remain. Put ours back for all
+    // but the last, and the guest's destructors run with the baton.
+    let round = value as usize >> sched::ROUND_SHIFT;
+    if round < LAST_ROUND {
+        sched::rearm_identity(id, round + 1);
+        return;
+    }
     count(C_EXIT);
     // libpthread cleared our key before calling us. The join wake is still
     // this scheduled thread's, made with the baton: it must not count as a
@@ -285,11 +298,7 @@ extern "C" fn my_pthread_cond_timedwait(
     };
     count(C_COND);
     // The deadline is absolute on the (virtual) realtime clock
-    let abs = unsafe {
-        ((*ts).tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add((*ts).tv_nsec as u64)
-    };
+    let abs = unsafe { sched::timespec_ns(ts) };
     let deadline = abs.saturating_sub(crate::determinism::REALTIME_BASE_NS);
     cond_wait_until(c, m, me, deadline)
 }
@@ -304,11 +313,7 @@ extern "C" fn my_pthread_cond_timedwait_relative_np(
         return unsafe { pthread_cond_timedwait_relative_np(c, m, ts) };
     };
     count(C_COND);
-    let rel = unsafe {
-        ((*ts).tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add((*ts).tv_nsec as u64)
-    };
+    let rel = unsafe { sched::timespec_ns(ts) };
     cond_wait_until(c, m, me, sched::now().saturating_add(rel))
 }
 
@@ -336,12 +341,18 @@ fn cond_wait_until(
 // Try, and wait in the scheduler for an unlock instead. Writers are not
 // preferred over readers; who gets the lock next is the scheduler's draw.
 
-extern "C" fn my_pthread_rwlock_rdlock(l: *mut libc::pthread_rwlock_t) -> c_int {
+/// Take a rwlock one way or the other: try, and wait in the scheduler for
+/// an unlock while it is busy.
+fn rwlock_wait(
+    l: *mut libc::pthread_rwlock_t,
+    real: unsafe extern "C" fn(*mut libc::pthread_rwlock_t) -> c_int,
+    attempt: unsafe extern "C" fn(*mut libc::pthread_rwlock_t) -> c_int,
+) -> c_int {
     if my_id().is_none() {
-        return unsafe { libc::pthread_rwlock_rdlock(l) };
+        return unsafe { real(l) };
     }
     loop {
-        let rc = unsafe { libc::pthread_rwlock_tryrdlock(l) };
+        let rc = unsafe { attempt(l) };
         if rc != libc::EBUSY {
             return rc;
         }
@@ -350,18 +361,20 @@ extern "C" fn my_pthread_rwlock_rdlock(l: *mut libc::pthread_rwlock_t) -> c_int 
     }
 }
 
+extern "C" fn my_pthread_rwlock_rdlock(l: *mut libc::pthread_rwlock_t) -> c_int {
+    rwlock_wait(
+        l,
+        libc::pthread_rwlock_rdlock,
+        libc::pthread_rwlock_tryrdlock,
+    )
+}
+
 extern "C" fn my_pthread_rwlock_wrlock(l: *mut libc::pthread_rwlock_t) -> c_int {
-    if my_id().is_none() {
-        return unsafe { libc::pthread_rwlock_wrlock(l) };
-    }
-    loop {
-        let rc = unsafe { libc::pthread_rwlock_trywrlock(l) };
-        if rc != libc::EBUSY {
-            return rc;
-        }
-        count(C_MUTEX);
-        sched::yield_baton(State::Blocked(l as usize), l as usize as u64);
-    }
+    rwlock_wait(
+        l,
+        libc::pthread_rwlock_wrlock,
+        libc::pthread_rwlock_trywrlock,
+    )
 }
 
 extern "C" fn my_pthread_rwlock_unlock(l: *mut libc::pthread_rwlock_t) -> c_int {
@@ -436,25 +449,19 @@ fn unfair_owner(value: u64) -> Option<usize> {
     sched::scheduled_thread(owner).or_else(|| sched::scheduled_thread(owner | 3))
 }
 
-/// A contended unfair lock. Who holds it decides what the wait is:
-/// - a thread outside the schedule: the kernel's wait, which its unlock ends;
-/// - one of ours that is parked: it holds the lock until it runs again, so
-///   the baton goes on;
-/// - one of ours that is running in real time without the baton (starting
-///   up, or between a hand-off and its park, inside the system libraries):
-///   it lets go by itself in a moment. Whether we caught it holding the
-///   lock is real-time luck and must not show in the schedule, so that is
-///   waited out in the kernel as well.
+/// A contended unfair lock, as the baton holder sees it: an owner that is
+/// parked holds it until it runs again, so the baton goes on; any other
+/// owner lets go in real time, which must not show in the schedule.
 fn unfair_wait(op: u32, addr: *mut c_void, value: u64, real: impl Fn() -> c_int) -> c_int {
     const LOOK_AGAIN_NS: u64 = 1_000_000;
+    // A running owner of ours blocked on something a parked thread holds
+    // would never let go
+    const GIVE_UP_AFTER: u32 = 30_000;
     let wide = ulock_is_wide(op);
-    // Only the baton holder's waits are the schedule's business. Another of
-    // our threads gets here from the system libraries (the allocator's own
-    // lock, say) while it starts up or after it has handed the baton on.
     if !sched::baton_is_mine() {
         return real();
     }
-    loop {
+    for _ in 0..GIVE_UP_AFTER {
         match unfair_owner(value) {
             None => return real(),
             Some(owner) if sched::is_parked(owner) => {
@@ -467,13 +474,19 @@ fn unfair_wait(op: u32, addr: *mut c_void, value: u64, real: impl Fn() -> c_int)
                 return 0;
             }
             Some(_) => {
-                unsafe { __ulock_wait2(op, addr, value, LOOK_AGAIN_NS, 0) };
+                let rc = unsafe { __ulock_wait2(op, addr, value, LOOK_AGAIN_NS, 0) };
                 if !value_matches(addr, value, wide) {
-                    return 0;
+                    // Not 0 when the kernel says others still wait: the
+                    // caller's unlock must then wake them
+                    return rc.max(0);
                 }
             }
         }
     }
+    sched::fatal(
+        "an os_unfair_lock held by a running thread of ours was not released in 30 s \
+         (is its owner waiting for a parked thread?)",
+    )
 }
 
 extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int {
@@ -684,11 +697,7 @@ extern "C" fn my_nanosleep(req: *const libc::timespec, rem: *mut libc::timespec)
         return unsafe { libc::nanosleep(req, rem) };
     }
     count(C_YIELD);
-    let ns = unsafe {
-        ((*req).tv_sec as u64)
-            .saturating_mul(1_000_000_000)
-            .saturating_add((*req).tv_nsec as u64)
-    };
+    let ns = unsafe { sched::timespec_ns(req) };
     sleep_ns(ns);
     if !rem.is_null() {
         unsafe {

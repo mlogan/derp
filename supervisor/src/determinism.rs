@@ -17,8 +17,10 @@ use crate::rng::Rng;
 
 static ENTROPY: SpinLock<Option<Rng>> = SpinLock::new(None);
 
+const ENTROPY_STREAM: u64 = 0x5EED_5EED_5EED_5EED;
+
 pub fn init(seed: u64) {
-    *ENTROPY.lock() = Some(Rng::seed_from_u64(seed ^ 0x5EED_5EED_5EED_5EED));
+    *ENTROPY.lock() = Some(Rng::seed_from_u64(seed ^ ENTROPY_STREAM));
 }
 
 /// The seeded stream is for scheduled threads. A GCD worker draws at a
@@ -40,10 +42,10 @@ static RESEEDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 /// The entropy stream, switched first if the run's reseed time has passed.
 fn entropy() -> crate::spin::Guard<'static, Option<Rng>> {
-    let reseed = crate::sched::reseed_once(&RESEEDED, 0x5EED_5EED_5EED_5EED);
+    let reseed = crate::sched::reseed_once(&RESEEDED);
     let mut guard = ENTROPY.lock();
     if let Some(seed) = reseed {
-        *guard = Some(Rng::seed_from_u64(seed));
+        *guard = Some(Rng::seed_from_u64(seed ^ ENTROPY_STREAM));
     }
     guard
 }

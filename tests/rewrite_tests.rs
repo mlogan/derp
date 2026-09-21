@@ -71,6 +71,7 @@ fn stubs_are_slide_proof() {
         args: vec!["1".into()],
         dylib: Some(common::supervisor_dylib()),
         disable_aslr: false,
+        heap_size: rewrite::launch::DEFAULT_HEAP,
         stdout: None,
         seed: 0,
         quantum: launch::DEFAULT_QUANTUM,
@@ -196,4 +197,32 @@ fn heap_layout_is_a_function_of_the_seed_and_not_predictable() {
     );
     let (o, _) = run(&rw, &["crash"], Some(dylib.clone()), crashed[0]);
     assert_eq!(o.signal(), Some(libc::SIGABRT), "seed {} again", crashed[0]);
+}
+
+/// Corners a review found: an absurd size overflowed into a live block,
+/// scattered slabs left no room for a 32 MB block, every `malloc` took
+/// 8 KB of stack, and frees in a guest's key destructors were leaked
+/// because they ran after the thread had left the schedule.
+#[test]
+fn allocator_corners() {
+    let dir = common::scratch_dir("alloc_edges");
+    let exe = common::build_c("alloc_edges", &dir, &[]);
+    let rw = dir.join("alloc_edges.rw");
+    rewrite_to(&exe, &rw, &Options::default());
+    for seed in 1..=3u64 {
+        let (o, text) = run(&rw, &[], Some(common::supervisor_dylib()), seed);
+        assert_eq!(o.exit_code(), Some(0), "seed {seed}: {text}");
+        assert_eq!(
+            text,
+            "absurd size: null\nkey destructors ran\nmalloc on a small stack: ok\n\
+             32 MB after 80 MB of small blocks: ok\n256 MB after 80 MB of small blocks: ok\n\
+             2048 MB after 80 MB of small blocks: ok\n",
+            "seed {seed}"
+        );
+        assert_eq!(
+            o.report.get_u64("heap_leaked_blocks"),
+            Some(0),
+            "seed {seed}"
+        );
+    }
 }

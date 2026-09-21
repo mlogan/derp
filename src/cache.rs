@@ -115,8 +115,9 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
         .map_or(0, |d| d.as_nanos());
     let mtime = format!("{mtime}-{}", meta.len());
     let name = format!(
-        "{}.rw3-{}-{}of{}-{mtime}",
+        "{}{}{}-{}of{}-{mtime}",
         input.file_name().unwrap_or_default().to_string_lossy(),
+        crate::shared::CACHE_TAG,
         opts.seed,
         opts.mem_rate.0,
         opts.mem_rate.1

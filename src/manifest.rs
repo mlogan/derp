@@ -2,8 +2,9 @@
 //! settings of the run. YAML:
 //!
 //! ```yaml
-//! seed: 7                  # optional; the command line overrides these four
+//! seed: 7                  # optional; the command line overrides these five
 //! quantum: 1000..10000
+//! heap-size: 32G           # address space of each guest's heap
 //! mem-hook-rate: 1/16
 //! net-latency: 5ms
 //! allow:                   # extra paths every host may touch
@@ -111,6 +112,7 @@ struct RawRun {
     quantum: Option<String>,
     mem_hook_rate: Option<Scalar>,
     net_latency: Option<Scalar>,
+    heap_size: Option<Scalar>,
     #[serde(default)]
     allow: Vec<String>,
     #[serde(default)]
@@ -139,6 +141,22 @@ const DEFAULT_RESTART_DELAY_NS: u64 = 100_000_000;
 
 /// A year
 const MAX_DURATION_NS: u64 = 365 * 24 * 3600 * 1_000_000_000;
+
+/// A heap size: `32G`, `512M`, `4T`, or bytes. Between 64 MB and 4 TB.
+#[must_use]
+pub fn parse_size(s: &str) -> Option<u64> {
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let shift = match &s[digits.len()..] {
+        "" => 0,
+        "K" | "k" => 10,
+        "M" | "m" => 20,
+        "G" | "g" => 30,
+        "T" | "t" => 40,
+        _ => return None,
+    };
+    let bytes = digits.parse::<u64>().ok()?.checked_mul(1 << shift)?;
+    ((64 << 20)..=(4 << 40)).contains(&bytes).then_some(bytes)
+}
 
 /// `5ms`, `250us`, `10ns`, `1s`; a bare number is milliseconds.
 pub fn parse_duration_ns(s: &str) -> Option<u64> {
@@ -224,6 +242,7 @@ pub struct Manifest {
     pub quantum: Option<String>,
     pub mem_hook_rate: Option<String>,
     pub net_latency: Option<String>,
+    pub heap_size: Option<String>,
     pub allow: Vec<String>,
     /// Variables for every process of the run
     pub env: Vec<(String, String)>,
@@ -272,6 +291,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         quantum: raw.quantum,
         mem_hook_rate: raw.mem_hook_rate.as_ref().map(Scalar::text),
         net_latency: raw.net_latency.as_ref().map(Scalar::text),
+        heap_size: raw.heap_size.as_ref().map(Scalar::text),
         allow: raw.allow,
         env: raw.env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
         pass_env: raw.pass_env,
@@ -351,6 +371,17 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes() {
+        assert_eq!(parse_size("32G"), Some(32 << 30));
+        assert_eq!(parse_size("512m"), Some(512 << 20));
+        assert_eq!(parse_size("4T"), Some(4 << 40));
+        assert_eq!(parse_size("134217728"), Some(128 << 20));
+        for bad in ["", "G", "1M", "5T", "32GB", "-1G", "1.5G", "99999999999G"] {
+            assert_eq!(parse_size(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn hosts_processes_and_settings() {

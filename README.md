@@ -48,6 +48,8 @@ heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
 stop-after: 30s          # the run is over at this virtual time (default: never)
+outside-network: refuse  # or allow: connections and name lookups beyond the
+                         # virtual network reach the real one (input, unrepeatable)
 env: { LOG_LEVEL: debug }   # for every process (guests start from a fixed environment)
 pass-env: [SSL_CERT_FILE]   # inherited from yours on purpose; nothing else is
 allow: [/opt/site-content]  # extra paths every host may touch
@@ -177,6 +179,17 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
 - A wait (`poll`, `select`, `kevent`) may not depend on a descriptor whose
   other end is outside the run: nothing could repeat it. Such a wait is
   logged, and only the guests' side ever ends it.
+- In a run-file run, connecting to an address outside the virtual network
+  fails with `ENETUNREACH` and looking up a name the run does not know
+  fails with `EAI_NONAME`, unless the run file says `outside-network:
+  allow`; then they reach the real network and what comes back is input.
+  A lone `rewrite run prog` allows them.
+- A wait a system library makes for itself (libdispatch for a block on a
+  GCD worker, libxpc for a reply: what the Security framework does to load
+  certificates, what the resolver does) is made in the kernel with the
+  baton: nothing else in the run moves until it is over, so however long
+  it takes, the run is the same. The report counts them as
+  `system_wait`.
 - A handler for any other signal runs when the kernel delivers it, at a
   moment of real time, on whichever thread it lands, usually one that is
   parked. What it does is input to the run. It may call anything; a wake

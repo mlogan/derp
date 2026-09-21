@@ -150,6 +150,8 @@ pub struct Run {
     /// Virtual time at which the run is over whatever is still running
     /// (0: never): for servers that never exit by themselves
     pub stop_at_ns: u64,
+    /// Whether guests may connect outside the virtual network
+    pub outside_network: bool,
 }
 
 #[derive(Debug)]
@@ -744,6 +746,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     }
     if let Some(c) = coord {
         c.set_net_latency(run.net_latency_ns);
+        c.set_outside_network(run.outside_network);
         c.set_stop_at(run.stop_at_ns);
         c.set_debug_paths();
         if let Some((at, with)) = run.reseed {
@@ -920,6 +923,8 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         net_latency_ns: 0,
         reseed: None,
         stop_at_ns: cfg.stop_at_ns,
+        // A single program inherits our environment anyway
+        outside_network: true,
     };
     let mut out = launch_run(&run)?;
     Ok(out.guests.remove(0))

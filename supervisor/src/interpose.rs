@@ -118,7 +118,7 @@ const DISPATCH_TIME_NOW: u64 = 0;
 const DISPATCH_TIME_FOREVER: u64 = u64::MAX;
 
 /// Counts of interposed calls that took the scheduler path, for the report
-pub static COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+pub static COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 pub const C_CREATE: usize = 0;
 pub const C_JOIN: usize = 1;
 pub const C_MUTEX: usize = 2;
@@ -128,7 +128,9 @@ pub const C_OSSYNC: usize = 5;
 pub const C_YIELD: usize = 6;
 pub const C_EXIT: usize = 7;
 pub const C_DISPATCH: usize = 8;
-pub const COUNT_NAMES: [&str; 9] = [
+/// Waits a system library made, taken to the kernel with the baton
+pub const C_SYSTEM: usize = 9;
+pub const COUNT_NAMES: [&str; 10] = [
     "create",
     "join",
     "mutex_wait",
@@ -138,7 +140,68 @@ pub const COUNT_NAMES: [&str; 9] = [
     "yield",
     "exit",
     "dispatch_wait",
+    "system_wait",
 ];
+
+/// A wait a system library makes on its own behalf (libdispatch waiting
+/// for a block on a GCD worker, libxpc for a reply) is ended by a thread
+/// the scheduler does not run, at a moment of real time. Blocked in the
+/// scheduler, the waiter would come back at a point of the schedule that
+/// depends on it. So such a wait is the real one, made with the baton:
+/// nothing else in the run moves until it is over, and the run is the
+/// same whenever that is. The caller's return address tells such a wait
+/// from the guest's own (Rust's parking is a dispatch semaphore, its
+/// futexes are ulocks), which other scheduled threads end.
+///
+/// Not quite exact: libc++'s `std::atomic::wait` is a ulock wait from a
+/// system library that a guest thread ends. A guest that uses it from C++
+/// would hold the baton in the kernel for the wake that cannot come.
+fn system_wait(caller: usize) -> bool {
+    if !crate::process::in_system_library(caller) {
+        return false;
+    }
+    count(C_SYSTEM);
+    true
+}
+
+extern "C" {
+    fn rewrite_ulock_wait_shim();
+    fn rewrite_ulock_wait2_shim();
+    fn rewrite_os_sync_wait_shim();
+    fn rewrite_os_sync_wait_timeout_shim();
+    fn rewrite_dispatch_semaphore_wait_shim();
+}
+
+// Each shim hands the caller's return address on as one more argument, in
+// the register after the call's own; the tail call keeps the link register
+// so the implementation returns straight to the caller.
+std::arch::global_asm!(
+    ".globl _rewrite_ulock_wait_shim",
+    ".p2align 2",
+    "_rewrite_ulock_wait_shim:",
+    "mov x4, x30",
+    "b _rewrite_ulock_wait_impl",
+    ".globl _rewrite_ulock_wait2_shim",
+    ".p2align 2",
+    "_rewrite_ulock_wait2_shim:",
+    "mov x5, x30",
+    "b _rewrite_ulock_wait2_impl",
+    ".globl _rewrite_os_sync_wait_shim",
+    ".p2align 2",
+    "_rewrite_os_sync_wait_shim:",
+    "mov x4, x30",
+    "b _rewrite_os_sync_wait_impl",
+    ".globl _rewrite_os_sync_wait_timeout_shim",
+    ".p2align 2",
+    "_rewrite_os_sync_wait_timeout_shim:",
+    "mov x6, x30",
+    "b _rewrite_os_sync_wait_timeout_impl",
+    ".globl _rewrite_dispatch_semaphore_wait_shim",
+    ".p2align 2",
+    "_rewrite_dispatch_semaphore_wait_shim:",
+    "mov x2, x30",
+    "b _rewrite_dispatch_semaphore_wait_impl",
+);
 
 fn count(i: usize) {
     COUNTS[i].fetch_add(1, Ordering::Relaxed);
@@ -523,8 +586,17 @@ fn unfair_wait(op: u32, addr: *mut c_void, value: u64, real: impl Fn() -> c_int)
     )
 }
 
-extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int {
-    if my_id().is_none() {
+#[no_mangle]
+pub extern "C" fn rewrite_ulock_wait_impl(
+    op: u32,
+    addr: *mut c_void,
+    value: u64,
+    timeout_us: u32,
+    caller: usize,
+) -> c_int {
+    // An unfair lock's owner may be a parked thread of ours (libdispatch's
+    // once gate): that wait stays the scheduler's, whoever made it
+    if my_id().is_none() || (!ulock_is_unfair(op) && system_wait(caller)) {
         return unsafe { __ulock_wait(op, addr, value, timeout_us) };
     }
     count(C_ULOCK);
@@ -548,14 +620,16 @@ extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: 
     )
 }
 
-extern "C" fn my_ulock_wait2(
+#[no_mangle]
+pub extern "C" fn rewrite_ulock_wait2_impl(
     op: u32,
     addr: *mut c_void,
     value: u64,
     timeout_ns: u64,
     value2: u64,
+    caller: usize,
 ) -> c_int {
-    if my_id().is_none() {
+    if my_id().is_none() || (!ulock_is_unfair(op) && system_wait(caller)) {
         return unsafe { __ulock_wait2(op, addr, value, timeout_ns, value2) };
     }
     count(C_ULOCK);
@@ -590,13 +664,15 @@ extern "C" fn my_ulock_wake(op: u32, addr: *mut c_void, wake_value: u64) -> c_in
     }
 }
 
-extern "C" fn my_os_sync_wait_on_address(
+#[no_mangle]
+pub extern "C" fn rewrite_os_sync_wait_impl(
     addr: *mut c_void,
     value: u64,
     size: usize,
     flags: u32,
+    caller: usize,
 ) -> c_int {
-    if my_id().is_none() {
+    if my_id().is_none() || system_wait(caller) {
         return unsafe { os_sync_wait_on_address(addr, value, size, flags) };
     }
     count(C_OSSYNC);
@@ -607,15 +683,17 @@ extern "C" fn my_os_sync_wait_on_address(
     0
 }
 
-extern "C" fn my_os_sync_wait_on_address_with_timeout(
+#[no_mangle]
+pub extern "C" fn rewrite_os_sync_wait_timeout_impl(
     addr: *mut c_void,
     value: u64,
     size: usize,
     flags: u32,
     clockid: u32,
     timeout_ns: u64,
+    caller: usize,
 ) -> c_int {
-    if my_id().is_none() {
+    if my_id().is_none() || system_wait(caller) {
         return unsafe {
             os_sync_wait_on_address_with_timeout(addr, value, size, flags, clockid, timeout_ns)
         };
@@ -707,8 +785,13 @@ fn dispatch_timeout_ns(timeout: u64) -> u64 {
 /// Rust's `Thread::park` sits on one of these. A zero timeout is a
 /// try-wait, which lets the count live in libdispatch while the blocking
 /// moves into the scheduler.
-extern "C" fn my_dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isize {
-    if my_id().is_none() {
+#[no_mangle]
+pub extern "C" fn rewrite_dispatch_semaphore_wait_impl(
+    sema: *mut c_void,
+    timeout: u64,
+    caller: usize,
+) -> isize {
+    if my_id().is_none() || system_wait(caller) {
         return unsafe { dispatch_semaphore_wait(sema, timeout) };
     }
     loop {
@@ -792,14 +875,14 @@ interposers! {
     my_pthread_rwlock_unlock => libc::pthread_rwlock_unlock,
     my_pthread_cond_signal => libc::pthread_cond_signal,
     my_pthread_cond_broadcast => libc::pthread_cond_broadcast,
-    my_ulock_wait => __ulock_wait,
-    my_ulock_wait2 => __ulock_wait2,
+    rewrite_ulock_wait_shim => __ulock_wait,
+    rewrite_ulock_wait2_shim => __ulock_wait2,
     my_ulock_wake => __ulock_wake,
-    my_os_sync_wait_on_address => os_sync_wait_on_address,
-    my_os_sync_wait_on_address_with_timeout => os_sync_wait_on_address_with_timeout,
+    rewrite_os_sync_wait_shim => os_sync_wait_on_address,
+    rewrite_os_sync_wait_timeout_shim => os_sync_wait_on_address_with_timeout,
     my_os_sync_wake_by_address_any => os_sync_wake_by_address_any,
     my_os_sync_wake_by_address_all => os_sync_wake_by_address_all,
-    my_dispatch_semaphore_wait => dispatch_semaphore_wait,
+    rewrite_dispatch_semaphore_wait_shim => dispatch_semaphore_wait,
     my_dispatch_semaphore_signal => dispatch_semaphore_signal,
     my_sched_yield => libc::sched_yield,
     my_pthread_yield_np => pthread_yield_np,

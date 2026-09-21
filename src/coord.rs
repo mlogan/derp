@@ -126,6 +126,11 @@ impl Coordinator {
         self.shared.lock().stop_at_ns = ns;
     }
 
+    /// Whether guests may connect to addresses outside the virtual network.
+    pub fn set_outside_network(&self, allowed: bool) {
+        self.shared.lock().net.outside_allowed = allowed;
+    }
+
     /// Fill the host table, in declaration order: host `i` is `10.0.0.(i + 1)`.
     pub fn add_hosts(&self, names: &[String]) {
         let mut s = self.shared.lock();

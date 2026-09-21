@@ -443,6 +443,8 @@ fn start_private_run(cfg: &Config) -> (&'static Shared, usize) {
     let mem = map_region(-1, Shared::SIZE);
     let sh = unsafe { Shared::init(mem, cfg.seed, cfg.quantum_lo, cfg.quantum_hi) };
     let mut s = sh.lock();
+    // A lone program inherits the environment; the network too
+    s.net.outside_allowed = true;
     let pid = s.add_proc(0, shared::NO_PROC);
     s.procs[pid as usize].state = shared::P_LIVE;
     s.procs[pid as usize].real_pid = unsafe { libc::getpid() };

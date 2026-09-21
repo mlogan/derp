@@ -427,6 +427,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         net_latency_ns: cli.net_latency_ns,
         reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
         stop_at_ns: cli.stop_after_ns,
+        outside_network: m.outside_network,
     };
     if run.stop_at_ns != 0 && (run.passive || run.dylib.is_none()) {
         return Err("stop-after needs the supervisor: it is a virtual time".into());

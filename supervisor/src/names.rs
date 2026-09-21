@@ -92,6 +92,24 @@ unsafe fn entry(name: &[u8], ip: u32, port: u16, socktype: c_int, canon: bool) -
     p
 }
 
+static REFUSED_LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A name the resolver answers without asking the network
+unsafe fn needs_no_lookup(name: &[u8], hints: *const libc::addrinfo) -> bool {
+    if !hints.is_null() && (*hints).ai_flags & libc::AI_NUMERICHOST != 0 {
+        return true;
+    }
+    let Ok(text) = std::str::from_utf8(name) else {
+        return false;
+    };
+    text.eq_ignore_ascii_case("localhost")
+        || text.parse::<std::net::IpAddr>().is_ok()
+        || text.strip_prefix('[').is_some_and(|t| {
+            t.strip_suffix(']')
+                .is_some_and(|t| t.parse::<std::net::Ipv6Addr>().is_ok())
+        })
+}
+
 pub unsafe extern "C" fn my_getaddrinfo(
     node: *const c_char,
     service: *const c_char,
@@ -111,6 +129,22 @@ pub unsafe extern "C" fn my_getaddrinfo(
         None
     };
     let Some((name, addr)) = virtual_host else {
+        // Any other name is the system resolver's, which answers in real
+        // time with whatever the world says: refused with the rest of the
+        // outside network. Numeric addresses and localhost need no lookup.
+        if in_run()
+            && !node.is_null()
+            && !sched::with(|s, _| s.net.outside_allowed).unwrap_or(true)
+            && !needs_no_lookup(CStr::from_ptr(node).to_bytes(), hints)
+        {
+            if !REFUSED_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::report::log(
+                    "name lookup outside the virtual network refused; \
+                     `outside-network: allow` in the run file lets it through",
+                );
+            }
+            return libc::EAI_NONAME;
+        }
         return libc::getaddrinfo(node, service, hints, res);
     };
     let (family, socktype, flags) = if hints.is_null() {

@@ -114,6 +114,7 @@ struct RawRun {
     net_latency: Option<Scalar>,
     heap_size: Option<Scalar>,
     stop_after: Option<Scalar>,
+    outside_network: Option<String>,
     #[serde(default)]
     allow: Vec<String>,
     #[serde(default)]
@@ -246,6 +247,10 @@ pub struct Manifest {
     pub heap_size: Option<String>,
     /// Virtual time at which the run is over, whatever still runs
     pub stop_after: Option<String>,
+    /// Whether a guest may connect to addresses outside the virtual
+    /// network (what comes back is input the run cannot repeat); refused
+    /// with `ENETUNREACH` unless the run file says `outside-network: allow`
+    pub outside_network: bool,
     pub allow: Vec<String>,
     /// Variables for every process of the run
     pub env: Vec<(String, String)>,
@@ -289,6 +294,15 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     if raw.hosts.len() > MAX_HOSTS {
         return Err(format!("run file: more than {MAX_HOSTS} hosts"));
     }
+    let outside_network = match raw.outside_network.as_deref() {
+        None | Some("refuse") => false,
+        Some("allow") => true,
+        Some(other) => {
+            return Err(format!(
+                "run file: outside-network is refuse (default) or allow, not {other}"
+            ))
+        }
+    };
     let mut m = Manifest {
         seed: raw.seed,
         quantum: raw.quantum,
@@ -296,6 +310,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         net_latency: raw.net_latency.as_ref().map(Scalar::text),
         heap_size: raw.heap_size.as_ref().map(Scalar::text),
         stop_after: raw.stop_after.as_ref().map(Scalar::text),
+        outside_network,
         allow: raw.allow,
         env: raw.env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
         pass_env: raw.pass_env,

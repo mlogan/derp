@@ -6,6 +6,7 @@ pub const STR_X30_PRE: u32 = 0xF81F_0FFE; // str x30, [sp, #-16]!
 pub const LDR_X30_POST: u32 = 0xF841_07FE; // ldr x30, [sp], #16
 pub const SUB_X1_X1_1: u32 = 0xD100_0421;
 pub const BLR_X0: u32 = 0xD63F_0000;
+pub const BLR_X1: u32 = 0xD63F_0020;
 pub const RET: u32 = 0xD65F_03C0;
 
 pub const B_RANGE: i64 = 128 << 20;

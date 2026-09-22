@@ -416,6 +416,16 @@ pub unsafe extern "C" fn my_kevent(
             if got > 0 {
                 // A one-shot registration that fired is gone from the kernel
                 let fired = &out[n..n + got as usize];
+                if crate::net::diag_net() {
+                    for e in fired {
+                        let (ident, filter, flags, fflags, data) =
+                            (e.ident, e.filter, e.flags, e.fflags, e.data);
+                        sched::trace_line(&format!(
+                            "real kevent ident={ident} filter={filter} flags={flags:#x} fflags={fflags:#x} data={data} at {}",
+                            sched::now()
+                        ));
+                    }
+                }
                 if fired.iter().any(|e| e.flags & libc::EV_ONESHOT != 0) {
                     let mut kqs = KQS.lock();
                     if let Some(k) = kqs.0.iter_mut().find(|k| k.fds.contains(&kq)) {

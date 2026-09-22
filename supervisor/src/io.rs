@@ -243,6 +243,9 @@ pub unsafe extern "C" fn my_read(fd: c_int, buf: *mut c_void, n: usize) -> isize
     if let Some(sock) = crate::net::lookup(fd) {
         return crate::net::recv_fd(fd, sock, buf.cast(), n, 0);
     }
+    if let Some(got) = crate::determinism::read_random(fd, buf, n) {
+        return got;
+    }
     when_readable(fd, || unsafe { libc::read(fd, buf, n) })
 }
 
@@ -251,6 +254,9 @@ pub unsafe extern "C" fn my_read_nocancel(fd: c_int, buf: *mut c_void, n: usize)
     if let Some(sock) = crate::net::lookup(fd) {
         return crate::net::recv_fd(fd, sock, buf.cast(), n, 0);
     }
+    if let Some(got) = crate::determinism::read_random(fd, buf, n) {
+        return got;
+    }
     when_readable(fd, || unsafe { read_nocancel(fd, buf, n) })
 }
 
@@ -258,6 +264,9 @@ pub unsafe extern "C" fn my_readv(fd: c_int, iov: *const libc::iovec, n: c_int) 
     sched::hook_event(sched::SITE_IO);
     if let Some(sock) = crate::net::lookup(fd) {
         return readv_virtual(fd, sock, iov, n);
+    }
+    if n > 0 && crate::determinism::read_random(fd, (*iov).iov_base, (*iov).iov_len).is_some() {
+        return (*iov).iov_len as isize;
     }
     when_readable(fd, || unsafe { libc::readv(fd, iov, n) })
 }
@@ -350,10 +359,12 @@ fn close_managed(fd: c_int, real: impl Fn() -> c_int) -> c_int {
 
 pub unsafe extern "C" fn my_close(fd: c_int) -> c_int {
     sched::hook_event(sched::SITE_IO);
+    crate::determinism::closed(fd);
     close_managed(fd, || unsafe { libc::close(fd) })
 }
 
 pub unsafe extern "C" fn my_close_nocancel(fd: c_int) -> c_int {
     sched::hook_event(sched::SITE_IO);
+    crate::determinism::closed(fd);
     close_managed(fd, || unsafe { close_nocancel(fd) })
 }

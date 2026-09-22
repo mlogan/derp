@@ -37,6 +37,11 @@ pub enum Class {
         rn: u8,
     },
     Ret,
+    /// `mrs xN, cntvct_el0` or `cntpct_el0`: the CPU's counter, a clock
+    /// no interposer sees
+    Counter {
+        rt: u8,
+    },
     /// A load or store that can be displaced into a stub and re-executed
     Mem {
         base: u8,
@@ -65,6 +70,11 @@ fn rel(pc: u64, imm: u64, bits: u32) -> u64 {
 }
 
 pub fn decode(w: u32, pc: u64) -> Class {
+    if w & 0xFFFF_FFE0 == 0xD53B_E040 || w & 0xFFFF_FFE0 == 0xD53B_E020 {
+        return Class::Counter {
+            rt: (w & 0x1F) as u8,
+        };
+    }
     // Unconditional immediate branches
     if w & 0xFC00_0000 == 0x1400_0000 {
         return Class::B {

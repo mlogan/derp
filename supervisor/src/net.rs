@@ -457,7 +457,16 @@ pub fn send_to(
             break;
         }
     }
+    if diag_net() {
+        sched::trace_line(&format!("net send fd={fd} sock={sock} sent={done} of {len}"));
+    }
     done as isize
+}
+
+/// Diagnostic: `DIAG_TRACE_NET=1` traces every virtual-socket transfer
+pub fn diag_net() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DIAG_TRACE_NET").is_some())
 }
 
 pub fn send_fd(fd: c_int, sock: u32, buf: *const u8, len: usize, flags: c_int) -> isize {
@@ -501,6 +510,9 @@ pub fn recv_from(
         if !waitall || done == len {
             break;
         }
+    }
+    if diag_net() {
+        sched::trace_line(&format!("net recv fd={fd} sock={sock} got={done} of {len}"));
     }
     done as isize
 }
@@ -825,6 +837,7 @@ pub unsafe extern "C" fn my_dup(fd: c_int) -> c_int {
     let new = libc::dup(fd);
     if new >= 0 {
         crate::kq::duplicated(fd, new);
+        crate::determinism::duplicated(fd, new);
     }
     if let (Some(sock), true) = (sock, new >= 0) {
         duplicated(sock);
@@ -841,6 +854,8 @@ pub unsafe extern "C" fn my_dup2(fd: c_int, target: c_int) -> c_int {
         // Whatever `target` was is closed, registrations and all
         crate::kq::closed(target);
         crate::kq::duplicated(fd, target);
+        crate::determinism::closed(target);
+        crate::determinism::duplicated(fd, target);
         if let Some(sock) = sock {
             duplicated(sock);
         }

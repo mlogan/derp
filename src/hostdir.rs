@@ -31,9 +31,12 @@ pub fn prepare(scratch: &Path, base: &Path, hosts: &[Host]) -> io::Result<Vec<Pa
     Ok(roots)
 }
 
+/// Modes come along: a database refuses a data directory others may read.
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
-    if std::fs::metadata(from)?.is_dir() {
+    let meta = std::fs::metadata(from)?;
+    if meta.is_dir() {
         std::fs::create_dir(to)?;
+        std::fs::set_permissions(to, meta.permissions())?;
         let mut entries: Vec<_> = std::fs::read_dir(from)?.collect::<Result<_, _>>()?;
         // Creation order shows in directory listings; keep it repeatable
         entries.sort_by_key(std::fs::DirEntry::file_name);

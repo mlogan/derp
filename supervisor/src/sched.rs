@@ -306,6 +306,7 @@ pub static OUTSIDE_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 extern "C" {
     fn rewrite_scheduler_yield();
+    fn rewrite_counter_read();
 }
 
 /// Fold the hooks consumed from the current quantum into `HOOKS`.
@@ -390,6 +391,18 @@ fn map_shared_file(path: &str) -> Option<(*mut Shared, usize)> {
 
 fn scheduler_slot() -> *mut usize {
     (shared::STUB_BASE + shared::SLOT_OFFSET as usize) as *mut usize
+}
+
+fn counter_slot() -> *mut usize {
+    (shared::STUB_BASE + shared::COUNTER_ENTRY_OFFSET as usize) as *mut usize
+}
+
+/// Called from a counter-read trampoline, through `rewrite_counter_read`,
+/// with the guest's registers saved: the virtual clock in the counter's
+/// ticks, which the trampoline's site register receives.
+#[no_mangle]
+pub extern "C" fn rewrite_counter_impl() -> u64 {
+    crate::determinism::counter_ticks()
 }
 
 pub fn fatal(msg: &str) -> ! {
@@ -481,6 +494,7 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     }
     if std::env::var_os(PASSIVE_VAR).is_some() {
         map_region(-1, Shared::SIZE);
+        unsafe { counter_slot().write(rewrite_counter_read as *const () as usize) };
         return;
     }
     let mut key: libc::pthread_key_t = 0;
@@ -499,7 +513,10 @@ pub fn init(info: Option<Info>, cfg: &Config) {
         }
         Err(_) => start_private_run(cfg),
     };
-    unsafe { scheduler_slot().write(rewrite_scheduler_yield as *const () as usize) };
+    unsafe {
+        scheduler_slot().write(rewrite_scheduler_yield as *const () as usize);
+        counter_slot().write(rewrite_counter_read as *const () as usize);
+    }
     SHARED.store(std::ptr::from_ref(sh).cast_mut(), Ordering::Relaxed);
     open_trace();
     load_mask();
@@ -594,7 +611,49 @@ pub fn peek_clock() -> Option<u64> {
 
 /// A read of the virtual clock by the guest, or None outside a run.
 pub fn clock_read() -> Option<u64> {
-    with(|s, _| s.clock_read())
+    let now = with(|s, _| s.clock_read());
+    if let Some(now) = now {
+        trace_clock_read(now);
+    }
+    now
+}
+
+/// Diagnostic: `DIAG_TRACE_CLOCK=lo..hi` (virtual ns) in the guest's
+/// environment traces every clock read in that window with the reader's
+/// call chain (frame pointers), to find a read that comes and goes.
+static TRACE_CLOCK: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+
+#[inline(never)]
+fn trace_clock_read(now: u64) {
+    let window = TRACE_CLOCK.get_or_init(|| {
+        let v = std::env::var("DIAG_TRACE_CLOCK").ok()?;
+        let (lo, hi) = v.split_once("..")?;
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    });
+    let Some((lo, hi)) = *window else { return };
+    if now < lo || now > hi {
+        return;
+    }
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let mut fp: *const usize;
+    unsafe { std::arch::asm!("mov {}, x29", out(reg) fp) };
+    let mut line = format!("p{} t{:?} clock read {now}", pid(), my_id());
+    for _ in 0..10 {
+        if fp.is_null() || (fp as usize) & 7 != 0 {
+            break;
+        }
+        let (next, ret) = unsafe { (*fp as *const usize, *fp.add(1)) };
+        let _ = write!(line, " {ret:#x}");
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    line.push('\n');
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
 }
 
 static YIELDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -733,6 +792,7 @@ impl After {
                 // Traced too: a quantum ended here, switch or not, and
                 // masking this site would move the run
                 trace_switch(me, me, self.issued, site, self.clock);
+                die_if_stopped();
                 if self.unsettled {
                     take_up_baton(sh);
                 } else {
@@ -775,10 +835,19 @@ pub fn signal_crashed(s: &mut shared::State) -> bool {
 /// released at this point of the schedule and not at some later one, and
 /// until a thread of this process that exited is gone.
 pub fn take_up_baton(sh: &Shared) {
+    die_if_stopped();
     // Before the counter is ours: the exiting thread's last hooks go
     // against the count it left behind
     wait_out_exit();
     wait_out_deaths(sh, true);
+}
+
+/// The run's stop reached this process: its report, then its end. Its
+/// death passes the baton on to the next stopped process.
+fn die_if_stopped() {
+    if with(|s, pid| s.procs[pid as usize].stopped) == Some(true) {
+        die();
+    }
 }
 
 /// Threads whose exit the next holder waited for, and the longest wait
@@ -949,6 +1018,16 @@ fn open_trace() {
     let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 200) };
     unsafe { libc::close(fd) };
     TRACE_FD.store(high, Ordering::Relaxed);
+}
+
+/// Diagnostic: a line of the trace
+pub fn trace_line(text: &str) {
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let line = format!("p{} t{:?} {text}\n", pid(), my_id());
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
 }
 
 fn trace_outside_expiry(site: u64) {
@@ -1177,6 +1256,105 @@ pub fn report(out: &mut String) {
         let _ = writeln!(out, "interposed_{name}={}", c.load(Ordering::Relaxed));
     }
 }
+
+// A counter read's entry. On entry [sp] holds the guest's x0 and x1 (the
+// trampoline pushed them) and x30 points at the word holding the site's
+// register number. Every other register the guest may have live is saved
+// here, x0..x28 in one block so the result can be dropped into the slot
+// of any of them; x29 and x30 are never a counter's destination.
+std::arch::global_asm!(
+    ".globl _rewrite_counter_read",
+    ".p2align 2",
+    "_rewrite_counter_read:",
+    "stp x29, x30, [sp, #-16]!",
+    "mov x29, sp",
+    // x0..x28: x0 and x1 copied from the trampoline's push at [x29, #16]
+    "sub sp, sp, #240",
+    "ldp x2, x3, [x29, #16]",
+    "stp x2, x3, [sp, #0]",
+    "ldp x2, x3, [x29, #-224]",
+    "stp x2, x3, [sp, #16]",
+    "stp x4, x5, [sp, #32]",
+    "stp x6, x7, [sp, #48]",
+    "stp x8, x9, [sp, #64]",
+    "stp x10, x11, [sp, #80]",
+    "stp x12, x13, [sp, #96]",
+    "stp x14, x15, [sp, #112]",
+    "stp x16, x17, [sp, #128]",
+    "stp x18, x19, [sp, #144]",
+    "stp x20, x21, [sp, #160]",
+    "stp x22, x23, [sp, #176]",
+    "stp x24, x25, [sp, #192]",
+    "stp x26, x27, [sp, #208]",
+    "str x28, [sp, #224]",
+    "mrs x2, nzcv",
+    "mrs x3, fpsr",
+    "stp x2, x3, [sp, #-16]!",
+    "stp q0, q1, [sp, #-32]!",
+    "stp q2, q3, [sp, #-32]!",
+    "stp q4, q5, [sp, #-32]!",
+    "stp q6, q7, [sp, #-32]!",
+    "stp q8, q9, [sp, #-32]!",
+    "stp q10, q11, [sp, #-32]!",
+    "stp q12, q13, [sp, #-32]!",
+    "stp q14, q15, [sp, #-32]!",
+    "stp q16, q17, [sp, #-32]!",
+    "stp q18, q19, [sp, #-32]!",
+    "stp q20, q21, [sp, #-32]!",
+    "stp q22, q23, [sp, #-32]!",
+    "stp q24, q25, [sp, #-32]!",
+    "stp q26, q27, [sp, #-32]!",
+    "stp q28, q29, [sp, #-32]!",
+    "stp q30, q31, [sp, #-32]!",
+    "bl _rewrite_counter_impl",
+    // The block of x0..x28 sits at x29 - 240; the site's register is the
+    // word at x30 (saved at [x29, #8])
+    "ldr x1, [x29, #8]",
+    "ldr w1, [x1]",
+    "sub x2, x29, #240",
+    "str x0, [x2, x1, lsl #3]",
+    "ldp q30, q31, [sp], #32",
+    "ldp q28, q29, [sp], #32",
+    "ldp q26, q27, [sp], #32",
+    "ldp q24, q25, [sp], #32",
+    "ldp q22, q23, [sp], #32",
+    "ldp q20, q21, [sp], #32",
+    "ldp q18, q19, [sp], #32",
+    "ldp q16, q17, [sp], #32",
+    "ldp q14, q15, [sp], #32",
+    "ldp q12, q13, [sp], #32",
+    "ldp q10, q11, [sp], #32",
+    "ldp q8, q9, [sp], #32",
+    "ldp q6, q7, [sp], #32",
+    "ldp q4, q5, [sp], #32",
+    "ldp q2, q3, [sp], #32",
+    "ldp q0, q1, [sp], #32",
+    "ldp x2, x3, [sp], #16",
+    "msr nzcv, x2",
+    "msr fpsr, x3",
+    // x0 and x1 go back to the trampoline's push, for it to pop
+    "ldp x2, x3, [sp, #0]",
+    "stp x2, x3, [x29, #16]",
+    "ldp x2, x3, [sp, #16]",
+    "ldp x4, x5, [sp, #32]",
+    "ldp x6, x7, [sp, #48]",
+    "ldp x8, x9, [sp, #64]",
+    "ldp x10, x11, [sp, #80]",
+    "ldp x12, x13, [sp, #96]",
+    "ldp x14, x15, [sp, #112]",
+    "ldp x16, x17, [sp, #128]",
+    "ldp x18, x19, [sp, #144]",
+    "ldp x20, x21, [sp, #160]",
+    "ldp x22, x23, [sp, #176]",
+    "ldp x24, x25, [sp, #192]",
+    "ldp x26, x27, [sp, #208]",
+    "ldr x28, [sp, #224]",
+    "add sp, sp, #240",
+    "ldp x29, x30, [sp], #16",
+    "ldp x0, x1, [sp], #16",
+    "add x30, x30, #4",
+    "ret",
+);
 
 // Saves every register the guest may have live (the stub already saved x0,
 // x1 and x30), calls the Rust scheduler, and restores them. x18 is the

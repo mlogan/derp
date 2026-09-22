@@ -33,6 +33,8 @@ pub const STUB_BASE: usize = 0x78_0000_0000;
 /// load the scheduler entry point from `STUB_BASE + SLOT_OFFSET`.
 pub const PRIVATE_SIZE: usize = 0x4000;
 pub const SLOT_OFFSET: u32 = 0;
+/// Next to it, the entry a counter-read trampoline calls
+pub const COUNTER_ENTRY_OFFSET: u32 = 8;
 /// Where guests map the file
 pub const MAP_ADDR: usize = STUB_BASE + PRIVATE_SIZE;
 /// Offset of the quantum counter from `STUB_BASE`, in reach of an
@@ -94,7 +96,7 @@ pub const DEBUG_PATH_LEN: usize = 1024;
 
 /// What the cache puts between a program's file name and the key of its
 /// rewritten copy
-pub const CACHE_TAG: &str = ".rw4-";
+pub const CACHE_TAG: &str = ".rw5-";
 
 /// Store `path` in one of the state's path fields; too long is not stored.
 pub fn set_debug_path(field: &mut [u8; DEBUG_PATH_LEN], path: &str) {
@@ -811,16 +813,23 @@ impl State {
         (self.stop_at_ns != 0 && !self.stopped).then_some(self.stop_at_ns)
     }
 
-    /// The run is over: every process alive is crashed, marked as stopped
-    /// rather than faulted, and none is restarted. A point of the schedule
-    /// like an injected crash, so it falls at the same place every run.
+    /// The run is over: every process alive is marked as stopped, and none
+    /// is restarted. A point of the schedule like an injected crash, so it
+    /// falls at the same place every run. Every thread of a stopped process
+    /// is made runnable: the first of them to take the baton up writes the
+    /// process's report and ends it (`sched::die_if_stopped`), so a stopped
+    /// process is heard from, which a killed one is not.
     fn stop_run(&mut self) {
         self.stopped = true;
-        for pid in 0..self.nprocs {
-            let p = &mut self.procs[pid as usize];
+        for pid in 0..self.nprocs as usize {
+            let p = &mut self.procs[pid];
             if p.state != P_EXITED && !p.killed {
                 p.stopped = true;
-                self.crash(pid);
+            }
+        }
+        for t in &mut self.threads[..self.nthreads as usize] {
+            if t.state != T_EXITED && self.procs[t.pid as usize].stopped {
+                t.state = T_RUNNABLE;
             }
         }
     }
@@ -981,7 +990,6 @@ impl State {
         }
         if self.pending_stop().is_some_and(|at| self.clock_ns >= at) {
             self.stop_run();
-            return None;
         }
         self.clock_moved();
         self.inject_due_crashes();
@@ -1002,7 +1010,6 @@ impl State {
             self.clock_ns = self.clock_ns.max(next);
             if self.pending_stop().is_some_and(|at| self.clock_ns >= at) {
                 self.stop_run();
-                return None;
             }
             self.clock_moved();
             self.inject_due_crashes();

@@ -919,8 +919,8 @@ fn curl_fetches_pages_from_python_web_servers_on_two_hosts() {
             "{}",
             r.stdout[0]
         );
-        // Daemons are killed when curl is done; nothing left the virtual network
-        assert_eq!(r.fields["p0.status"], "signal 9");
+        // Daemons are stopped when curl is done; nothing left the virtual network
+        assert_eq!(r.fields["p0.status"], "stopped");
         assert_eq!(r.fields["p2.status"], "exit 0");
         assert_eq!(r.u64("run.net_connections"), 2);
         assert_eq!(r.u64("run.net_passthrough"), 0);

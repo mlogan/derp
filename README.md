@@ -230,6 +230,10 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   order; the launcher is pid 1. A scheduled thread's `pthread_threadid_np`
   is its index in the run plus a billion (kernel thread ids differ from
   run to run; RocksDB mixes one into its DB session ids).
+- A read of the CPU's counter register (`mrs xN, cntvct_el0`, what Redis
+  and others take their monotonic clock from, past every library) is
+  rewritten into a read of the virtual clock, in the counter's ticks. The
+  report of `rewrite scan` and the "sites hooked" line count them.
 - Where a scheduled thread's mappings land is the run's: thread stacks,
   `pthread_t` blocks and `mmap`s without an address go to a reserved
   region (64 GB at `0x7c_0000_0000`) in schedule order, so the kernel's

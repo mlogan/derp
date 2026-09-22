@@ -85,7 +85,9 @@ pub unsafe extern "C" fn rewrite_open_impl(
     if !crate::hostfs::permits("open", path) {
         return -1;
     }
-    open(path, flags, mode as c_int)
+    let fd = open(path, flags, mode as c_int);
+    crate::determinism::opened(path, fd);
+    fd
 }
 
 /// What stdio and the rest of libSystem call instead of `open`
@@ -99,7 +101,9 @@ pub unsafe extern "C" fn rewrite_open_nocancel_impl(
     if !crate::hostfs::permits("open", path) {
         return -1;
     }
-    open_nocancel(path, flags, mode as c_int)
+    let fd = open_nocancel(path, flags, mode as c_int);
+    crate::determinism::opened(path, fd);
+    fd
 }
 
 /// `openat(dirfd, path, flags, mode)`: the variadic mode is the fourth
@@ -115,7 +119,9 @@ pub unsafe extern "C" fn rewrite_openat_impl(
     if !crate::hostfs::permits_at("openat", dirfd, path) {
         return -1;
     }
-    libc::openat(dirfd, path, flags, mode as c_int)
+    let fd = libc::openat(dirfd, path, flags, mode as c_int);
+    crate::determinism::opened(path, fd);
+    fd
 }
 
 extern "C" {

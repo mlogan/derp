@@ -299,6 +299,40 @@ fn an_exiting_threads_last_destructors_do_not_overlap_the_schedule() {
     }
 }
 
+/// The random devices give the seed's bytes, like `getentropy`: Redis
+/// seeds its hash tables from `/dev/urandom`.
+#[test]
+fn the_random_devices_are_seeded() {
+    let dir = common::scratch_dir("urandom");
+    let exe = common::build_c("urandom", &dir, &[]);
+    let rw_path = dir.join("urandom.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+    let (_, other) = run(&rw_path, &[], Some(common::supervisor_dylib()), 2);
+    assert_ne!(other, first);
+}
+
+/// A program that reads the CPU's counter register directly sees the
+/// virtual clock, the same on every run.
+#[test]
+fn the_cpu_counter_is_the_virtual_clock() {
+    let dir = common::scratch_dir("cntvct");
+    let exe = common::build_c("cntvct", &dir, &[]);
+    let rw_path = dir.join("cntvct.rw");
+    let stats = rewrite_to(&exe, &rw_path, &Options::default());
+    assert!(stats.counter_sites >= 3, "{stats:?}");
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    // The virtual clock starts at a second: 24 million ticks, not the
+    // machine's uptime
+    assert!(first.starts_with("freq=24000000 a=2400"), "{first}");
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+}
+
 /// The kernel frees an exited thread's stack itself, at a moment of real
 /// time, and would grant an `mmap` hint into the hole once it has: the run
 /// places a hinted request like one without an address.

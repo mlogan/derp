@@ -126,6 +126,14 @@ impl Coordinator {
         self.shared.lock().stop_at_ns = ns;
     }
 
+    /// The run is over at the virtual time it has reached: what still runs
+    /// (the daemons, once every other process is done) is stopped at its
+    /// next switch, reports, and exits, instead of being killed unheard.
+    pub fn stop_now(&self) {
+        let mut s = self.shared.lock();
+        s.stop_at_ns = s.clock_ns.max(1);
+    }
+
     /// Whether guests may connect to addresses outside the virtual network.
     pub fn set_outside_network(&self, allowed: bool) {
         self.shared.lock().net.outside_allowed = allowed;

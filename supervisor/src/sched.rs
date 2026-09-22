@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::shared::{self, Handoff, Shared};
 use crate::spin::SpinLock;
@@ -68,6 +68,10 @@ static INFO: SpinLock<Option<Info>> = SpinLock::new(None);
 /// `HOOKS` what it consumed before that.
 static LAST_QUANTUM: AtomicI64 = AtomicI64::new(0);
 static HOOKS: AtomicI64 = AtomicI64::new(0);
+/// Quantum expiries taken by threads outside the schedule, and by
+/// scheduled threads not holding the baton
+static OUTSIDE_EXPIRIES: AtomicU64 = AtomicU64::new(0);
+static STRAY_EXPIRIES: AtomicU64 = AtomicU64::new(0);
 
 /// The thread's scheduler id lives in a pthread key (value `id + 1`) rather
 /// than a Rust thread-local: the key's destructor is the thread's teardown
@@ -872,6 +876,17 @@ fn open_trace() {
     TRACE_FD.store(high, Ordering::Relaxed);
 }
 
+fn trace_outside_expiry(site: u64) {
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let mut line = String::new();
+    let who = my_id().map_or("outside".to_string(), |id| format!("t{id}"));
+    let _ = writeln!(line, "p{} {who} expiry without the baton site={site:#x}", pid());
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
+}
+
 fn trace_switch(from: usize, to: usize, issued: u64, site: u64, clock: u64) {
     let fd = TRACE_FD.load(Ordering::Relaxed);
     if fd < 0 {
@@ -997,8 +1012,18 @@ pub extern "C" fn rewrite_yield_impl(stub_pc: u64) {
     }
     with(|s, _| s.expiries += 1);
     if my_id().is_some() {
+        if !baton_is_mine() {
+            // Hooked code ran on a scheduled thread without the baton: it
+            // ate the holder's quantum at a moment of real time
+            STRAY_EXPIRIES.fetch_add(1, Ordering::Relaxed);
+            trace_outside_expiry(stub_pc);
+        }
         yield_baton(State::Runnable, stub_pc);
     } else if let Some(q) = with(|s, _| s.renew_quantum()) {
+        // A thread outside the schedule ran hooked code: its hooks moved
+        // the scheduled threads' expiries, at a moment of real time
+        OUTSIDE_EXPIRIES.fetch_add(1, Ordering::Relaxed);
+        trace_outside_expiry(stub_pc);
         settle_hooks();
         install_quantum(q);
     }
@@ -1033,6 +1058,16 @@ pub fn report(out: &mut String) {
         out,
         "first_outside_wake_ns={}",
         FIRST_OUTSIDE_WAKE_NS.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "outside_expiries={}",
+        OUTSIDE_EXPIRIES.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "stray_expiries={}",
+        STRAY_EXPIRIES.load(Ordering::Relaxed)
     );
     let _ = writeln!(
         out,

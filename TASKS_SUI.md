@@ -157,6 +157,39 @@ room-size iteration oscillated between two answers; the size is now the
 closed-form fixed point of the local site density (0.7 bytes of
 trampoline per byte of `-O0` text: a room per 104 MB).
 
+## Slowdown (2026-09-22)
+
+Measured with `--wall-limit` (real time) and the CPU time each process
+reports (`cpu_user_ns`, `cpu_system_ns`; `wait4`'s rusage). A fixed span
+of time is not a fixed amount of work: the node's consensus is timer
+driven, and under the supervisor a virtual second holds fewer rounds (a
+yield is a millisecond, a clock read a microsecond), so per span the
+comparison favours the supervisor. Three ways that hold up:
+
+| what | native | rewritten, no scheduler | supervised |
+|---|---|---|---|
+| release `sui move build` (examples/move/basics), wall, best of 3 | 0.55 s | 0.72 s (1.31x) | 0.72 to 0.89 s |
+| the same, CPU (user + sys) | 0.50 + 1.03 s | | 0.39 + 0.30 s |
+| `-O0` sui-node, start to "P2p network started", CPU | 0.52 + 0.07 s | (stalls: its clock never moves) | 0.95 + 0.11 s (1.8x) |
+| `-O0` sui-node, 120 s of the node's time, CPU | 40.0 + 1.6 s for 2121 rounds | | 2.9 + 0.65 s for 381 rounds and 3 reconfigurations |
+
+Serialisation costs less CPU than it looks: natively the node's threads
+burn CPU in parallel (the Move build spent twice as much time in the
+kernel natively as its whole supervised run took). The wall-clock ratio
+is what a user of the tool feels: about 1.3x for the hooks alone on
+release code, 1.8x with the scheduler on `-O0` startup. The rewritten
+binary without the scheduler cannot run a server: the passive clock
+advances a microsecond per read, so timers never fire.
+
+Other ways to measure, not done: count instructions natively with
+`xctrace` (Instruments' counters) against hooks x cost per hook; run
+the node natively with the same seed of work (a fixed number of
+transactions from a client) and stop both at the last transaction's
+effects; or `rewrite bench` on a Move unit-test run, which is longer
+and all compute. `sui move build` under a single-program run gave two
+hashes in three runs: such a run inherits the environment and the
+build cache's file times, both real input.
+
 ## Known residual
 
 On some runs one trace line differs: the quantum expires at a different

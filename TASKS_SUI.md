@@ -100,7 +100,13 @@ the log is `DIR/net/sui.log.2027-01-15` (the virtual clock's date).
     its Mach port behind and the next holder in that process spins until
     the port is dead (`exit_waits`, `exit_wait_max_ns` in the report).
     `exitdtor.c`, whose destructor re-arms itself through all four rounds,
-    gave six hashes in six runs before and one after.
+    gave six hashes in six runs before and one after. The first version
+    of the wait timed itself with `Instant::now()` and made every
+    sui-node run differ: dyld routes libSystem's own clock calls to the
+    interposers too, so a supervisor clock read on a scheduled thread
+    moves the virtual clock (the trace showed one thread's hand-off a
+    microsecond apart per spin). The supervisor reads real time only
+    through `mach_absolute_time` directly (`sched::real_now_ns`).
 
 ## Build sizes and reach (2026-09-22)
 

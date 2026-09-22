@@ -148,6 +148,8 @@ static PORTS: SpinLock<Vec<(u32, usize)>> = SpinLock::new(Vec::new());
 
 extern "C" {
     fn pthread_mach_thread_np(t: libc::pthread_t) -> u32;
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
     fn thread_info(thread: u32, flavor: u32, info: *mut u32, count: *mut u32) -> i32;
     fn mach_port_mod_refs(task: u32, name: u32, right: u32, delta: i32) -> i32;
     fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
@@ -653,7 +655,7 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
         describe_blocked();
         fatal("deadlock: every thread is blocked");
     }
-    let began = std::time::Instant::now();
+    let began = real_now_ns();
     loop {
         unsafe { libc::usleep(200) };
         sh.exit_if_orphaned();
@@ -664,7 +666,7 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
         if after.carry_out(sh, me, state, site) {
             return;
         }
-        if began.elapsed() > std::time::Duration::from_secs(30) {
+        if real_now_ns().saturating_sub(began) > 30_000_000_000 {
             fatal("deadlock: every thread is blocked, and no outside thread woke one");
         }
     }
@@ -782,6 +784,20 @@ pub fn take_up_baton(sh: &Shared) {
 /// Threads whose exit the next holder waited for, and the longest wait
 static EXIT_WAITS: AtomicU64 = AtomicU64::new(0);
 static EXIT_WAIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Real time, in nanoseconds, straight from the kernel's clock. The
+/// supervisor must not read the clock through libSystem on a scheduled
+/// thread: dyld routes libSystem's own clock calls to the interposers too,
+/// and every read would move the virtual clock.
+pub fn real_now_ns() -> u64 {
+    static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (numer, denom) = *TIMEBASE.get_or_init(|| {
+        let mut info = [0u32; 2];
+        unsafe { mach_timebase_info(&raw mut info) };
+        (u64::from(info[0].max(1)), u64::from(info[1].max(1)))
+    });
+    (unsafe { mach_absolute_time() }) * numer / denom
+}
 static SAID_EXIT_STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The exiting thread's teardown continues after it hands the baton on:
@@ -816,9 +832,9 @@ fn wait_out_exit() {
     if port == 0 {
         return;
     }
-    let began = std::time::Instant::now();
+    let began = real_now_ns();
     while thread_alive(port) {
-        if began.elapsed() > std::time::Duration::from_secs(30) {
+        if real_now_ns().saturating_sub(began) > 30_000_000_000 {
             if !SAID_EXIT_STUCK.swap(true, Ordering::Relaxed) {
                 crate::report::log("an exited thread is not gone after 30 s; no longer waiting for it");
             }
@@ -829,7 +845,7 @@ fn wait_out_exit() {
     unsafe { mach_port_deallocate(mach_task_self_, port) };
     with(|s, pid| s.procs[pid as usize].exiting_port = 0);
     EXIT_WAITS.fetch_add(1, Ordering::Relaxed);
-    EXIT_WAIT_MAX_NS.fetch_max(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    EXIT_WAIT_MAX_NS.fetch_max(real_now_ns().saturating_sub(began), Ordering::Relaxed);
 }
 
 /// `take_up_baton` for a thread that already runs: its quantum stands.

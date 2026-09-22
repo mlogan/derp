@@ -77,6 +77,7 @@ fn stubs_are_slide_proof() {
         seed: 0,
         quantum: launch::DEFAULT_QUANTUM,
         stop_at_ns: 0,
+        wall_limit_ms: 0,
         passive: false,
         rewrite: None,
     };

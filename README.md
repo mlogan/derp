@@ -28,6 +28,11 @@ Options worth knowing:
   and does not fail the run. For servers that never exit by themselves,
   and for comparing what a program did in a fixed span of virtual time.
   Also `stop-after:` in the run file; it needs the supervisor.
+- `--wall-limit 60s` (`wall-limit:` in the run file) does the same at a
+  real time, and works for `--native` runs too, which have no virtual
+  clock. Every process reports `cpu_user_ns` and `cpu_system_ns`, the CPU
+  time it used, and `run.cpu_*` sum them: what a program cost natively
+  and under the supervisor in the same span.
 - `--capture` writes each guest's stdout to `stdout.<index>` in the
   `--scratch` directory, and `--capture-stderr` its stderr to
   `stderr.<index>` (the supervisor's messages about that guest included;
@@ -48,6 +53,7 @@ heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
 stop-after: 30s          # the run is over at this virtual time (default: never)
+wall-limit: 60s          # or at this real time, native runs included
 outside-network: refuse  # or allow: connections and name lookups beyond the
                          # virtual network reach the real one (input, unrepeatable)
 env: { LOG_LEVEL: debug }   # for every process (guests start from a fixed environment)

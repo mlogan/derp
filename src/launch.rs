@@ -30,6 +30,8 @@ pub struct Launch {
     pub quantum: (u32, u32),
     /// See `Run::stop_at_ns`
     pub stop_at_ns: u64,
+    /// See `Run::wall_limit_ms`
+    pub wall_limit_ms: u64,
     /// Inject the dylib without scheduling: see `Run::passive`
     pub passive: bool,
     /// See `Run::rewrite`
@@ -150,6 +152,10 @@ pub struct Run {
     /// Virtual time at which the run is over whatever is still running
     /// (0: never): for servers that never exit by themselves
     pub stop_at_ns: u64,
+    /// Real time, in milliseconds, after which the run is over whatever is
+    /// still running (0: never). For measuring a run against a native one,
+    /// which has no virtual clock to stop at.
+    pub wall_limit_ms: u64,
     /// Whether guests may connect outside the virtual network
     pub outside_network: bool,
 }
@@ -167,6 +173,8 @@ pub struct RunOutcome {
     /// from; a restarted process shares it with its earlier lives
     pub specs: Vec<Option<usize>>,
     pub totals: Totals,
+    /// The real-time limit ended the run
+    pub wall_limited: bool,
     /// The survivors were killed because every thread was blocked
     pub deadlock: bool,
 }
@@ -178,6 +186,10 @@ struct Tracked {
     spec: Option<usize>,
     pid: libc::pid_t,
     status: Option<i32>,
+    /// CPU time it used, user and system, in nanoseconds, once reaped
+    cpu: Option<(u64, u64)>,
+    /// Killed by the real-time limit
+    wall_limited: bool,
     report: String,
     /// What it ran, once it said (`MSG_IMAGE`): the executable, and the
     /// original that was rewritten into it
@@ -317,6 +329,8 @@ impl Tracked {
             spec,
             pid,
             status: None,
+            cpu: None,
+            wall_limited: false,
             report: String::new(),
             image: None,
             program: None,
@@ -335,10 +349,15 @@ impl Tracked {
         }
         let mut status = 0;
         let flags = if block { 0 } else { libc::WNOHANG };
-        if unsafe { libc::waitpid(self.pid, &raw mut status, flags) } != self.pid {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        if unsafe { libc::wait4(self.pid, &raw mut status, flags, &raw mut usage) } != self.pid {
             return false;
         }
         self.status = Some(status);
+        let ns = |t: libc::timeval| {
+            (t.tv_sec.max(0) as u64) * 1_000_000_000 + (t.tv_usec.max(0) as u64) * 1000
+        };
+        self.cpu = Some((ns(usage.ru_utime), ns(usage.ru_stime)));
         true
     }
 
@@ -357,11 +376,17 @@ struct Events {
 }
 
 enum Event {
-    Exited { index: usize, status: i32 },
+    Exited {
+        index: usize,
+        status: i32,
+    },
     Socket,
+    /// The real-time limit
+    Timer,
 }
 
 const SOCKET_UDATA: usize = usize::MAX;
+const TIMER_UDATA: usize = usize::MAX - 1;
 
 impl Events {
     fn new() -> io::Result<Self> {
@@ -406,6 +431,25 @@ impl Events {
         self.add(fd as usize, libc::EVFILT_READ, 0, SOCKET_UDATA);
     }
 
+    fn watch_timer(&self, ms: u64) {
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        ev.ident = TIMER_UDATA;
+        ev.filter = libc::EVFILT_TIMER;
+        ev.flags = libc::EV_ADD | libc::EV_ONESHOT;
+        ev.data = ms.min(isize::MAX as u64) as isize;
+        ev.udata = TIMER_UDATA as *mut libc::c_void;
+        unsafe {
+            libc::kevent(
+                self.kq,
+                &raw const ev,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            );
+        }
+    }
+
     fn unwatch_socket(&self, fd: libc::c_int) {
         let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
         ev.ident = fd as usize;
@@ -445,6 +489,9 @@ impl Events {
             }
             if ev.udata as usize == SOCKET_UDATA {
                 return Ok(Event::Socket);
+            }
+            if ev.udata as usize == TIMER_UDATA {
+                return Ok(Event::Timer);
             }
             if ev.fflags & libc::NOTE_EXIT != 0 {
                 return Ok(Event::Exited {
@@ -563,12 +610,22 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
     let deadlock = result?;
     let totals = coord.as_ref().map(Coordinator::totals).unwrap_or_default();
     let specs: Vec<Option<usize>> = procs.iter().map(|p| p.spec).collect();
+    let wall_limited = procs.iter().any(|p| p.wall_limited);
     let guests = procs
         .into_iter()
         .enumerate()
         .map(|(i, c)| {
             let mut report = Report::parse(&c.report);
-            let stopped = totals.stopped.get(i).copied().unwrap_or(false);
+            let stopped = totals.stopped.get(i).copied().unwrap_or(false) || c.wall_limited;
+            if let Some((user, system)) = c.cpu {
+                report.fields.insert("cpu_user_ns".into(), user.to_string());
+                report
+                    .fields
+                    .insert("cpu_system_ns".into(), system.to_string());
+            }
+            if c.wall_limited {
+                report.fields.insert("wall_limited".into(), "true".into());
+            }
             // A guest the stop killed never reported; the run-wide values
             // are still worth having
             if coord.is_some() && (!report.fields.is_empty() || stopped) {
@@ -598,6 +655,7 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
         .collect();
     Ok(RunOutcome {
         guests,
+        wall_limited,
         initial: run.guests.len(),
         daemons: run.guests.iter().map(|g| g.daemon).collect(),
         specs,
@@ -736,6 +794,9 @@ fn rewritten_path(run: &Run, payload: &[u8]) -> Result<Vec<u8>, i32> {
 /// Returns whether the run ended in a deadlock.
 fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -> io::Result<bool> {
     let events = Events::new()?;
+    if run.wall_limit_ms != 0 {
+        events.watch_timer(run.wall_limit_ms);
+    }
     let mut channel = None;
     let mut guest_sock = None;
     if coord.is_some() {
@@ -817,6 +878,13 @@ fn supervise_started(
             if std::mem::take(&mut ch.closed) {
                 events.unwatch_socket(ch.fd);
             }
+        }
+        if let Event::Timer = event {
+            for p in procs.iter_mut() {
+                p.wall_limited = p.status.is_none();
+            }
+            end_run(procs);
+            break;
         }
         if let Event::Exited { index, status } = event {
             gone.push(index);
@@ -923,6 +991,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         net_latency_ns: 0,
         reseed: None,
         stop_at_ns: cfg.stop_at_ns,
+        wall_limit_ms: cfg.wall_limit_ms,
         // A single program inherits our environment anyway
         outside_network: true,
     };

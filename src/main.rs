@@ -57,6 +57,9 @@ options:
   --stop-after T                       the run is over at this virtual time: what still runs
                                        is killed there, reported as stopped, and does not
                                        fail the run (for servers that never exit)
+  --wall-limit T                       the same at this real time, for native runs too: to
+                                       compare the CPU time (cpu_user_ns, cpu_system_ns) a
+                                       program uses natively and under the supervisor
 run file:
   seed: 7                              optional; the command line overrides these six
   quantum: 1000..10000
@@ -64,6 +67,7 @@ run file:
   net-latency: 5ms
   heap-size: 32G
   stop-after: 30s
+  wall-limit: 60s
   env: { LOG_LEVEL: debug }            for every process
   pass-env: [SSL_CERT_FILE]            inherited from your environment; nothing else is
   hosts:                               in order: 10.0.0.1, 10.0.0.2, ...
@@ -99,6 +103,8 @@ struct Cli {
     heap_size: u64,
     /// Virtual time at which the run is over (0: when its processes are)
     stop_after_ns: u64,
+    /// Real time after which it is over (0: never)
+    wall_limit_ms: u64,
     reseed_at: Option<u64>,
     reseed: u64,
     jobs: u32,
@@ -138,6 +144,9 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(t), true) = (&m.stop_after, from_file("stop-after")) {
         cli.stop_after_ns = parse_stop_after(t)?;
     }
+    if let (Some(t), true) = (&m.wall_limit, from_file("wall-limit")) {
+        cli.wall_limit_ms = parse_stop_after(t)? / 1_000_000;
+    }
     Ok(cli)
 }
 
@@ -161,6 +170,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         net_latency_ns: 0,
         heap_size: launch::DEFAULT_HEAP,
         stop_after_ns: 0,
+        wall_limit_ms: 0,
         reseed_at: None,
         reseed: 0,
         jobs: 4,
@@ -205,6 +215,10 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 let v = take_value(&mut args)?;
                 cli.heap_size = manifest::parse_size(&v).ok_or(format!("bad heap size {v}"))?;
                 cli.given.push("heap-size");
+            }
+            "--wall-limit" => {
+                cli.wall_limit_ms = parse_stop_after(&take_value(&mut args)?)? / 1_000_000;
+                cli.given.push("wall-limit");
             }
             "--stop-after" => {
                 cli.stop_after_ns = parse_stop_after(&take_value(&mut args)?)?;
@@ -280,6 +294,7 @@ fn run_guest(
         seed: cli.opts.seed,
         quantum: cli.quantum,
         stop_at_ns: cli.stop_after_ns,
+        wall_limit_ms: cli.wall_limit_ms,
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
     };
@@ -432,6 +447,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         net_latency_ns: cli.net_latency_ns,
         reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
         stop_at_ns: cli.stop_after_ns,
+        wall_limit_ms: cli.wall_limit_ms,
         outside_network: m.outside_network,
     };
     if run.stop_at_ns != 0 && (run.passive || run.dylib.is_none()) {
@@ -479,6 +495,12 @@ fn print_run_report(o: &RunOutcome) {
     if o.totals.stopped_at != 0 {
         eprintln!("run.stopped_at={}", o.totals.stopped_at);
     }
+    if o.wall_limited {
+        eprintln!("run.wall_limited=true");
+    }
+    let cpu = |key: &str| -> u64 { o.guests.iter().filter_map(|g| g.report.get_u64(key)).sum() };
+    eprintln!("run.cpu_user_ns={}", cpu("cpu_user_ns"));
+    eprintln!("run.cpu_system_ns={}", cpu("cpu_system_ns"));
     if let Some((entry, life)) = failed_life(o) {
         eprintln!(
             "run.failure=entry {entry}: {}",

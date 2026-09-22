@@ -114,6 +114,7 @@ struct RawRun {
     net_latency: Option<Scalar>,
     heap_size: Option<Scalar>,
     stop_after: Option<Scalar>,
+    wall_limit: Option<Scalar>,
     outside_network: Option<String>,
     #[serde(default)]
     allow: Vec<String>,
@@ -247,6 +248,8 @@ pub struct Manifest {
     pub heap_size: Option<String>,
     /// Virtual time at which the run is over, whatever still runs
     pub stop_after: Option<String>,
+    /// Real time after which the run is over, whatever still runs
+    pub wall_limit: Option<String>,
     /// Whether a guest may connect to addresses outside the virtual
     /// network (what comes back is input the run cannot repeat); refused
     /// with `ENETUNREACH` unless the run file says `outside-network: allow`
@@ -310,6 +313,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         net_latency: raw.net_latency.as_ref().map(Scalar::text),
         heap_size: raw.heap_size.as_ref().map(Scalar::text),
         stop_after: raw.stop_after.as_ref().map(Scalar::text),
+        wall_limit: raw.wall_limit.as_ref().map(Scalar::text),
         outside_network,
         allow: raw.allow,
         env: raw.env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),

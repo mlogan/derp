@@ -4,7 +4,7 @@
 
 use std::ffi::{c_char, c_ulong};
 
-pub const MAGIC: u64 = 0x0032_3030_5453_5752;
+pub const MAGIC: u64 = 0x0033_3030_5453_5752;
 const OFF_MAGIC: usize = 0;
 const OFF_SITES: usize = 8;
 const OFF_MEM_SITES: usize = 16;

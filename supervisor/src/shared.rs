@@ -94,7 +94,7 @@ pub const DEBUG_PATH_LEN: usize = 1024;
 
 /// What the cache puts between a program's file name and the key of its
 /// rewritten copy
-pub const CACHE_TAG: &str = ".rw3-";
+pub const CACHE_TAG: &str = ".rw4-";
 
 /// Store `path` in one of the state's path fields; too long is not stored.
 pub fn set_debug_path(field: &mut [u8; DEBUG_PATH_LEN], path: &str) {
@@ -219,6 +219,10 @@ pub struct ProcRec {
     pub parent: u32,
     /// Raw wait status, valid once `state` is `P_EXITED`
     pub exit_status: i32,
+    /// Mach port of a thread of this process that handed the baton on
+    /// from its teardown and may still be running destructors (0: none);
+    /// the next holder in this process waits for it to be gone
+    pub exiting_port: u32,
     /// Virtual time at which the run learned of the death (0: alive)
     pub died_at: u64,
     /// The parent has collected the exit with `waitpid`
@@ -249,6 +253,8 @@ pub struct ProcRec {
     pub signalled: bool,
     /// Crashed while live, and the run has not yet waited out its real death
     pub unsettled: bool,
+    /// Killed because the run reached `State::stop_at_ns`, not by a fault
+    pub stopped: bool,
     /// Which run-file entry the launcher started this from (`NO_PROC` for a
     /// guest's own child, which only its parent could restart)
     pub spec: u32,
@@ -300,6 +306,10 @@ pub struct State {
     /// Restarts that were due but found the process or thread table full;
     /// the launcher counts them
     pub restarts_refused: u64,
+    /// Virtual time at which the run is over (0: when its processes are):
+    /// every process still alive is killed at that point of the schedule
+    pub stop_at_ns: u64,
+    pub stopped: bool,
     unsignalled: u32,
     pub unsettled: u32,
     pub threads: [ThreadRec; MAX_THREADS],
@@ -731,7 +741,7 @@ impl State {
             RESTART_ON_FAILURE => status != 0,
             _ => false,
         };
-        wanted && p.spec != NO_PROC && p.faults.restarts_left > 0
+        wanted && !self.stopped && p.spec != NO_PROC && p.faults.restarts_left > 0
     }
 
     fn has_room(&self) -> bool {
@@ -793,6 +803,25 @@ impl State {
             }
             self.crash(pid);
             self.crashes_injected += 1;
+        }
+    }
+
+    /// The stop that is still ahead, if the run has one.
+    fn pending_stop(&self) -> Option<u64> {
+        (self.stop_at_ns != 0 && !self.stopped).then_some(self.stop_at_ns)
+    }
+
+    /// The run is over: every process alive is crashed, marked as stopped
+    /// rather than faulted, and none is restarted. A point of the schedule
+    /// like an injected crash, so it falls at the same place every run.
+    fn stop_run(&mut self) {
+        self.stopped = true;
+        for pid in 0..self.nprocs {
+            let p = &mut self.procs[pid as usize];
+            if p.state != P_EXITED && !p.killed {
+                p.stopped = true;
+                self.crash(pid);
+            }
         }
     }
 
@@ -950,22 +979,31 @@ impl State {
             self.rng = Rng::seed_from_u64(self.reseed_with);
             self.fault_rng = Rng::seed_from_u64(self.reseed_with ^ 0xFA17_FA17_FA17_FA17);
         }
+        if self.pending_stop().is_some_and(|at| self.clock_ns >= at) {
+            self.stop_run();
+            return None;
+        }
         self.clock_moved();
         self.inject_due_crashes();
         self.expire_deadlines();
         let mut runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         while runnable == 0 {
-            // A timed waiter's deadline, a payload in flight or a crash,
-            // whichever comes first
+            // A timed waiter's deadline, a payload in flight, a crash or the
+            // run's stop, whichever comes first
             let next = [
                 self.earliest_deadline(),
                 self.net.next_due(),
                 self.next_crash(),
+                self.pending_stop(),
             ]
             .into_iter()
             .flatten()
             .min()?;
             self.clock_ns = self.clock_ns.max(next);
+            if self.pending_stop().is_some_and(|at| self.clock_ns >= at) {
+                self.stop_run();
+                return None;
+            }
             self.clock_moved();
             self.inject_due_crashes();
             self.expire_deadlines();

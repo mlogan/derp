@@ -490,6 +490,26 @@ fn in_run() -> bool {
     crate::coord::connected()
 }
 
+/// Kernel thread ids are system-wide and differ from run to run; `RocksDB`
+/// mixes one into every DB session id. A scheduled thread's is its index in
+/// the run. Threads outside the schedule keep the kernel's.
+const VTID_BASE: u64 = 1_000_000_000;
+
+pub unsafe extern "C" fn my_pthread_threadid_np(thread: libc::pthread_t, tid: *mut u64) -> c_int {
+    if in_run() && !tid.is_null() {
+        let id = if thread == 0 {
+            sched::my_id()
+        } else {
+            sched::with(|s, pid| s.find_pthread(pid, thread as u64)).flatten()
+        };
+        if let Some(id) = id {
+            *tid = VTID_BASE + id as u64;
+            return 0;
+        }
+    }
+    libc::pthread_threadid_np(thread, tid)
+}
+
 extern "C" {
     fn _dyld_get_shared_cache_range(length: *mut usize) -> *const std::ffi::c_void;
 }

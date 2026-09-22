@@ -177,6 +177,9 @@ pub struct Net {
     pub now: u64,
     /// Delay between different hosts; traffic within a host is immediate
     pub latency_ns: u64,
+    /// Connections to addresses outside the virtual network go to the
+    /// kernel (their traffic is input); otherwise they are unreachable
+    pub outside_allowed: bool,
     in_flight: u32,
     next_due: u64,
     // Totals for the report

@@ -73,8 +73,11 @@ fn stubs_are_slide_proof() {
         disable_aslr: false,
         heap_size: rewrite::launch::DEFAULT_HEAP,
         stdout: None,
+        stderr: None,
         seed: 0,
         quantum: launch::DEFAULT_QUANTUM,
+        stop_at_ns: 0,
+        wall_limit_ms: 0,
         passive: false,
         rewrite: None,
     };
@@ -225,4 +228,90 @@ fn allocator_corners() {
             "seed {seed}"
         );
     }
+}
+
+/// A constant table in the text that the function table lists without a
+/// symbol (hand-written assembly keeps round constants that way): its words
+/// decode as instructions, one as a backward `b`, and must not be hooked.
+#[test]
+fn an_unnamed_constant_table_in_the_text_is_left_alone() {
+    let dir = common::scratch_dir("asm_table");
+    let exe = common::build_c("asm_table", &dir, &[]);
+    let rw_path = dir.join("asm_table.rw");
+    let stats = rewrite_to(&exe, &rw_path, &Options::default());
+    assert_eq!(stats.unnamed_entries, 1, "{stats}");
+    assert!(stats.call_sites > 0, "{stats}");
+
+    let (native, expected) = run(&exe, &[], None, 0);
+    assert_eq!(native.exit_code(), Some(0));
+    assert_eq!(expected, "7 12648209782\n");
+    let (supervised, text) = run(&rw_path, &[], Some(common::supervisor_dylib()), 0);
+    assert_eq!(supervised.exit_code(), Some(0));
+    assert_eq!(text, expected);
+}
+
+/// Where scheduled threads' stacks and mappings land is the run's to
+/// decide: in the reserved region, the same on every run, whatever the
+/// kernel placed elsewhere meanwhile.
+#[test]
+fn thread_stacks_and_mappings_land_in_the_region_and_repeat() {
+    let dir = common::scratch_dir("stacks");
+    let exe = common::build_c("stacks", &dir, &[]);
+    let rw_path = dir.join("stacks.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    assert!(o.report.get_u64("mappings_placed").unwrap() >= 5, "{first}");
+    assert_eq!(o.report.get_u64("mappings_overflowed"), Some(0));
+    let addresses: Vec<u64> = first
+        .split(|c: char| !c.is_ascii_hexdigit() && c != 'x')
+        .filter_map(|w| w.strip_prefix("0x"))
+        .filter_map(|h| u64::from_str_radix(h, 16).ok())
+        .collect();
+    assert_eq!(addresses.len(), 9, "{first}");
+    for a in &addresses {
+        assert!(
+            (0x7C_0000_0000..0x8C_0000_0000).contains(a),
+            "{a:#x} outside the region"
+        );
+    }
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+}
+
+/// A guest key destructor younger than the supervisor's runs after it in
+/// the last round, once the baton is handed on; jemalloc's thread cache
+/// cleanup is one, and re-arms itself for more rounds. Its hooks and its
+/// work must not overlap the next thread's: the schedule must repeat.
+#[test]
+fn an_exiting_threads_last_destructors_do_not_overlap_the_schedule() {
+    let dir = common::scratch_dir("exitdtor");
+    let exe = common::build_c("exitdtor", &dir, &[]);
+    let rw_path = dir.join("exitdtor.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    assert!(o.report.get_u64("exit_waits").unwrap() >= 8, "{first}");
+    let hash = o.report.get("schedule_hash").unwrap().to_string();
+    for _ in 0..4 {
+        let (again, _) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+        assert_eq!(again.report.get("schedule_hash").unwrap(), &hash);
+    }
+}
+
+/// The kernel frees an exited thread's stack itself, at a moment of real
+/// time, and would grant an `mmap` hint into the hole once it has: the run
+/// places a hinted request like one without an address.
+#[test]
+fn a_hinted_mapping_is_placed_by_the_run_not_granted_by_the_kernel() {
+    let dir = common::scratch_dir("hint");
+    let exe = common::build_c("hint", &dir, &[]);
+    let rw_path = dir.join("hint.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    assert!(first.contains(" placed"), "{first}");
+    assert_eq!(o.report.get_u64("mappings_hinted"), Some(1), "{first}");
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
 }

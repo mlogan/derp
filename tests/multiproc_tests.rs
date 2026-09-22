@@ -1612,3 +1612,130 @@ fn signal_handlers_and_execve_do_not_wedge_the_run() {
         }
     }
 }
+
+/// `stop-after`: the run is over at that virtual time, whatever still runs
+/// is killed there and does not fail the run, and the stop is a point of
+/// the schedule.
+#[test]
+fn a_run_is_over_at_its_stop_time() {
+    let dir = common::scratch_dir("multiproc_stop_after");
+    common::build_c("sleeper", &dir, &[]);
+    common::build_c("envprobe", &dir, &[]);
+    let manifest = dir.join("stop.yaml");
+    // The sleeper would run for 100 virtual seconds
+    std::fs::write(
+        &manifest,
+        "stop-after: 3s\nhosts:\n  - name: a\n    processes:\n      - sleeper 100000 1000\n      - envprobe\n",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let first = run_manifest(&manifest, &scratch, 1, 2);
+    assert_eq!(first.fields["p0.status"], "stopped");
+    assert_eq!(first.fields["p1.status"], "exit 0");
+    assert_eq!(first.fields["run.stopped_at"], "3000000000");
+    let clock: u64 = first.fields["run.clock_ns"].parse().unwrap();
+    assert!((3_000_000_000..3_100_000_000).contains(&clock), "{clock}");
+    assert!(first.stdout[0].is_empty(), "{}", first.stdout[0]);
+    let again = run_manifest(&manifest, &scratch, 1, 2);
+    assert_eq!(
+        again.fields["run.schedule_hash"],
+        first.fields["run.schedule_hash"]
+    );
+    assert_eq!(again.fields["run.switches"], first.fields["run.switches"]);
+    // The command line overrides the file; a later stop is a longer run
+    let later = run_manifest_with(&manifest, &scratch, 1, 2, &["--stop-after", "5s"]);
+    assert_eq!(later.fields["run.stopped_at"], "5000000000");
+    let expiries = |r: &RunReport| r.fields["run.expiries"].parse::<u64>().unwrap();
+    assert!(expiries(&later) > expiries(&first));
+}
+
+#[test]
+fn a_process_crashed_before_the_stop_is_not_restarted_after_it() {
+    let dir = common::scratch_dir("multiproc_stop_restarts");
+    common::build_c("sleeper", &dir, &[]);
+    let manifest = dir.join("stop.yaml");
+    std::fs::write(
+        &manifest,
+        "stop-after: 2s\nhosts:\n  - name: a\n    processes:\n\
+        \x20     - argv: [sleeper, \"100000\", \"1000\"]\n\
+        \x20       restart: always\n        crash: { every: 100ms..200ms }\n",
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let report = run_manifest(&manifest, &scratch, 2, 1);
+    let restarts: u64 = report.fields["run.restarts"].parse().unwrap();
+    let processes: u64 = report.fields["run.processes"].parse().unwrap();
+    assert!(restarts >= 5, "{restarts}");
+    assert_eq!(processes, restarts + 1);
+    let last = format!("p{}.status", processes - 1);
+    assert_eq!(report.fields[&last], "stopped");
+}
+
+#[test]
+fn a_single_program_run_stops_too() {
+    let dir = common::scratch_dir("single_stop_after");
+    let exe = common::build_c("sleeper", &dir, &[]);
+    common::supervisor_dylib();
+    let out = Command::new(common::rewrite_bin())
+        .args(["run", "--seed", "3", "--stop-after", "2s"])
+        .arg(&exe)
+        .args(["100000", "1000"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("stopped_at=2000000000"), "{err}");
+}
+
+/// A real-time limit ends a run that has no virtual clock to stop at, and
+/// every process reports the CPU time it used.
+#[test]
+fn a_wall_limit_ends_a_native_run_and_cpu_time_is_reported() {
+    let dir = common::scratch_dir("wall_limit");
+    let exe = common::build_c("sleeper", &dir, &[]);
+    let out = Command::new(common::rewrite_bin())
+        .args(["run", "--native", "--wall-limit", "300ms"])
+        .arg(&exe)
+        .args(["100000", "1000"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("wall_limited=true"), "{err}");
+    assert!(err.contains("cpu_user_ns="), "{err}");
+    assert!(err.contains("cpu_system_ns="), "{err}");
+}
+
+/// Unless the run file says `outside-network: allow`, a name the run does
+/// not know and an address beyond the virtual network are unreachable, the
+/// same way every run; a numeric address needs no lookup.
+#[test]
+fn the_outside_network_is_refused_unless_allowed() {
+    let dir = common::scratch_dir("multiproc_outside");
+    common::build_c("outside", &dir, &[]);
+    let manifest = dir.join("outside.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - outside\n",
+    )
+    .unwrap();
+    let r = run_manifest(&manifest, &dir.join("scratch"), 1, 1);
+    assert_eq!(
+        r.stdout[0],
+        "lookup nodename nor servname provided, or not known\nnumeric ok\nconnect Network is unreachable\n"
+    );
+    // The file may let them out; the lookup then reaches the real resolver,
+    // which is not this test's to depend on: only the numeric path is checked
+    std::fs::write(
+        &manifest,
+        "outside-network: allow\nhosts:\n  - name: a\n    processes:\n      - outside\n",
+    )
+    .unwrap();
+    let r = run_manifest(&manifest, &dir.join("scratch"), 1, 1);
+    assert!(r.stdout[0].contains("numeric ok\n"), "{}", r.stdout[0]);
+    assert!(
+        !r.stdout[0].contains("Network is unreachable"),
+        "{}",
+        r.stdout[0]
+    );
+}

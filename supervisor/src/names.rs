@@ -128,7 +128,15 @@ pub unsafe extern "C" fn my_getaddrinfo(
     } else {
         None
     };
-    let Some((name, addr)) = virtual_host else {
+    // A lookup that needs no resolver is answered here all the same: the
+    // system's own goes through libinfo, whose threads and sockets are
+    // outside the run (Go's cgo resolver asks it for every port).
+    let local = if in_run() && virtual_host.is_none() && service_is_numeric(service) {
+        local_answer(node, hints)
+    } else {
+        None
+    };
+    let Some((name, addr)) = virtual_host.or(local) else {
         // Any other name is the system resolver's, which answers in real
         // time with whatever the world says: refused with the rest of the
         // outside network. Numeric addresses and localhost need no lookup.
@@ -183,6 +191,31 @@ pub unsafe extern "C" fn my_getaddrinfo(
     OURS.lock().push(head as usize);
     *res = head.cast();
     0
+}
+
+unsafe fn service_is_numeric(service: *const c_char) -> bool {
+    service.is_null()
+        || CStr::from_ptr(service)
+            .to_str()
+            .is_ok_and(|s| s.parse::<u16>().is_ok())
+}
+
+/// The answer to a lookup of nothing (this host: any address for a
+/// passive socket, else loopback), of `localhost`, or of a numeric IPv4
+/// address, as `(name, address)`.
+unsafe fn local_answer(node: *const c_char, hints: *const libc::addrinfo) -> Option<(Vec<u8>, u32)> {
+    if node.is_null() {
+        let passive = !hints.is_null() && (*hints).ai_flags & libc::AI_PASSIVE != 0;
+        let ip = if passive { 0 } else { u32::from(std::net::Ipv4Addr::LOCALHOST) };
+        return Some((b"localhost".to_vec(), ip));
+    }
+    let name = CStr::from_ptr(node).to_bytes();
+    if name == b"localhost" {
+        return Some((name.to_vec(), u32::from(std::net::Ipv4Addr::LOCALHOST)));
+    }
+    let text = std::str::from_utf8(name).ok()?;
+    let ip: std::net::Ipv4Addr = text.parse().ok()?;
+    Some((name.to_vec(), u32::from(ip)))
 }
 
 pub unsafe extern "C" fn my_freeaddrinfo(list: *mut libc::addrinfo) {

@@ -474,6 +474,18 @@ is 32 GB of address space (`heap-size` to change it), guests outlive neither the
 owner, the supervisor allocates from its own heap, and the trace and mask
 paths reach guests through the shared state, not their environment.
 
+**Examples of real systems** (branch `mlogan-examples`, in progress):
+`examples/` holds Redis and Postgres run files with Python
+clients, each repeatable. Plan in `IMPLEMENTATION_PLAN_EXAMPLES.md`,
+progress and findings in `TASKS_EXAMPLES.md`, setup in
+`examples/README.md`.
+
+**Nondeterminism list**: `README.md` has a section
+"Nondeterminism found and fixed": one item per source of nondeterminism
+(or supervisor bug) closed, in the form *problem*: what was wrong, then
+what was done, in plain sentences. Every change that closes one must add
+its item there, in the same commit, under the fitting heading.
+
 **Next Phase**: Not yet planned
 
 ---

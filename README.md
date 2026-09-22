@@ -208,6 +208,15 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   cost memory. `heap-size: 128G` in the run file or `--heap-size` changes
   it (64 MB to 4 TB). A seeded layout scatters blocks, so leave it roomy:
   a quarter holds the small size classes and the rest the large blocks.
+- Go programs are supported in part. Build with the external linker
+  (`go build -ldflags=-linkmode=external`: Go's own emits no
+  `LC_FUNCTION_STARTS`) and set `GODEBUG=netdns=cgo` in the run file so
+  that Go resolves the run's host names through the system resolver. A
+  Go server and client (`examples/go`) run and their output repeats; the
+  schedule hash of that pair takes one of two values, one quantum ending
+  one hook apart in the runtime's stack copying, which
+  `TASKS_EXAMPLES.md` records with what was ruled out and what to try
+  next. A Go program alone repeats fully.
 - A guest with an allocator of its own (jemalloc, sui-node's default)
   keeps its heap out of the seeded one, so its layout is not the seed's
   to vary, and a bug that depends on pointer order shows on fewer seeds.
@@ -230,6 +239,29 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   order; the launcher is pid 1. A scheduled thread's `pthread_threadid_np`
   is its index in the run plus a billion (kernel thread ids differ from
   run to run; RocksDB mixes one into its DB session ids).
+- System V semaphores (`semop`, what Postgres's lightweight locks sleep
+  on) are waited for by the scheduler, and a keyed segment or set a
+  guest creates (`shmget`, `semget`) is private to the run and removed
+  when it ends, as is a POSIX shared memory object (`shm_open`, given a
+  per-run name): keys and names are a namespace of the whole machine,
+  and what one run leaves there would change the next run's tries. A
+  segment attaches (`shmat`) in the reserved region. `getrusage` reports
+  the virtual clock as CPU time.
+- A process's interval timer (`setitimer(ITIMER_REAL)`, `alarm`) is a
+  virtual deadline: its SIGALRM is pending from that moment of the
+  schedule and wakes a blocked thread of the process, instead of landing
+  on a parked thread at a real moment (Postgres times statements so).
+- A signal one guest sends another (`kill` with anything but SIGTERM and
+  SIGKILL, which end the target) is delivered when the target next takes
+  the baton up, on that thread, so its handler runs at a point of the
+  schedule; `kill(pid, 0)` says whether a guest lives. A kqueue watch on
+  a guest's pid (`EVFILT_PROC`) or on a signal (`EVFILT_SIGNAL`) is the
+  run's too: Postgres's children watch the postmaster and its latches are
+  SIGURG.
+- A read of the CPU's counter register (`mrs xN, cntvct_el0`, what Redis
+  and others take their monotonic clock from, past every library) is
+  rewritten into a read of the virtual clock, in the counter's ticks. The
+  report of `rewrite scan` and the "sites hooked" line count them.
 - Where a scheduled thread's mappings land is the run's: thread stacks,
   `pthread_t` blocks and `mmap`s without an address go to a reserved
   region (64 GB at `0x7c_0000_0000`) in schedule order, so the kernel's
@@ -241,6 +273,266 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   at the end of its last extent). The report counts `mappings_placed`
   and `mappings_hinted`. An exited thread's stack is not reused; the
   region has room for about 30,000 threads of 2 MB.
+
+## Nondeterminism found and fixed
+
+Every item names an input the run took from outside itself, or a bug in
+the supervisor, and what was done. Keep this list current: a change that
+closes a source of nondeterminism adds an item here.
+
+### Scheduling
+
+- *Thread interleaving is decided by the kernel*: one thread of the run
+  holds a baton and runs; the others are parked. The baton changes hands
+  at quantum expiries, counted in hooked branches and calls, and at every
+  interposed blocking call. The quantum length is drawn from the seed.
+- *Blocking calls sleep in the kernel while the thread holds the baton*:
+  mutexes, condition variables (also `pthread_cond_timedwait_relative_np`),
+  rwlocks, `os_unfair_lock` and the ulock calls, dispatch semaphores,
+  sleeps, `poll`, `select`, `kevent`, pipe and socket I/O, `waitpid`,
+  `semop` and `pthread_join` are interposed and become scheduler waits.
+- *Several processes schedule independently*: the scheduler's state is in
+  shared memory and the baton passes between processes; `fork`, `execve`,
+  `posix_spawn`, exit and `waitpid` are points of the schedule.
+- *`POSIX_SPAWN_SETEXEC` was treated as a spawn*: the old process record
+  kept the baton. It is treated as an exec.
+- *GCD worker threads are created by the kernel and run outside the
+  scheduler*: a guest that submits work to Grand Central Dispatch ends
+  the run with exit 69. System libraries use GCD internally: their wakes
+  go to the scheduler and the kernel, an unfair-lock wait whose owner is
+  such a thread is a real wait, and an idle scheduler looks again in real
+  time for up to 30 s before declaring a deadlock.
+- *A wait a system library makes for itself (an XPC reply, a block on a
+  GCD worker) yielded the baton and let real time in*: such a wait is made
+  in the kernel with the baton held, so nothing else moves meanwhile.
+- *libdispatch's ulock waits pass `ULF_NO_ERRNO` and got positive errors*:
+  the interposer answers those callers with negative errno values.
+- *The thread-exit hook's join wake counted as a wake from outside the
+  schedule* (libpthread clears the key before the hook runs): the hook
+  sets the identity back for the wake.
+- *Key destructors of the guest ran after the exiting thread had handed
+  the baton on*: the supervisor's key destructor re-arms itself for every
+  destructor round but the last, so the guest's run with the baton.
+- *Destructors of keys younger than the supervisor's (jemalloc's thread
+  cache) still ran in the last round, off the baton*: the exiting thread
+  leaves its Mach port behind and the next baton holder in that process
+  waits until the port is dead.
+- *An exiting thread's last hooks raced the next holder's quantum*: the
+  wait for the port happens before the holder touches the hook counter.
+- *A signal handler on a thread that is inside the scheduler lock
+  deadlocked on the lock*: the lock word names the holding thread; a
+  handler on the holder makes no wake itself and leaves it for the holder
+  to make on leaving the lock.
+- *A process that died holding the scheduler lock hung the run*: the lock
+  is taken over from a dead owner, whose death is checked with
+  `proc_pidinfo` (a zombie that is nobody's child still answers `kill`).
+- *A new image after `execve` spun on a lock word naming its own pid*:
+  the word is reset before the new image's first lock.
+- *Threads outside the schedule ran hooked code and ate the holder's
+  quantum*: the report counts expiries taken without the baton
+  (`outside_expiries`, `stray_expiries`) and the trace names them.
+- *Real-time collisions on libmalloc's lock inside the supervisor showed
+  in the guest's schedule*: the supervisor allocates from its own heap
+  with its own lock, and only the baton holder's unfair-lock waits count.
+- *A daemon was killed at the end of a run, unheard*: when every other
+  process is done the launcher arms a stop at the virtual time reached;
+  every thread of a stopped process is made runnable and the first to
+  take the baton up writes the report and ends the process.
+- *The run started as soon as every guest had attached, so a guest's
+  remaining start-up ran in real time while the first guest already ran
+  guest code*: two Go processes fell into one of two schedules from the
+  first quantum. The launcher hands the baton out only once every
+  guest's main thread is parked.
+- *A thread-directed signal (`pthread_kill`) from one scheduled thread to
+  another landed on a parked thread at a real moment*: Go preempts
+  goroutines and stops the world with SIGURG this way. The signal is
+  pending against the target thread and raised when it next takes the
+  baton up.
+- *A process that leaves through `_exit` skipped the exit hooks and never
+  reported*: Go does. `_exit` writes the report first.
+- *The supervisor timed its own wait with `Instant::now()`*: libSystem's
+  clock call is routed to the interposer by dyld, so every spin moved the
+  virtual clock. The supervisor reads real time only with
+  `mach_absolute_time` directly.
+
+### Memory
+
+- *`malloc` addresses vary between runs*: the malloc family is interposed
+  and served from a heap in a fixed region.
+- *The heap layout was the same for every seed, so pointer-order bugs
+  never showed*: where blocks land and whether a freed block is reused at
+  once are drawn from the seed and the process index.
+- *A fixed 4 GB heap ran out under a scattered layout*: the heap is 32 GB
+  of address space by default and the run file sets it.
+- *`mmap` hints for the supervisor's regions were not honoured*: the kernel
+  ignores hints in some ranges and low addresses vary between launches.
+  The regions are reserved with `mach_vm_allocate` at fixed addresses and
+  mapped over with `MAP_FIXED`.
+- *Threads outside the schedule allocated from the deterministic heap*:
+  their allocations go to libmalloc, and a block they free is counted as
+  leaked rather than reused.
+- *The kernel placed thread stacks first-fit around GCD workers' stacks,
+  and `pthread_self` is a stack address that RocksDB hashes*: scheduled
+  threads' `mach_vm_map`, `mach_vm_allocate` and `mmap` requests without
+  an address are placed in a reserved region in schedule order.
+- *An `mmap` with an address hint was granted or refused by the kernel
+  depending on whether an exited thread's stack had been freed yet*:
+  hinted requests are placed like the others.
+- *`shmat` attached a segment where the kernel chose*: it attaches in the
+  reserved region.
+- *A guest's own allocator (jemalloc) keeps its heap out of the seeded
+  one*: its memory still comes from `mmap`, which the run places, so it
+  runs repeatably, with the compact layout.
+- *The yield and counter entries pushed several hundred bytes of
+  registers onto whatever stack the hooked code ran on*: a goroutine's
+  stack has a guard of under a kilobyte, and the pushes landed on the
+  heap object below it (Go's collector found a corrupted heap). Each
+  scheduled thread has a supervisor stack for those entries, which leave
+  at most 48 bytes on the guest's stack.
+- *The environment's length decides where a guest's stack starts*: the
+  supervisor's own variables are fixed-width, run-file guests start from
+  a fixed environment (`pass-env:` names what is inherited), and the trace
+  and mask paths reach guests through the shared state rather than their
+  environment.
+
+### Time
+
+- *Clock reads return real time*: `clock_gettime`, `gettimeofday`, `time`,
+  `mach_absolute_time`, `mach_continuous_time` and
+  `clock_gettime_nsec_np` return a virtual clock that advances 1 µs per
+  read and 1 ms per baton switch, and jumps to the next deadline when
+  nothing can run.
+- *Threads outside the schedule advanced the virtual clock when they read
+  it*: they see the clock but do not move it.
+- *`gettimeofday` left its time-zone argument unfilled*: Redis takes its
+  zone from it and logged dates in 1970. It is filled with UTC.
+- *Reading `CNTVCT_EL0` returns the CPU's real-time counter*: the `mrs`
+  instruction is rewritten to jump to a stub that returns the virtual
+  clock in the counter's ticks.
+- *`setitimer` and `alarm` armed real kernel timers whose SIGALRM landed
+  on a parked thread at a real moment*: the timer is a virtual deadline of
+  the process; its SIGALRM becomes pending at that moment of the schedule
+  and wakes a blocked thread of the process.
+- *`getrusage` returns real CPU times*: it returns the virtual clock as
+  user time.
+- *Timed waits across processes used each process's own clock*: the run
+  has one clock in the shared state, and timed waits are ordered by
+  deadline on it.
+
+### Randomness
+
+- *`arc4random`, `getentropy` and `CCRandomGenerateBytes` return real
+  entropy*: they return bytes from a stream seeded by the run's seed and
+  the process index.
+- *Reads of `/dev/urandom` and `/dev/random` return real entropy* (Redis
+  seeds its hash tables there): descriptors open on those devices read
+  from the same stream.
+
+### Signals
+
+- *A signal a guest sends itself went to whichever thread the kernel
+  picked, at a real moment*: `kill(getpid(), sig)` is delivered with
+  `pthread_kill` to the calling thread, so the handler runs there with
+  the baton.
+- *`SIGCHLD` arrived from the kernel at a real moment*: the guest's
+  handler is kept by the supervisor, the kernel's delivery is dropped, and
+  the handler runs on the parent's next thread to take the baton up after
+  the death is recorded, with the child's pid and status in `siginfo`,
+  `SA_RESETHAND` honoured, and a blocked signal left for a thread that
+  takes it.
+- *Signals between guests were dropped* (Postgres's latches are SIGURG,
+  its procsignals SIGUSR1): a signal to another guest is recorded against
+  the target and raised on the target's next thread to take the baton up;
+  `kill(pid, 0)` answers whether the guest lives.
+
+### Processes
+
+- *Virtual pids collided with real ones and reached system APIs*: virtual
+  pids start at 100,000, above any real pid; callers inside the dyld
+  shared cache get the real pid from `getpid` and `getppid`.
+- *Kernel thread ids differ from run to run* (RocksDB mixes one into its
+  session ids): `pthread_threadid_np` returns the thread's index in the
+  run plus a billion.
+- *A guest killed by another guest was dead to the run only when the
+  launcher noticed*: the whole death happens under the scheduler lock at
+  the moment of the `kill`; its peers see EOF from then.
+- *Guests outlived a dead launcher*: a guest whose launcher is gone exits
+  within a second.
+- *A guest's own children were invisible to the tools*: every process
+  reports its program once it first holds the baton, and the launcher
+  keeps the rewritten-to-original mapping.
+
+### Files and IPC
+
+- *Guests read and wrote wherever their paths pointed*: every host gets a
+  fresh directory per run, `files:` copies inputs in (with their modes),
+  and paths outside it and the system's directories are refused.
+- *System V keys are a namespace of the whole machine, and Postgres tries
+  keys in sequence until one is free*: a keyed `shmget` or `semget` makes
+  a private object, and the launcher removes the run's objects at the end.
+- *POSIX shared memory names collided with a killed run's objects*:
+  `shm_open` names carry the launcher's pid and are unlinked at the end.
+
+### Network
+
+- *Sockets between guests went through the kernel*: guests live on virtual
+  hosts with virtual stream and datagram sockets, names, `poll`, `select`
+  and `kevent` over them, payloads delivered on the virtual clock with a
+  fixed latency.
+- *A guest could reach the real network, whose answers cannot be
+  repeated*: in run-file runs, connections outside the virtual network
+  fail with `ENETUNREACH` and unknown names with `EAI_NONAME` unless the
+  run file allows them; a connection that leaves is logged with its
+  destination.
+- *A lookup that needs no resolver (a null host for a port, `localhost`,
+  a numeric address) went to libSystem's resolver, whose threads and
+  sockets are outside the run*: Go's cgo resolver asks it for every
+  port. Such lookups are answered by the supervisor.
+- *An IPv6 socket was the kernel's, and a dual-stack listener (Go's,
+  Postgres's) lived outside the run while clients connected to the
+  virtual address*: in a run, `socket(AF_INET6)` fails with
+  `EAFNOSUPPORT`, and programs fall back to IPv4.
+- *`send` on a kernel socket pair woke nobody* (tokio's signal self-pipe):
+  `send`, `sendto` and `sendmsg` wake the scheduler's waiters, and `recv`
+  on such a socket waits in the scheduler.
+- *`recv(MSG_DONTWAIT)` on a blocking socket pair parked*: it does not.
+
+### kqueue
+
+- *A kqueue holding only a user event waited in the kernel with the
+  baton* (mio's waker): a `kevent` wait is the scheduler's unless every
+  registration belongs to the outside world; user events are modelled.
+- *`EV_RECEIPT`, `EV_DISPATCH`, `EV_CLEAR`, `EV_ONESHOT` and `EV_ENABLE`
+  re-firing were not modelled*: they are, checked against the kernel's
+  answers, with receipts in change order.
+- *mio registers through one duplicate of the kqueue and waits on
+  another*: duplicates share one registry entry, and closing a descriptor
+  purges its entries without touching timer or process registrations of
+  the same ident.
+- *`EVFILT_PROC` on a virtual pid was rejected by the kernel* (Postgres's
+  children decided the postmaster had died): watches on a guest's pid and
+  on signals (`EVFILT_SIGNAL`) are the run's, fed by the process table and
+  the signal counts.
+- *A wait mixing guest descriptors with ones from outside the run is not
+  repeatable*: it is logged once, and only the guests' side ends it.
+
+### Rewriting
+
+- *Sites more than 128 MB from the stub segment cannot reach it*: one
+  shared stub body with a four-to-six-word trampoline per site, far
+  callees through x16 islands at call sites, and rooms planted in the text
+  at link time by `rewrite cargo` for the sites still out of reach.
+- *A store-conditional fails when an interrupt lands between it and its
+  load, and the retry branch after it was hooked*: the retry happened at
+  the hardware's whim and counted a hook. The branch right after an
+  exclusive store is part of the untouched span.
+- *Constant tables in hand-written assembly decoded as branches* (blst's
+  SHA-256 constants): function-table entries without a symbol are left
+  alone when most entries have one.
+- *Tail calls through x16 clobbered a register hand-written assembly
+  keeps live*: islands are used at `bl` sites only.
+- *Rewritten images of installed programs were written next to the
+  program*: they go to a cache directory under `$TMPDIR`.
 
 ## Big programs
 

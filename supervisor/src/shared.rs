@@ -33,6 +33,8 @@ pub const STUB_BASE: usize = 0x78_0000_0000;
 /// load the scheduler entry point from `STUB_BASE + SLOT_OFFSET`.
 pub const PRIVATE_SIZE: usize = 0x4000;
 pub const SLOT_OFFSET: u32 = 0;
+/// Next to it, the entry a counter-read trampoline calls
+pub const COUNTER_ENTRY_OFFSET: u32 = 8;
 /// Where guests map the file
 pub const MAP_ADDR: usize = STUB_BASE + PRIVATE_SIZE;
 /// Offset of the quantum counter from `STUB_BASE`, in reach of an
@@ -94,7 +96,10 @@ pub const DEBUG_PATH_LEN: usize = 1024;
 
 /// What the cache puts between a program's file name and the key of its
 /// rewritten copy
-pub const CACHE_TAG: &str = ".rw4-";
+pub const CACHE_TAG: &str = ".rw6-";
+pub const MAX_IPC_OBJECTS: usize = 256;
+pub const IPC_SHM: u32 = 1;
+pub const IPC_SEM: u32 = 2;
 
 /// Store `path` in one of the state's path fields; too long is not stored.
 pub fn set_debug_path(field: &mut [u8; DEBUG_PATH_LEN], path: &str) {
@@ -198,6 +203,10 @@ pub struct ThreadRec {
     pub cond_key: u64,
     pub cond_seq: u64,
     pub signaled: bool,
+    /// Thread-directed signals (`pthread_kill` from another scheduled
+    /// thread) not yet delivered: a bit per signal, raised when this
+    /// thread next takes the baton up
+    pub sig_pending: u64,
     /// Set when the wait ended because `deadline` passed
     pub timed_out: bool,
     /// `ProcRec::outside_wakes` when this thread last looked
@@ -219,6 +228,17 @@ pub struct ProcRec {
     pub parent: u32,
     /// Raw wait status, valid once `state` is `P_EXITED`
     pub exit_status: i32,
+    /// Its interval timer (`setitimer(ITIMER_REAL)`, `alarm`): the virtual
+    /// time its SIGALRM is due (0: none) and the interval that re-arms it
+    pub alarm_at: u64,
+    pub alarm_interval: u64,
+    /// Signals other guests sent it, not yet delivered: a bit per signal.
+    /// Delivered to the next thread of the process to take the baton up
+    /// that does not block them (`sched::deliver_pending_signals`).
+    pub sig_pending: u64,
+    /// How many of each signal guests have sent it, itself included, for
+    /// `EVFILT_SIGNAL` watches
+    pub sig_counts: [u32; 32],
     /// Mach port of a thread of this process that handed the baton on
     /// from its teardown and may still be running destructors (0: none);
     /// the next holder in this process waits for it to be gone
@@ -302,6 +322,17 @@ pub struct State {
     pub trace_path: [u8; DEBUG_PATH_LEN],
     pub mask_path: [u8; DEBUG_PATH_LEN],
     pub crashes_injected: u64,
+    /// System V objects the guests created, for the launcher to remove
+    /// when the run ends: (1 shared memory, 2 semaphore set), id. Guests
+    /// get private objects (`IPC_PRIVATE`) whatever key they name, since
+    /// keys are a namespace of the whole machine and what a run leaves
+    /// there would make the next run's tries differ.
+    pub ipc_objects: [(u32, i32, u64); MAX_IPC_OBJECTS],
+    pub nipc_objects: u32,
+    /// POSIX shared memory names the guests made (as given to the kernel,
+    /// with the run's prefix), NUL-padded, for the launcher to unlink
+    pub pshm_names: [[u8; 32]; MAX_IPC_OBJECTS],
+    pub npshm_names: u32,
     pub restarts: u64,
     /// Restarts that were due but found the process or thread table full;
     /// the launcher counts them
@@ -479,6 +510,11 @@ impl Shared {
     /// Exit if the launcher is gone. Nobody is left to reap this process,
     /// end the run or release a lock the launcher held, so a guest that
     /// stayed would park or spin forever.
+    /// Real pid of the launcher, 0 in a run without one.
+    pub fn launcher_pid(&self) -> i32 {
+        self.launcher.load(Ordering::Relaxed)
+    }
+
     pub fn exit_if_orphaned(&self) {
         let launcher = self.launcher.load(Ordering::Relaxed);
         if launcher == 0 || launcher == unsafe { libc::getpid() } {
@@ -811,16 +847,23 @@ impl State {
         (self.stop_at_ns != 0 && !self.stopped).then_some(self.stop_at_ns)
     }
 
-    /// The run is over: every process alive is crashed, marked as stopped
-    /// rather than faulted, and none is restarted. A point of the schedule
-    /// like an injected crash, so it falls at the same place every run.
+    /// The run is over: every process alive is marked as stopped, and none
+    /// is restarted. A point of the schedule like an injected crash, so it
+    /// falls at the same place every run. Every thread of a stopped process
+    /// is made runnable: the first of them to take the baton up writes the
+    /// process's report and ends it (`sched::die_if_stopped`), so a stopped
+    /// process is heard from, which a killed one is not.
     fn stop_run(&mut self) {
         self.stopped = true;
-        for pid in 0..self.nprocs {
-            let p = &mut self.procs[pid as usize];
+        for pid in 0..self.nprocs as usize {
+            let p = &mut self.procs[pid];
             if p.state != P_EXITED && !p.killed {
                 p.stopped = true;
-                self.crash(pid);
+            }
+        }
+        for t in &mut self.threads[..self.nthreads as usize] {
+            if t.state != T_EXITED && self.procs[t.pid as usize].stopped {
+                t.state = T_RUNNABLE;
             }
         }
     }
@@ -951,6 +994,40 @@ impl State {
     }
 
     /// Release every blocked thread whose deadline has passed.
+    /// Interval timers that are due: their SIGALRM is pending, and one
+    /// blocked thread of the process is woken to take it.
+    fn fire_alarms(&mut self) {
+        let now = self.clock_ns;
+        for pid in 0..self.nprocs as usize {
+            let p = &mut self.procs[pid];
+            if p.state == P_EXITED || p.alarm_at == 0 || p.alarm_at > now {
+                continue;
+            }
+            p.alarm_at = if p.alarm_interval == 0 {
+                0
+            } else {
+                now + p.alarm_interval
+            };
+            p.sig_pending |= 1 << libc::SIGALRM;
+            p.sig_counts[libc::SIGALRM as usize] += 1;
+            if let Some(t) = self
+                .live()
+                .iter_mut()
+                .find(|t| t.pid == pid as u32 && t.state == T_BLOCKED)
+            {
+                t.state = T_RUNNABLE;
+            }
+        }
+    }
+
+    fn next_alarm(&self) -> Option<u64> {
+        self.procs[..self.nprocs as usize]
+            .iter()
+            .filter(|p| p.state != P_EXITED && p.alarm_at != 0)
+            .map(|p| p.alarm_at)
+            .min()
+    }
+
     fn expire_deadlines(&mut self) {
         let now = self.clock_ns;
         for t in self.live() {
@@ -981,13 +1058,17 @@ impl State {
         }
         if self.pending_stop().is_some_and(|at| self.clock_ns >= at) {
             self.stop_run();
-            return None;
         }
         self.clock_moved();
         self.inject_due_crashes();
         self.expire_deadlines();
+        self.fire_alarms();
         let mut runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         while runnable == 0 {
+            // Nobody left: the run is over where it is, not at its stop time
+            if !self.any_alive() {
+                return None;
+            }
             // A timed waiter's deadline, a payload in flight, a crash or the
             // run's stop, whichever comes first
             let next = [
@@ -995,6 +1076,7 @@ impl State {
                 self.net.next_due(),
                 self.next_crash(),
                 self.pending_stop(),
+                self.next_alarm(),
             ]
             .into_iter()
             .flatten()
@@ -1002,11 +1084,11 @@ impl State {
             self.clock_ns = self.clock_ns.max(next);
             if self.pending_stop().is_some_and(|at| self.clock_ns >= at) {
                 self.stop_run();
-                return None;
             }
             self.clock_moved();
             self.inject_due_crashes();
             self.expire_deadlines();
+            self.fire_alarms();
             runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         }
         let n = self.rng.below(runnable as u64) as usize;

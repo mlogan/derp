@@ -89,6 +89,7 @@ pub extern "C" fn my_arc4random_uniform(bound: u32) -> u32 {
 }
 
 pub extern "C" fn my_arc4random_buf(buf: *mut c_void, n: usize) {
+    crate::sched::diag_point(0xD1A6_0000_0000_0005);
     if outside() {
         return unsafe { libc::arc4random_buf(buf, n) };
     }
@@ -144,6 +145,19 @@ fn now_ns() -> u64 {
     })
 }
 
+/// The CPU's counter as the virtual clock would show it: a read like any
+/// clock read (Redis takes its monotonic time from `cntvct_el0`).
+pub fn counter_ticks() -> u64 {
+    static FREQ: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let freq = *FREQ.get_or_init(|| {
+        let f: u64;
+        unsafe { std::arch::asm!("mrs {}, cntfrq_el0", out(reg) f) };
+        f.max(1)
+    });
+    let ns = monotonic_ns();
+    ns / 1_000_000_000 * freq + ns % 1_000_000_000 * freq / 1_000_000_000
+}
+
 fn monotonic_ns() -> u64 {
     MONOTONIC_BASE_NS + now_ns()
 }
@@ -177,7 +191,7 @@ pub extern "C" fn my_clock_gettime_nsec_np(clk: libc::clockid_t) -> u64 {
     }
 }
 
-pub extern "C" fn my_gettimeofday(tv: *mut libc::timeval, _tz: *mut c_void) -> c_int {
+pub extern "C" fn my_gettimeofday(tv: *mut libc::timeval, tz: *mut c_void) -> c_int {
     let ns = realtime_ns();
     if !tv.is_null() {
         unsafe {
@@ -185,7 +199,147 @@ pub extern "C" fn my_gettimeofday(tv: *mut libc::timeval, _tz: *mut c_void) -> c
             (*tv).tv_usec = ((ns % 1_000_000_000) / 1000) as libc::suseconds_t;
         }
     }
+    // UTC, as the guest environment says (Redis reads its zone here)
+    if !tz.is_null() {
+        // struct timezone { int tz_minuteswest; int tz_dsttime; }
+        unsafe { tz.cast::<[c_int; 2]>().write([0, 0]) };
+    }
     0
+}
+
+// ---- interval timers ------------------------------------------------------
+
+/// `setitimer(ITIMER_REAL)`: a virtual deadline of the process, at which
+/// its SIGALRM becomes pending and a blocked thread of it is woken. The
+/// other timers count CPU time and stay the kernel's.
+pub unsafe extern "C" fn my_setitimer(
+    which: c_int,
+    new: *const libc::itimerval,
+    old: *mut libc::itimerval,
+) -> c_int {
+    if which != libc::ITIMER_REAL || outside() || new.is_null() {
+        return libc::setitimer(which, new, old);
+    }
+    let ns = |tv: libc::timeval| (tv.tv_sec.max(0) as u64) * 1_000_000_000 + (tv.tv_usec.max(0) as u64) * 1000;
+    let value = ns((*new).it_value);
+    let interval = ns((*new).it_interval);
+    let Some(now) = crate::sched::peek_clock() else {
+        return libc::setitimer(which, new, old);
+    };
+    let before = crate::sched::with(|s, pid| {
+        let p = &mut s.procs[pid as usize];
+        let left = (p.alarm_at != 0).then(|| p.alarm_at.saturating_sub(now));
+        let was = (left, p.alarm_interval);
+        p.alarm_at = if value == 0 { 0 } else { now + value.max(1) };
+        p.alarm_interval = if value == 0 { 0 } else { interval };
+        was
+    });
+    if !old.is_null() {
+        let (left, interval) = before.unwrap_or((None, 0));
+        let tv = |ns: u64| libc::timeval {
+            tv_sec: (ns / 1_000_000_000) as libc::time_t,
+            tv_usec: ((ns % 1_000_000_000) / 1000) as libc::suseconds_t,
+        };
+        (*old).it_value = tv(left.unwrap_or(0));
+        (*old).it_interval = tv(interval);
+    }
+    0
+}
+
+pub unsafe extern "C" fn my_getitimer(which: c_int, cur: *mut libc::itimerval) -> c_int {
+    if which != libc::ITIMER_REAL || outside() || cur.is_null() {
+        return libc::getitimer(which, cur);
+    }
+    let Some(now) = crate::sched::peek_clock() else {
+        return libc::getitimer(which, cur);
+    };
+    let (left, interval) = crate::sched::with(|s, pid| {
+        let p = &s.procs[pid as usize];
+        (
+            if p.alarm_at == 0 { 0 } else { p.alarm_at.saturating_sub(now) },
+            p.alarm_interval,
+        )
+    })
+    .unwrap_or((0, 0));
+    let tv = |ns: u64| libc::timeval {
+        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+        tv_usec: ((ns % 1_000_000_000) / 1000) as libc::suseconds_t,
+    };
+    (*cur).it_value = tv(left);
+    (*cur).it_interval = tv(interval);
+    0
+}
+
+pub unsafe extern "C" fn my_alarm(secs: libc::c_uint) -> libc::c_uint {
+    let new = libc::itimerval {
+        it_value: libc::timeval {
+            tv_sec: secs as libc::time_t,
+            tv_usec: 0,
+        },
+        it_interval: libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        },
+    };
+    let mut old: libc::itimerval = std::mem::zeroed();
+    my_setitimer(libc::ITIMER_REAL, &raw const new, &raw mut old);
+    (old.it_value.tv_sec as libc::c_uint) + libc::c_uint::from(old.it_value.tv_usec > 0)
+}
+
+/// `getrusage`: CPU times are real time in disguise, so a scheduled thread
+/// gets the virtual clock as user time and nothing else (Postgres reports
+/// them in vacuum logs).
+pub unsafe extern "C" fn my_getrusage(who: c_int, usage: *mut libc::rusage) -> c_int {
+    if outside() || usage.is_null() {
+        return libc::getrusage(who, usage);
+    }
+    let ns = now_ns();
+    usage.write(std::mem::zeroed());
+    (*usage).ru_utime.tv_sec = (ns / 1_000_000_000) as libc::time_t;
+    (*usage).ru_utime.tv_usec = ((ns % 1_000_000_000) / 1000) as libc::suseconds_t;
+    0
+}
+
+// ---- random devices -------------------------------------------------------
+
+/// Descriptors open on `/dev/urandom` or `/dev/random`: reads of them
+/// come from the entropy stream, like `getentropy`. Redis seeds its hash
+/// tables from the device.
+static RANDOM_FDS: SpinLock<Vec<c_int>> = SpinLock::new(Vec::new());
+
+/// A path just opened as `fd`.
+///
+/// # Safety
+/// `path` is a NUL-terminated string.
+pub unsafe fn opened(path: *const libc::c_char, fd: c_int) {
+    if fd < 0 || path.is_null() {
+        return;
+    }
+    let name = std::ffi::CStr::from_ptr(path).to_bytes();
+    if name == b"/dev/urandom" || name == b"/dev/random" {
+        RANDOM_FDS.lock().push(fd);
+    }
+}
+
+pub fn closed(fd: c_int) {
+    RANDOM_FDS.lock().retain(|&f| f != fd);
+}
+
+pub fn duplicated(fd: c_int, new: c_int) {
+    let mut fds = RANDOM_FDS.lock();
+    if fds.contains(&fd) && !fds.contains(&new) {
+        fds.push(new);
+    }
+}
+
+/// `read(fd, buf, n)` for a random device, if `fd` is one and the reader
+/// is scheduled: None otherwise.
+pub fn read_random(fd: c_int, buf: *mut c_void, n: usize) -> Option<isize> {
+    if outside() || !RANDOM_FDS.lock().contains(&fd) {
+        return None;
+    }
+    fill(buf.cast(), n);
+    Some(n as isize)
 }
 
 pub extern "C" fn my_time(t: *mut libc::time_t) -> libc::time_t {

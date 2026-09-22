@@ -85,7 +85,9 @@ pub unsafe extern "C" fn rewrite_open_impl(
     if !crate::hostfs::permits("open", path) {
         return -1;
     }
-    open(path, flags, mode as c_int)
+    let fd = open(path, flags, mode as c_int);
+    crate::determinism::opened(path, fd);
+    fd
 }
 
 /// What stdio and the rest of libSystem call instead of `open`
@@ -99,7 +101,9 @@ pub unsafe extern "C" fn rewrite_open_nocancel_impl(
     if !crate::hostfs::permits("open", path) {
         return -1;
     }
-    open_nocancel(path, flags, mode as c_int)
+    let fd = open_nocancel(path, flags, mode as c_int);
+    crate::determinism::opened(path, fd);
+    fd
 }
 
 /// `openat(dirfd, path, flags, mode)`: the variadic mode is the fourth
@@ -115,11 +119,78 @@ pub unsafe extern "C" fn rewrite_openat_impl(
     if !crate::hostfs::permits_at("openat", dirfd, path) {
         return -1;
     }
-    libc::openat(dirfd, path, flags, mode as c_int)
+    let fd = libc::openat(dirfd, path, flags, mode as c_int);
+    crate::determinism::opened(path, fd);
+    fd
+}
+
+/// A POSIX shared memory name as this run gives it to the kernel: prefixed
+/// with the launcher's pid, so that runs never meet each other's objects
+/// (a name is machine-wide, and one a killed guest left behind would make
+/// a create fail and the guest try another). None when it would not fit
+/// the kernel's 31 characters, in which case the name stays as it is.
+fn run_pshm_name(name: *const c_char) -> Option<std::ffi::CString> {
+    let given = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+    let launcher = sched::shared().map_or(0, crate::shared::Shared::launcher_pid);
+    let tag = if launcher == 0 {
+        unsafe { libc::getpid() }
+    } else {
+        launcher
+    };
+    let mut out = format!("/r{:04x}", tag & 0xFFFF).into_bytes();
+    out.extend_from_slice(given.strip_prefix(b"/").unwrap_or(given));
+    (out.len() <= 31)
+        .then(|| std::ffi::CString::new(out).ok())
+        .flatten()
+}
+
+fn note_pshm(name: &std::ffi::CStr) {
+    let bytes = name.to_bytes();
+    sched::with(|s, _| {
+        let n = s.npshm_names as usize;
+        if n < crate::shared::MAX_IPC_OBJECTS && bytes.len() < 32 {
+            s.pshm_names[n] = [0; 32];
+            s.pshm_names[n][..bytes.len()].copy_from_slice(bytes);
+            s.npshm_names += 1;
+        }
+    });
+}
+
+/// `shm_open` is variadic (the mode); see the `open` shim.
+#[no_mangle]
+pub unsafe extern "C" fn rewrite_shm_open_impl(
+    name: *const c_char,
+    oflag: c_int,
+    mode: usize,
+) -> c_int {
+    sched::hook_event(sched::SITE_FILE);
+    if sched::my_id().is_none() || name.is_null() {
+        return libc::shm_open(name, oflag, mode as c_int);
+    }
+    let Some(ours) = run_pshm_name(name) else {
+        return libc::shm_open(name, oflag, mode as c_int);
+    };
+    let fd = libc::shm_open(ours.as_ptr(), oflag, mode as c_int);
+    if fd >= 0 && oflag & libc::O_CREAT != 0 {
+        note_pshm(&ours);
+    }
+    fd
+}
+
+pub unsafe extern "C" fn my_shm_unlink(name: *const c_char) -> c_int {
+    sched::hook_event(sched::SITE_FILE);
+    if sched::my_id().is_none() || name.is_null() {
+        return libc::shm_unlink(name);
+    }
+    match run_pshm_name(name) {
+        Some(ours) => libc::shm_unlink(ours.as_ptr()),
+        None => libc::shm_unlink(name),
+    }
 }
 
 extern "C" {
     pub fn rewrite_open_shim();
+    pub fn rewrite_shm_open_shim();
     pub fn rewrite_open_nocancel_shim();
     pub fn rewrite_openat_shim();
 }
@@ -130,6 +201,11 @@ std::arch::global_asm!(
     "_rewrite_open_shim:",
     "ldr x2, [sp]",
     "b _rewrite_open_impl",
+    ".globl _rewrite_shm_open_shim",
+    ".p2align 2",
+    "_rewrite_shm_open_shim:",
+    "ldr x2, [sp]",
+    "b _rewrite_shm_open_impl",
     ".globl _rewrite_open_nocancel_shim",
     ".p2align 2",
     "_rewrite_open_nocancel_shim:",

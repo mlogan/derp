@@ -1,0 +1,15 @@
+# A memcached server with four worker threads on one host and a Python
+# client with four threads on another. Needs Homebrew's memcached and
+# python@3.13, and a venv with pymemcache (see ../README.md), then
+#   rewrite run --manifest examples/memcached/run.yaml --capture
+seed: 1
+env: { PYTHONPATH: site-packages }   # the venv's, copied into the client's host directory
+hosts:
+  - name: cache
+    processes:
+      - argv: [/opt/homebrew/bin/memcached, -p, "11211", -l, 0.0.0.0, -t, "4", -U, "0", -m, "64"]
+        daemon: true
+  - name: client
+    files: [client.py, ../.venv/lib/python3.13/site-packages]
+    processes:
+      - [/opt/homebrew/opt/python@3.13/bin/python3.13, -u, client.py]

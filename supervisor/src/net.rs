@@ -193,6 +193,12 @@ pub unsafe extern "C" fn my_socket(domain: c_int, ty: c_int, protocol: c_int) ->
         libc::SOCK_DGRAM => KIND_DGRAM,
         _ => 0,
     };
+    // The virtual network is IPv4: an IPv6 socket would be the kernel's,
+    // listening where no guest can reach it (Go's and Postgres's listeners
+    // try IPv6 first and fall back)
+    if active() && domain == libc::AF_INET6 && kind != 0 {
+        return crate::errno::fail(libc::EAFNOSUPPORT);
+    }
     if !active() || family == 0 || kind == 0 {
         return libc::socket(domain, ty, protocol);
     }
@@ -346,6 +352,9 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
         }
         return crate::errno::fail(libc::ENETUNREACH);
     }
+    if diag_net() {
+        sched::trace_line(&format!("net connect fd={fd} result={r:?}"));
+    }
     status(r)
 }
 
@@ -457,7 +466,16 @@ pub fn send_to(
             break;
         }
     }
+    if diag_net() {
+        sched::trace_line(&format!("net send fd={fd} sock={sock} sent={done} of {len}"));
+    }
     done as isize
+}
+
+/// Diagnostic: `DIAG_TRACE_NET=1` traces every virtual-socket transfer
+pub fn diag_net() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("DIAG_TRACE_NET").is_some())
 }
 
 pub fn send_fd(fd: c_int, sock: u32, buf: *const u8, len: usize, flags: c_int) -> isize {
@@ -501,6 +519,9 @@ pub fn recv_from(
         if !waitall || done == len {
             break;
         }
+    }
+    if diag_net() {
+        sched::trace_line(&format!("net recv fd={fd} sock={sock} got={done} of {len}"));
     }
     done as isize
 }
@@ -825,6 +846,7 @@ pub unsafe extern "C" fn my_dup(fd: c_int) -> c_int {
     let new = libc::dup(fd);
     if new >= 0 {
         crate::kq::duplicated(fd, new);
+        crate::determinism::duplicated(fd, new);
     }
     if let (Some(sock), true) = (sock, new >= 0) {
         duplicated(sock);
@@ -841,6 +863,8 @@ pub unsafe extern "C" fn my_dup2(fd: c_int, target: c_int) -> c_int {
         // Whatever `target` was is closed, registrations and all
         crate::kq::closed(target);
         crate::kq::duplicated(fd, target);
+        crate::determinism::closed(target);
+        crate::determinism::duplicated(fd, target);
         if let Some(sock) = sock {
             duplicated(sock);
         }

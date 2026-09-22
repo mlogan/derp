@@ -299,6 +299,107 @@ fn an_exiting_threads_last_destructors_do_not_overlap_the_schedule() {
     }
 }
 
+/// Signals between guests and kqueue watches on a guest's pid and on
+/// signals are the run's: postgres's children watch the postmaster so.
+#[test]
+fn signals_between_guests_and_watches_on_them_are_the_runs() {
+    let dir = common::scratch_dir("sigwatch");
+    let exe = common::build_c("sigwatch", &dir, &[]);
+    let rw_path = dir.join("sigwatch.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(7), "{first}");
+    assert!(first.contains("child: parent alive\n"), "{first}");
+    assert!(
+        first.contains("child: signal 30 x1, handled 1\n"),
+        "{first}"
+    );
+    assert!(
+        first.contains("child: signal 30 x2, handled 2\n"),
+        "{first}"
+    );
+    assert!(
+        first.contains("child: signal 30 x1, handled 3\n"),
+        "{first}"
+    );
+    assert!(
+        first.contains("child: parent exited with 7, kill(0) says gone\n"),
+        "{first}"
+    );
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+}
+
+/// An interval timer is a virtual deadline: its SIGALRMs come at the
+/// schedule's moments and wake the sleeping thread.
+#[test]
+fn an_interval_timer_is_a_virtual_deadline() {
+    let dir = common::scratch_dir("itimer");
+    let exe = common::build_c("itimer", &dir, &[]);
+    let rw_path = dir.join("itimer.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    assert_eq!(
+        first,
+        "alarms=3 after 150 ms, under 50 ms left to the next\ncancelled, alarm(0) says 0\n"
+    );
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+}
+
+/// A System V semaphore wait is the scheduler's, and a set made by key is
+/// private to the run: another run's leftovers cannot change the tries.
+#[test]
+fn a_sysv_semaphore_wait_is_the_schedulers() {
+    let dir = common::scratch_dir("sysvsem");
+    let exe = common::build_c("sysvsem", &dir, &[]);
+    let rw_path = dir.join("sysvsem.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    assert_eq!(
+        first,
+        "parent 0\nchild 0\nparent 1\nchild 1\nparent 2\nchild 2\nparent 3\nchild 3\nkeyed lookup finds nothing\n"
+    );
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+}
+
+/// The random devices give the seed's bytes, like `getentropy`: Redis
+/// seeds its hash tables from `/dev/urandom`.
+#[test]
+fn the_random_devices_are_seeded() {
+    let dir = common::scratch_dir("urandom");
+    let exe = common::build_c("urandom", &dir, &[]);
+    let rw_path = dir.join("urandom.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+    let (_, other) = run(&rw_path, &[], Some(common::supervisor_dylib()), 2);
+    assert_ne!(other, first);
+}
+
+/// A program that reads the CPU's counter register directly sees the
+/// virtual clock, the same on every run.
+#[test]
+fn the_cpu_counter_is_the_virtual_clock() {
+    let dir = common::scratch_dir("cntvct");
+    let exe = common::build_c("cntvct", &dir, &[]);
+    let rw_path = dir.join("cntvct.rw");
+    let stats = rewrite_to(&exe, &rw_path, &Options::default());
+    assert!(stats.counter_sites >= 3, "{stats:?}");
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    // The virtual clock starts at a second: 24 million ticks, not the
+    // machine's uptime
+    assert!(first.starts_with("freq=24000000 a=2400"), "{first}");
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+}
+
 /// The kernel frees an exited thread's stack itself, at a moment of real
 /// time, and would grant an `mmap` hint into the hole once it has: the run
 /// places a hinted request like one without an address.

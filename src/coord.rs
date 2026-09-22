@@ -126,6 +126,14 @@ impl Coordinator {
         self.shared.lock().stop_at_ns = ns;
     }
 
+    /// The run is over at the virtual time it has reached: what still runs
+    /// (the daemons, once every other process is done) is stopped at its
+    /// next switch, reports, and exits, instead of being killed unheard.
+    pub fn stop_now(&self) {
+        let mut s = self.shared.lock();
+        s.stop_at_ns = s.clock_ns.max(1);
+    }
+
     /// Whether guests may connect to addresses outside the virtual network.
     pub fn set_outside_network(&self, allowed: bool) {
         self.shared.lock().net.outside_allowed = allowed;
@@ -191,6 +199,22 @@ impl Coordinator {
 
     /// Hand out the first baton.
     pub fn start(&self) {
+        // Every guest's main thread has attached; wait until each is parked
+        // too, so that none is still finishing its start-up while another
+        // runs guest code
+        let began = std::time::Instant::now();
+        loop {
+            let all_parked = {
+                let s = self.shared.lock();
+                s.threads[..s.nthreads as usize]
+                    .iter()
+                    .all(|t| t.in_park.load(std::sync::atomic::Ordering::Acquire) != 0)
+            };
+            if all_parked || began.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+            std::thread::yield_now();
+        }
         let handoff = self.shared.lock().hand_off(None, 0);
         if let Handoff::Switch { to, .. } = handoff {
             self.shared.unpark(to);
@@ -222,6 +246,27 @@ impl Coordinator {
             self.shared.unpark(to);
         }
         deadlock
+    }
+
+    /// Remove the System V objects the guests made: a run leaves nothing
+    /// in the machine's namespace.
+    pub fn remove_ipc_objects(&self) {
+        let s = self.shared.lock();
+        for &(kind, id, _) in &s.ipc_objects[..s.nipc_objects as usize] {
+            unsafe {
+                if kind == crate::shared::IPC_SHM {
+                    libc::shmctl(id, libc::IPC_RMID, std::ptr::null_mut());
+                } else {
+                    libc::semctl(id, 0, libc::IPC_RMID);
+                }
+            }
+        }
+        for name in &s.pshm_names[..s.npshm_names as usize] {
+            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            if let Ok(c) = CString::new(&name[..end]) {
+                unsafe { libc::shm_unlink(c.as_ptr()) };
+            }
+        }
     }
 
     pub fn totals(&self) -> Totals {

@@ -202,6 +202,11 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   cost memory. `heap-size: 128G` in the run file or `--heap-size` changes
   it (64 MB to 4 TB). A seeded layout scatters blocks, so leave it roomy:
   a quarter holds the small size classes and the rest the large blocks.
+- A guest with an allocator of its own (jemalloc, sui-node's default)
+  keeps its heap out of the seeded one: jemalloc's extent bookkeeping
+  made two runs of a debug `sui-node` part in its own code. Build such a
+  program with the system allocator (`--no-default-features` for
+  sui-node).
 - Heap addresses are a function of the seed, and differ between seeds:
   how two blocks compare, and whether `free` then `malloc` returns the
   same block, goes both ways across seeds. A bug that depends on pointer
@@ -241,8 +246,13 @@ sites out of the stubs' reach it links once more with a `.space` object
 per 128 MB of text, placed in the middle of its stretch by an order file
 listing the symbols before it (`<program>.rooms/`). The rewriter writes
 the far sites' trampolines into those rooms, which are ordinary text.
-It says what it did: how many sites were out of reach, how many rooms
-it made and how big, and how many sites still cannot be reached. `rewrite run` on a program that needed this and did not
+`<program>.rooms/report.txt` says what it did: how many sites were out of
+reach, how many rooms it made and how big, and how many sites still
+cannot be reached (cargo shows a linker's messages only when the link
+fails). `rewrite rooms <prog>` shows the plan for a program without
+linking it. A `-O0` `sui-node` (180 MB of code, 4.8 million sites, 70% of
+them out of reach) gets two rooms of 76 MB together and every site is
+hooked; `rewrite run` then says how much went into rooms. `rewrite run` on a program that needed this and did not
 get it says so. No arm64 instruction reaches further than a `b` in one
 word, and stubs below `__TEXT` are impossible: the kernel wants
 `__PAGEZERO` to cover the low 4 GB and reserves everything up to the

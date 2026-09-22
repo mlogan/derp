@@ -158,8 +158,18 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
         } else {
             String::new()
         };
+        let rooms = if stats.rooms > 0 {
+            format!(
+                ", {} MB of them in {} room{}",
+                stats.room_bytes >> 20,
+                stats.rooms,
+                if stats.rooms == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
-            "rewrite: {} sites hooked{unreachable} -> {}",
+            "rewrite: {} sites hooked{unreachable}{rooms} -> {}",
             stats.branch_sites + stats.call_sites + stats.mem_sites,
             out.display()
         );

@@ -29,6 +29,7 @@ usage:
                                        for its sites to reach the stubs is linked again with
                                        rooms for them in its text (README, Big programs)
   rewrite cc <linker args…>            the linker driver `rewrite cargo` installs
+  rewrite rooms <prog>                 the rooms `rewrite cc` would give <prog>, and why
 options:
   --runs N                             repetitions for repeat (default 100)
   --seed S                             run seed (default 0)
@@ -773,6 +774,31 @@ fn rooms_cargo(args: Vec<OsString>) -> Fallible<ExitCode> {
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
+/// `rewrite rooms <prog>`: the plan `rewrite cc` would make for it.
+fn rooms_plan(prog: &Path) -> Fallible<()> {
+    let m = read_macho(prog)?;
+    let stats = rw::scan(&m, &Options::default())?;
+    let total = stats.branch_sites + stats.call_sites + stats.unreachable_sites;
+    println!(
+        "sites={total} unreachable={} rooms={} room_bytes={}",
+        stats.unreachable_sites, stats.rooms, stats.room_bytes
+    );
+    match rewrite::rooms::plan(&m, &stats) {
+        None => println!("every site reaches the stubs: no rooms needed"),
+        Some(plan) => {
+            println!(
+                "far_sites={} order_file_lines={}",
+                plan.far_sites,
+                plan.order_file.lines().count()
+            );
+            for (name, bytes) in &plan.rooms {
+                println!("{name} {bytes} bytes");
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `rewrite cc …`: link as `cc` would, then look at the result. An
 /// executable with sites out of the stub segment's reach is linked once
 /// more, with a room for them in its text (`rooms`). Anything else, and
@@ -850,7 +876,7 @@ fn rooms_link(args: Vec<OsString>) -> Fallible<ExitCode> {
     }
     let after = read_macho(&out).and_then(|m| Ok(rw::scan(&m, &Options::default())?))?;
     let mb: u64 = plan.rooms.iter().map(|(_, b)| b).sum::<u64>() >> 20;
-    eprintln!(
+    let report = format!(
         "rewrite cc: {name}: {} of {} sites were out of a b's reach; linked again with {} room{} \
          ({mb} MB) in the text; {} still out of reach",
         plan.far_sites,
@@ -859,6 +885,9 @@ fn rooms_link(args: Vec<OsString>) -> Fallible<ExitCode> {
         if plan.rooms.len() == 1 { "" } else { "s" },
         after.unreachable_sites
     );
+    // cargo shows a linker's stderr only when the link fails
+    eprintln!("{report}");
+    std::fs::write(dir.join("report.txt"), format!("{report}\n"))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -936,6 +965,9 @@ fn main() -> ExitCode {
             suspects(&cli).map(|()| ExitCode::SUCCESS)
         }
         Some("bench") if !rest.is_empty() => bench(cli, &rest).map(|()| ExitCode::SUCCESS),
+        Some("rooms") if rest.len() == 1 => {
+            rooms_plan(Path::new(&rest[0])).map(|()| ExitCode::SUCCESS)
+        }
         Some("repeat") if rest.is_empty() != cli.manifest.is_none() => {
             repeat(&cli, &rest).map(|()| ExitCode::SUCCESS)
         }

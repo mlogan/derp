@@ -64,7 +64,10 @@ pub fn plan(m: &MachO, stats: &Stats) -> Option<Plan> {
     let mut total = 0;
     // Rooms move the segment up, which puts more sites out of its reach
     for _ in 0..3 {
-        let far_end = (segment + total + MARGIN).saturating_sub(reach);
+        // No site lies past the text, however far the rooms push the segment
+        let far_end = (segment + total + MARGIN)
+            .saturating_sub(reach)
+            .min(text.size);
         if far_end == 0 {
             return None;
         }
@@ -72,18 +75,34 @@ pub fn plan(m: &MachO, stats: &Stats) -> Option<Plan> {
         total = 0;
         let mut from = 0;
         while from < far_end {
-            // The first site of the stretch must reach the room's last
-            // trampoline, the last site of the stretch its first
+            // A room of z bytes at p serves [p - (R - z), p + (R - z)]: its
+            // last trampoline must be within reach of the stretch's first
+            // site, its first of the stretch's last site, which the room
+            // itself moves up by z. So a stretch is L = 2 (R - z - slack)
+            // long, and z is the stretch's sites' worth: with d bytes of
+            // trampoline per byte of text, z = 2 d (R - slack) / (1 + 2 d).
+            // The density is the stretch's own, so settle the two together.
             let size = |n: u64| round_up(n * BYTES_PER_SITE * 11 / 10 + 4096, PAGE);
-            let guess = size(sites_in(buckets, from, from + 2 * reach));
-            let at = (from + reach)
-                .saturating_sub(guess + SLACK)
+            // With b bytes of trampoline for the stretch's len bytes of
+            // text, d = b / len and z = 2 b (R - slack) / (len + 2 b).
+            let mut len = 2 * reach;
+            for _ in 0..8 {
+                let end = (from + len).min(text.size);
+                let b = size(sites_in(buckets, from, end));
+                let z = 2 * b * (reach - SLACK) / ((end - from).max(1) + 2 * b);
+                let again = (2 * (reach - SLACK).saturating_sub(z)).max(1 << 20);
+                len = (len + again) / 2;
+            }
+            let next = (from + len).min(text.size);
+            let bytes = size(sites_in(buckets, from, next));
+            let at = (from + reach.saturating_sub(bytes + SLACK))
                 .max(from + 1)
                 .min(text.size);
-            let next = (at + reach).saturating_sub(guess + SLACK);
-            let bytes = size(sites_in(buckets, from, next.min(far_end)));
             rooms.push((at, bytes));
             total += bytes;
+            if at >= text.size {
+                break;
+            }
             from = next.max(at + 1);
         }
     }
@@ -109,7 +128,9 @@ pub fn plan(m: &MachO, stats: &Stats) -> Option<Plan> {
         }
         let _ = writeln!(order, "{ROOM_PREFIX}{k}");
     }
-    let far_end = (segment + total + MARGIN).saturating_sub(reach);
+    let far_end = (segment + total + MARGIN)
+        .saturating_sub(reach)
+        .min(text.size);
     Some(Plan {
         rooms: rooms
             .iter()

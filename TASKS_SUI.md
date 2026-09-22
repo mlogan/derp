@@ -100,6 +100,30 @@ inside the text at link time (generated `.space` objects placed by an
 `-order_file` every 100 MB), which the rewriter would fill with
 trampolines. Not built.
 
+## Rooms: the `-O0` sui-node (2026-09-22)
+
+`rewrite cargo build -p sui-node --bin sui-node --no-default-features`
+from the sui checkout. The wrapper links `sui-node` twice: the second
+time with two rooms (80 MB and 48 MB of `.space`, placed at 48 MB and
+230 MB of the text by a 775k-line order file); the file grows from 491 to
+619 MB and its text from 180 to 305 MB. `rewrite scan`: 4.79 million
+sites hooked, 0 unreachable, 75 MB of trampolines in the rooms. The
+node (one validator, `sui genesis` config, `stop-after: 120s`, about 4 s
+real) runs consensus and executes checkpoints; three runs give the same
+hash, 535,232,343 hooks, identical traces and logs.
+
+`--no-default-features` matters: sui-node's default allocator is
+jemalloc, which keeps the heap out of the seeded allocator, and two runs
+with it parted inside jemalloc's own code (`rtree_metadata_read`,
+`lg_ceil`) with identical logs but different hashes.
+
+The planner had two bugs on this binary that the 150 MB test program did
+not show: a stretch boundary past the end of the text made its loop push
+rooms forever (26 GB, then the kernel killed the linker), and the
+room-size iteration oscillated between two answers; the size is now the
+closed-form fixed point of the local site density (0.7 bytes of
+trampoline per byte of `-O0` text: a room per 104 MB).
+
 ## Known residual
 
 On some runs one trace line differs: the quantum expires at a different

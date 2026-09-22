@@ -3,7 +3,7 @@
 //! it stands, and threads outside the schedule (GCD workers, whose stacks
 //! the kernel makes) change what stands there at moments of real time. A
 //! thread's stack address is its identity to code that hashes
-//! `pthread_self` (RocksDB seeds its skip-list heights from it), so a run
+//! `pthread_self` (`RocksDB` seeds its skip-list heights from it), so a run
 //! whose thread stacks moved is another run.
 //!
 //! So a region of address space is reserved at start-up, and mapping
@@ -12,9 +12,13 @@
 //! and anonymous memory) are placed in it in the order the schedule makes
 //! them: first fit among what was given back, else the next unused stretch.
 //! What is unmapped is reserved again, so the kernel never fills the hole
-//! with something of its own. Threads outside the schedule keep the
-//! kernel's placement. A region that is used up falls back to the kernel,
-//! and the report says so.
+//! with something of its own. One hole it does dig: an exited thread's
+//! stack, which the kernel frees in the terminate syscall, at a moment of
+//! real time and with no call to see. Nothing placed here lands in such a
+//! hole (they are below `next` and not in `free`), but a request with an
+//! address hint would be granted it or not by the race, so hints are not
+//! passed on. Threads outside the schedule keep the kernel's placement. A
+//! region that is used up falls back to the kernel, and the report says so.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -60,6 +64,8 @@ static REGION: SpinLock<Option<Region>> = SpinLock::new(None);
 /// Mappings placed here, and requests the region could not take
 pub static PLACED: AtomicU64 = AtomicU64::new(0);
 pub static OVERFLOWED: AtomicU64 = AtomicU64::new(0);
+/// Requests that came with an address hint
+pub static HINTED: AtomicU64 = AtomicU64::new(0);
 static SAID_FULL: AtomicBool = AtomicBool::new(false);
 
 /// Reserve the region. Without it (the range is taken in this process)
@@ -217,7 +223,15 @@ pub unsafe extern "C" fn my_mmap(
     fd: i32,
     offset: libc::off_t,
 ) -> *mut c_void {
-    if addr.is_null() && flags & libc::MAP_FIXED == 0 {
+    // A hint without MAP_FIXED is a wish the kernel grants when the range
+    // happens to be free. jemalloc asks for its extents to grow in place,
+    // into this region, and finds the stack of a thread that exited if
+    // the kernel has freed it yet: placed here instead, like a request
+    // with no address.
+    if flags & libc::MAP_FIXED == 0 {
+        if !addr.is_null() {
+            HINTED.fetch_add(1, Ordering::Relaxed);
+        }
         let rounded = round_up(len as u64);
         if let Some(at) = take(rounded) {
             let p = libc::mmap(at as *mut c_void, len, prot, flags | libc::MAP_FIXED, fd, offset);

@@ -490,7 +490,7 @@ fn in_run() -> bool {
     crate::coord::connected()
 }
 
-/// Kernel thread ids are system-wide and differ from run to run; RocksDB
+/// Kernel thread ids are system-wide and differ from run to run; `RocksDB`
 /// mixes one into every DB session id. A scheduled thread's is its index in
 /// the run. Threads outside the schedule keep the kernel's.
 const VTID_BASE: u64 = 1_000_000_000;

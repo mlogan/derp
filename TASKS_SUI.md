@@ -80,6 +80,14 @@ the log is `DIR/net/sui.log.2027-01-15` (the virtual clock's date).
    it; runs parted in `MemTable::Add`. `mappings_placed` in the report.
 9. **`pthread_threadid_np`** of a scheduled thread is its index in the run
    (kernel thread ids are system-wide).
+10. **An `mmap` with an address hint is placed too**, not passed to the
+    kernel. jemalloc hints at the end of its last extent, which lies in
+    the region; the kernel grants the hint when the range is free, and
+    the stack of a scheduled thread that has exited is free once the
+    kernel has got round to freeing it (in the terminate syscall, real
+    time, no user-space call to see). Runs with jemalloc parted in its
+    radix tree (`rtree_metadata_read`, `lg_ceil`) on one run in three.
+    `mappings_hinted` in the report.
 
 ## Build sizes and reach (2026-09-22)
 
@@ -112,10 +120,14 @@ node (one validator, `sui genesis` config, `stop-after: 120s`, about 4 s
 real) runs consensus and executes checkpoints; three runs give the same
 hash, 535,232,343 hooks, identical traces and logs.
 
-`--no-default-features` matters: sui-node's default allocator is
-jemalloc, which keeps the heap out of the seeded allocator, and two runs
-with it parted inside jemalloc's own code (`rtree_metadata_read`,
-`lg_ceil`) with identical logs but different hashes.
+sui-node's default allocator is jemalloc, which keeps the heap out of
+the seeded allocator; two runs with it parted inside jemalloc's own code
+(`rtree_metadata_read`, `lg_ceil`) with identical logs but different
+hashes. The cause was change 10 above (a hinted `mmap` granted or not by
+a real-time race with an exiting thread's stack); with it, three runs
+with jemalloc agree (hash 4dc53a27de14494b, 539,458,903 hooks, 9 hinted
+mappings), and nine runs without the fix agreed too: the race is rare.
+`--no-default-features` is still the way to a seeded heap layout.
 
 The planner had two bugs on this binary that the 150 MB test program did
 not show: a stretch boundary past the end of the text made its loop push
@@ -153,6 +165,8 @@ the stack held. Not chased further: identifiers only.
 not_restarted_after_it`, `a_single_program_run_stops_too`,
 `an_unnamed_constant_table_in_the_text_is_left_alone` (`asm_table.c`),
 `thread_stacks_and_mappings_land_in_the_region_and_repeat` (`stacks.c`),
+`a_hinted_mapping_is_placed_by_the_run_not_granted_by_the_kernel`
+(`hint.c`),
 `the_outside_network_is_refused_unless_allowed` (`outside.c`). The far
 callee tails and unreachable sites have no test: they need a program of
 over 120 MB.

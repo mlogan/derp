@@ -277,3 +277,20 @@ fn thread_stacks_and_mappings_land_in_the_region_and_repeat() {
     let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
     assert_eq!(again, first);
 }
+
+/// The kernel frees an exited thread's stack itself, at a moment of real
+/// time, and would grant an `mmap` hint into the hole once it has: the run
+/// places a hinted request like one without an address.
+#[test]
+fn a_hinted_mapping_is_placed_by_the_run_not_granted_by_the_kernel() {
+    let dir = common::scratch_dir("hint");
+    let exe = common::build_c("hint", &dir, &[]);
+    let rw_path = dir.join("hint.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    assert!(first.contains(" placed"), "{first}");
+    assert_eq!(o.report.get_u64("mappings_hinted"), Some(1), "{first}");
+    let (_, again) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(again, first);
+}

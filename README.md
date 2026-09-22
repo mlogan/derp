@@ -203,10 +203,11 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   it (64 MB to 4 TB). A seeded layout scatters blocks, so leave it roomy:
   a quarter holds the small size classes and the rest the large blocks.
 - A guest with an allocator of its own (jemalloc, sui-node's default)
-  keeps its heap out of the seeded one: jemalloc's extent bookkeeping
-  made two runs of a debug `sui-node` part in its own code. Build such a
-  program with the system allocator (`--no-default-features` for
-  sui-node).
+  keeps its heap out of the seeded one, so its layout is not the seed's
+  to vary, and a bug that depends on pointer order shows on fewer seeds.
+  It runs repeatably all the same: its memory comes from `mmap`, which
+  the run places. Build with the system allocator to get the seeded
+  layout (`--no-default-features` for sui-node).
 - Heap addresses are a function of the seed, and differ between seeds:
   how two blocks compare, and whether `free` then `malloc` returns the
   same block, goes both ways across seeds. A bug that depends on pointer
@@ -220,7 +221,12 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   region (64 GB at `0x7c_0000_0000`) in schedule order, so the kernel's
   placement of what it maps meanwhile (GCD workers' stacks) cannot move
   them. `pthread_self` is a stack address, and RocksDB seeds its skip-list
-  heights from it. The report counts `mappings_placed`.
+  heights from it. An `mmap` with an address hint is placed like one
+  without: the kernel frees an exited thread's stack itself, in real
+  time, and would grant a hint into the hole once it had (jemalloc hints
+  at the end of its last extent). The report counts `mappings_placed`
+  and `mappings_hinted`. An exited thread's stack is not reused; the
+  region has room for about 30,000 threads of 2 MB.
 
 ## Big programs
 

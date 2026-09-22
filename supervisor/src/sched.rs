@@ -1046,6 +1046,11 @@ pub fn report(out: &mut String) {
     );
     let _ = writeln!(
         out,
+        "mappings_hinted={}",
+        crate::vmmap::HINTED.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
         "io_waits={}",
         crate::io::IO_WAITS.load(Ordering::Relaxed)
     );

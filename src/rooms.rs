@@ -91,7 +91,7 @@ pub fn plan(m: &MachO, stats: &Stats) -> Option<Plan> {
                 let b = size(sites_in(buckets, from, end));
                 let z = 2 * b * (reach - SLACK) / ((end - from).max(1) + 2 * b);
                 let again = (2 * (reach - SLACK).saturating_sub(z)).max(1 << 20);
-                len = (len + again) / 2;
+                len = u64::midpoint(len, again);
             }
             let next = (from + len).min(text.size);
             let bytes = size(sites_in(buckets, from, next));

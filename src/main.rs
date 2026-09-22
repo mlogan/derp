@@ -783,7 +783,10 @@ fn rooms_plan(prog: &Path) -> Fallible<()> {
         "sites={total} unreachable={} rooms={} room_bytes={}",
         stats.unreachable_sites, stats.rooms, stats.room_bytes
     );
-    match rewrite::rooms::plan(&m, &stats) {
+    let plan = (stats.unreachable_sites > 0)
+        .then(|| rewrite::rooms::plan(&m, &stats))
+        .flatten();
+    match plan {
         None => println!("every site reaches the stubs: no rooms needed"),
         Some(plan) => {
             println!(

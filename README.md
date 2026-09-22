@@ -208,6 +208,15 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   cost memory. `heap-size: 128G` in the run file or `--heap-size` changes
   it (64 MB to 4 TB). A seeded layout scatters blocks, so leave it roomy:
   a quarter holds the small size classes and the rest the large blocks.
+- Go programs are supported in part. Build with the external linker
+  (`go build -ldflags=-linkmode=external`: Go's own emits no
+  `LC_FUNCTION_STARTS`) and set `GODEBUG=netdns=cgo` in the run file so
+  that Go resolves the run's host names through the system resolver. A
+  Go server and client (`examples/go`) run and their output repeats; the
+  schedule hash of that pair takes one of two values, one quantum ending
+  one hook apart in the runtime's stack copying, which
+  `TASKS_EXAMPLES.md` records with what was ruled out and what to try
+  next. A Go program alone repeats fully.
 - A guest with an allocator of its own (jemalloc, sui-node's default)
   keeps its heap out of the seeded one, so its layout is not the seed's
   to vary, and a bug that depends on pointer order shows on fewer seeds.

@@ -88,6 +88,53 @@ Plan: `IMPLEMENTATION_PLAN_EXAMPLES.md`. Branch `mlogan-examples`.
   full-suite runs (a reseeded run did not repeat), as `TASKS_REVIEW2.md`
   records once before; not reproduced alone.
 
+## Go: set aside, and where to pick it up
+
+The checked-in case is `examples/go` (`main.go`, `run.yaml`; build per
+`examples/README.md`) with `tests/examples_tests.rs::the_go_example_repeats`,
+which holds the output and not the hash. The residual reproduces in
+about half of the runs of that pair and needs both processes; the
+server alone and the client alone repeat 16 of 16, and so did the two
+small programs tried (`gorand`, printing random values; `gobusy`, eight
+goroutines allocating and sleeping) once the run waited for every guest
+to park.
+
+What is known: exactly one trace line differs, an expiry of the client's
+main thread in stack copying (`copystack` → `adjustframes` →
+`getStackMap` → `pcvalue`), one hook earlier or later, in the quantum
+that follows the client's first exchange with the server; every
+interposed call before it in that quantum has the same remaining budget
+in both groups; no interposed call, signal or unmapping falls in the
+stretch where the hook appears. Ruled out: preemption signals
+(`GODEBUG=asyncpreemptoff=1`), store-conditional retries (unhooked),
+`madvise` results (all succeed), thread start-up overlap (waiting for
+the new thread to park changed nothing), the clock (equal at every
+switch), the counter reads (none in the stretch).
+
+Next steps, in the order worth trying:
+
+1. Find the branch. Add a per-site hit counter to the stubs under a
+   diagnostic build (a table indexed by site, incremented in the shared
+   body, dumped at exit) and diff the two groups' tables: the one site
+   whose count differs by one is the branch. Costly per hook but exact.
+2. If it is inside `pcvalue`, suspect the per-M `pcvalueCache`: a hit
+   or a miss changes the hook count by about one. Print (with a small
+   Go patch, or `GODEBUG` tracing of the cache if any) which M runs the
+   goroutine at that point and the cache's contents; a difference in
+   which M means the goroutine was handed between Ms differently, which
+   in turn points at the netpoller (`netpoll` returning a goroutine to a
+   different P) since the residual needs the network exchange.
+3. Check the kqueue side of that exchange in detail: log, per `kevent`
+   return, the list of events (ident, filter, data) and not only the
+   count; a user event and a socket event delivered in different orders
+   would give the same counts and a different goroutine wake order.
+4. Check whether the virtual socket's `readable`/`pending_bytes`
+   answers at that moment can depend on the real kernel (a kernel
+   socket pair among the guest objects, or a passthrough).
+5. Try `GOMAXPROCS=1` in the run file: one P removes goroutine
+   migration; if the residual goes away, it is the scheduler's choice
+   of P or M, which narrows step 2.
+
 ## Remaining
 
 - Rewriting the dylibs a guest loads.

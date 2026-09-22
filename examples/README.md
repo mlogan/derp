@@ -48,9 +48,10 @@ directory and point `PYTHONPATH` at it.
   the external linker; Go's resolver is told to use the system's
   (`GODEBUG=netdns=cgo`) so that it learns the run's host names. The
   runtime's goroutine stacks, signal-based preemption, kqueue polling
-  and counter-based spin waits are all covered. Its output repeats; its
-  schedule hash takes one of two values (one quantum ends one hook
-  apart), which `TASKS_EXAMPLES.md` records as open.
+  and counter-based spin waits are all covered. Support is partial: the
+  output repeats, the schedule hash takes one of two values (one quantum
+  ends one hook apart), which `TASKS_EXAMPLES.md` records with the next
+  steps; set aside for now.
 
 ## Limits worth knowing
 

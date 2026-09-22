@@ -199,6 +199,22 @@ impl Coordinator {
 
     /// Hand out the first baton.
     pub fn start(&self) {
+        // Every guest's main thread has attached; wait until each is parked
+        // too, so that none is still finishing its start-up while another
+        // runs guest code
+        let began = std::time::Instant::now();
+        loop {
+            let all_parked = {
+                let s = self.shared.lock();
+                s.threads[..s.nthreads as usize]
+                    .iter()
+                    .all(|t| t.in_park.load(std::sync::atomic::Ordering::Acquire) != 0)
+            };
+            if all_parked || began.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+            std::thread::yield_now();
+        }
         let handoff = self.shared.lock().hand_off(None, 0);
         if let Handoff::Switch { to, .. } = handoff {
             self.shared.unpark(to);

@@ -153,6 +153,7 @@ pub unsafe extern "C" fn my_mach_vm_map(
     max_protection: i32,
     inheritance: u32,
 ) -> i32 {
+    crate::sched::diag_point(0xD1A6_0000_0000_0008);
     let real = |a: *mut u64, flags: i32| {
         mach_vm_map(
             task,
@@ -191,6 +192,7 @@ pub unsafe extern "C" fn my_mach_vm_allocate(
     size: u64,
     flags: i32,
 ) -> i32 {
+    crate::sched::diag_point(0xD1A6_0000_0000_0009);
     if task == mach_task_self_ && flags & VM_FLAGS_ANYWHERE != 0 {
         let len = round_up(size);
         if let Some(at) = take(len) {
@@ -208,6 +210,7 @@ pub unsafe extern "C" fn my_mach_vm_allocate(
 }
 
 pub unsafe extern "C" fn my_mach_vm_deallocate(task: u32, addr: u64, size: u64) -> i32 {
+    crate::sched::diag_point(0xD1A6_0000_0000_000A);
     let rc = mach_vm_deallocate(task, addr, size);
     if rc == 0 && task == mach_task_self_ && in_region(addr) {
         give_back(addr, round_up(size));
@@ -256,6 +259,15 @@ pub unsafe extern "C" fn my_shmdt(addr: *const c_void) -> i32 {
     rc
 }
 
+/// `madvise`, for the hook trace: its advice and result are a
+/// diagnostic point (Go retries `MADV_FREE_REUSE` on `EAGAIN`).
+pub unsafe extern "C" fn my_madvise(addr: *mut c_void, len: usize, advice: i32) -> i32 {
+    let rc = libc::madvise(addr, len, advice);
+    let err = if rc == 0 { 0 } else { *libc::__error() };
+    crate::sched::diag_point(0xD1A6_0000_0000_0100 | ((advice as u64 & 0xFF) << 8) | (err as u64 & 0xFF));
+    rc
+}
+
 pub unsafe extern "C" fn my_mmap(
     addr: *mut c_void,
     len: usize,
@@ -264,6 +276,7 @@ pub unsafe extern "C" fn my_mmap(
     fd: i32,
     offset: libc::off_t,
 ) -> *mut c_void {
+    crate::sched::diag_point(0xD1A6_0000_0000_0006);
     // A hint without MAP_FIXED is a wish the kernel grants when the range
     // happens to be free. jemalloc asks for its extents to grow in place,
     // into this region, and finds the stack of a thread that exited if
@@ -287,6 +300,7 @@ pub unsafe extern "C" fn my_mmap(
 }
 
 pub unsafe extern "C" fn my_munmap(addr: *mut c_void, len: usize) -> i32 {
+    crate::sched::diag_point(0xD1A6_0000_0000_0007);
     let rc = libc::munmap(addr, len);
     if rc == 0 && in_region(addr as u64) {
         give_back(addr as u64, round_up(len as u64));

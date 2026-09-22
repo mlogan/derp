@@ -576,6 +576,31 @@ std::arch::global_asm!(
     "b _rewrite_getppid_impl",
 );
 
+/// `pthread_kill` to another scheduled thread of this process (Go
+/// preempts goroutines and stops the world this way, with SIGURG): the
+/// target is parked, so the signal is pending against it and raised when
+/// it next takes the baton up, where its handler runs with the baton. To
+/// the calling thread, or to a thread the scheduler does not run, it is
+/// the kernel's.
+pub unsafe extern "C" fn my_pthread_kill(t: libc::pthread_t, sig: c_int) -> c_int {
+    if sig == 0 || !(1..32).contains(&sig) || sched::my_id().is_none() || t == libc::pthread_self() {
+        return libc::pthread_kill(t, sig);
+    }
+    let queued = sched::with(|s, pid| {
+        let id = s.find_pthread(pid, t as u64)?;
+        if s.threads[id].state == shared::T_EXITED {
+            return None;
+        }
+        s.threads[id].sig_pending |= 1 << sig;
+        Some(())
+    })
+    .flatten();
+    match queued {
+        Some(()) => 0,
+        None => libc::pthread_kill(t, sig),
+    }
+}
+
 pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
     if !in_run() || !shared::is_virtual_pid(vpid) {
         return libc::kill(vpid, sig);

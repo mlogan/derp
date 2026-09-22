@@ -89,6 +89,7 @@ pub extern "C" fn my_arc4random_uniform(bound: u32) -> u32 {
 }
 
 pub extern "C" fn my_arc4random_buf(buf: *mut c_void, n: usize) {
+    crate::sched::diag_point(0xD1A6_0000_0000_0005);
     if outside() {
         return unsafe { libc::arc4random_buf(buf, n) };
     }

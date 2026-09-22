@@ -76,7 +76,40 @@ static STRAY_EXPIRIES: AtomicU64 = AtomicU64::new(0);
 /// The thread's scheduler id lives in a pthread key (value `id + 1`) rather
 /// than a Rust thread-local: the key's destructor is the thread's teardown
 /// hook and receives the id even after dyld has torn down TLV storage.
-static ID_KEY: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+static rewrite_id_key: AtomicUsize = AtomicUsize::new(usize::MAX);
+use rewrite_id_key as ID_KEY;
+
+/// A stack per scheduled thread for the yield and counter entries, by
+/// `id + 1` (0: none). Guest code may be on a goroutine's stack, with a
+/// guard of under a kilobyte below `sp`; the entries push several hundred
+/// bytes of registers, so they switch here first and leave at most 32
+/// bytes on the guest's stack (the stub's pushes).
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+static rewrite_stack_tops: [AtomicUsize; shared::MAX_THREADS + 1] =
+    [const { AtomicUsize::new(0) }; shared::MAX_THREADS + 1];
+const ENTRY_STACK_SIZE: usize = 256 << 10;
+
+fn give_entry_stack(id: usize) {
+    if id + 1 >= rewrite_stack_tops.len() || rewrite_stack_tops[id + 1].load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            ENTRY_STACK_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if p != libc::MAP_FAILED {
+        rewrite_stack_tops[id + 1].store(p as usize + ENTRY_STACK_SIZE, Ordering::Relaxed);
+    }
+}
 
 thread_local! {
     /// Depth of pass-through sections: while positive, interposed calls on
@@ -136,6 +169,7 @@ pub fn process_seed(seed: u64, proc_index: u32) -> u64 {
 }
 
 pub fn set_my_id(id: usize) {
+    give_entry_stack(id);
     set_identity(Some(id));
     let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
     PORTS.lock().push((port, id));
@@ -402,7 +436,9 @@ fn counter_slot() -> *mut usize {
 /// ticks, which the trampoline's site register receives.
 #[no_mangle]
 pub extern "C" fn rewrite_counter_impl() -> u64 {
-    crate::determinism::counter_ticks()
+    let ticks = crate::determinism::counter_ticks();
+    diag_point(0xD1A6_0000_0000_0000 | (ticks & 0xFFFF_FFFF));
+    ticks
 }
 
 pub fn fatal(msg: &str) -> ! {
@@ -623,6 +659,35 @@ pub fn clock_read() -> Option<u64> {
 /// the caller's chain: where two runs' hook consumption first drifts.
 static TRACE_HOOKS: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
 
+/// Diagnostic: a named point in an interposer, with the quantum's
+/// remaining hooks, under the same window as `trace_hook_event`.
+pub fn diag_point(label: u64) {
+    if my_id().is_none() {
+        return;
+    }
+    if let Some(sh) = shared() {
+        trace_hook_event(label, unsafe { *sh.counter() });
+    }
+}
+
+/// Diagnostic: the hook trace kept in memory (no syscall per event, which
+/// would slow the thread and hide a real-time race) and written at exit.
+const DIAG_MEM_ENTRIES: usize = 1 << 16;
+static DIAG_MEM: SpinLock<Vec<(u64, i64, usize, usize)>> = SpinLock::new(Vec::new());
+
+pub fn dump_diag_mem() {
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    let entries = std::mem::take(&mut *DIAG_MEM.lock());
+    if fd < 0 || entries.is_empty() {
+        return;
+    }
+    let mut text = String::new();
+    for (site, left, a, b) in entries {
+        let _ = writeln!(text, "p{} mem hook site={site:#x} left={left} {a:#x} {b:#x}", pid());
+    }
+    unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) };
+}
+
 #[inline(never)]
 fn trace_hook_event(site: u64, left: i64) {
     let window = TRACE_HOOKS.get_or_init(|| {
@@ -633,6 +698,27 @@ fn trace_hook_event(site: u64, left: i64) {
     let Some((lo, hi)) = *window else { return };
     let now = now();
     if now < lo || now > hi {
+        return;
+    }
+    if std::env::var_os("DIAG_TRACE_HOOKS_MEM").is_some() {
+        let mut fp: *const usize;
+        unsafe { std::arch::asm!("mov {}, x29", out(reg) fp) };
+        let mut pcs = [0usize; 2];
+        for pc in &mut pcs {
+            if fp.is_null() || (fp as usize) & 7 != 0 {
+                break;
+            }
+            let (next, ret) = unsafe { (*fp as *const usize, *fp.add(1)) };
+            *pc = ret;
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        let mut mem = DIAG_MEM.lock();
+        if mem.len() < DIAG_MEM_ENTRIES {
+            mem.push((site, left, pcs[0], pcs[1]));
+        }
         return;
     }
     let fd = TRACE_FD.load(Ordering::Relaxed);
@@ -887,19 +973,22 @@ pub fn take_up_baton(sh: &Shared) {
 /// this thread, here and now, so the handlers run with the baton at a
 /// point of the schedule. Ones this thread blocks stay pending for another.
 fn deliver_pending_signals() {
+    let Some(me) = my_id() else { return };
     let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask) };
     let take = with(|s, pid| {
-        let p = &mut s.procs[pid as usize];
         let mut take = 0u64;
+        let mine = s.threads[me].sig_pending;
+        let p = &mut s.procs[pid as usize];
         for sig in 1..32 {
-            if p.sig_pending & (1 << sig) != 0
+            if (p.sig_pending | mine) & (1 << sig) != 0
                 && unsafe { libc::sigismember(&raw const mask, sig) } == 0
             {
                 take |= 1 << sig;
             }
         }
         p.sig_pending &= !take;
+        s.threads[me].sig_pending &= !take;
         take
     })
     .unwrap_or(0);
@@ -1335,14 +1424,32 @@ std::arch::global_asm!(
     ".globl _rewrite_counter_read",
     ".p2align 2",
     "_rewrite_counter_read:",
+    // x0 and x1 are scratch here (the trampoline pushed the guest's). Find
+    // this thread's entry stack: its id from the key in the TSD block.
+    "str x2, [sp, #-16]!",
+    "mrs x2, tpidrro_el0",
+    "and x2, x2, #0xfffffffffffffff8",
+    "adrp x0, _rewrite_id_key@PAGE",
+    "ldr x0, [x0, _rewrite_id_key@PAGEOFF]",
+    "ldr x2, [x2, x0, lsl #3]",
+    "and x2, x2, #0xffffffff",
+    "adrp x0, _rewrite_stack_tops@PAGE",
+    "add x0, x0, _rewrite_stack_tops@PAGEOFF",
+    "ldr x0, [x0, x2, lsl #3]",
+    "ldr x2, [sp], #16",
+    "mov x1, sp",
+    "cbz x0, 1f",
+    "mov sp, x0",
+    "1:",
+    // [sp] holds the guest's sp; the guest's x0 and x1 are at [that]
+    "str x1, [sp, #-16]!",
     "stp x29, x30, [sp, #-16]!",
     "mov x29, sp",
-    // x0..x28: x0 and x1 copied from the trampoline's push at [x29, #16]
     "sub sp, sp, #240",
-    "ldp x2, x3, [x29, #16]",
-    "stp x2, x3, [sp, #0]",
-    "ldp x2, x3, [x29, #-224]",
     "stp x2, x3, [sp, #16]",
+    "ldr x2, [x29, #16]",
+    "ldp x2, x3, [x2]",
+    "stp x2, x3, [sp, #0]",
     "stp x4, x5, [sp, #32]",
     "stp x6, x7, [sp, #48]",
     "stp x8, x9, [sp, #64]",
@@ -1401,9 +1508,10 @@ std::arch::global_asm!(
     "ldp x2, x3, [sp], #16",
     "msr nzcv, x2",
     "msr fpsr, x3",
-    // x0 and x1 go back to the trampoline's push, for it to pop
+    // x0 and x1 go back to the trampoline's push on the guest's stack
     "ldp x2, x3, [sp, #0]",
-    "stp x2, x3, [x29, #16]",
+    "ldr x4, [x29, #16]",
+    "stp x2, x3, [x4]",
     "ldp x2, x3, [sp, #16]",
     "ldp x4, x5, [sp, #32]",
     "ldp x6, x7, [sp, #48]",
@@ -1420,6 +1528,8 @@ std::arch::global_asm!(
     "ldr x28, [sp, #224]",
     "add sp, sp, #240",
     "ldp x29, x30, [sp], #16",
+    "ldr x0, [sp]",
+    "mov sp, x0",
     "ldp x0, x1, [sp], #16",
     "add x30, x30, #4",
     "ret",
@@ -1434,6 +1544,24 @@ std::arch::global_asm!(
     ".globl _rewrite_scheduler_yield",
     ".p2align 2",
     "_rewrite_scheduler_yield:",
+    // x0 and x1 are scratch (the stub saved them). This thread's entry
+    // stack, by its id from the key in the TSD block; none: stay
+    "str x2, [sp, #-16]!",
+    "mrs x2, tpidrro_el0",
+    "and x2, x2, #0xfffffffffffffff8",
+    "adrp x0, _rewrite_id_key@PAGE",
+    "ldr x0, [x0, _rewrite_id_key@PAGEOFF]",
+    "ldr x2, [x2, x0, lsl #3]",
+    "and x2, x2, #0xffffffff",
+    "adrp x0, _rewrite_stack_tops@PAGE",
+    "add x0, x0, _rewrite_stack_tops@PAGEOFF",
+    "ldr x0, [x0, x2, lsl #3]",
+    "ldr x2, [sp], #16",
+    "mov x1, sp",
+    "cbz x0, 1f",
+    "mov sp, x0",
+    "1:",
+    "str x1, [sp, #-16]!",
     "stp x29, x30, [sp, #-16]!",
     "mov x29, sp",
     "stp x2, x3, [sp, #-16]!",
@@ -1463,7 +1591,10 @@ std::arch::global_asm!(
     "stp q26, q27, [sp, #-32]!",
     "stp q28, q29, [sp, #-32]!",
     "stp q30, q31, [sp, #-32]!",
+    // The site: the return address the stub body saved last, at the top
+    // of the guest's stack, whose sp is at [x29, #16]
     "ldr x0, [x29, #16]",
+    "ldr x0, [x0]",
     "bl _rewrite_yield_impl",
     "ldp q30, q31, [sp], #32",
     "ldp q28, q29, [sp], #32",
@@ -1493,5 +1624,7 @@ std::arch::global_asm!(
     "ldp x4, x5, [sp], #16",
     "ldp x2, x3, [sp], #16",
     "ldp x29, x30, [sp], #16",
+    "ldr x0, [sp]",
+    "mov sp, x0",
     "ret",
 );

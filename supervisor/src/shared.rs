@@ -96,7 +96,7 @@ pub const DEBUG_PATH_LEN: usize = 1024;
 
 /// What the cache puts between a program's file name and the key of its
 /// rewritten copy
-pub const CACHE_TAG: &str = ".rw5-";
+pub const CACHE_TAG: &str = ".rw6-";
 pub const MAX_IPC_OBJECTS: usize = 256;
 pub const IPC_SHM: u32 = 1;
 pub const IPC_SEM: u32 = 2;
@@ -203,6 +203,10 @@ pub struct ThreadRec {
     pub cond_key: u64,
     pub cond_seq: u64,
     pub signaled: bool,
+    /// Thread-directed signals (`pthread_kill` from another scheduled
+    /// thread) not yet delivered: a bit per signal, raised when this
+    /// thread next takes the baton up
+    pub sig_pending: u64,
     /// Set when the wait ended because `deadline` passed
     pub timed_out: bool,
     /// `ProcRec::outside_wakes` when this thread last looked
@@ -1061,6 +1065,10 @@ impl State {
         self.fire_alarms();
         let mut runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         while runnable == 0 {
+            // Nobody left: the run is over where it is, not at its stop time
+            if !self.any_alive() {
+                return None;
+            }
             // A timed waiter's deadline, a payload in flight, a crash or the
             // run's stop, whichever comes first
             let next = [

@@ -52,14 +52,14 @@ use crate::net::{
     my_shutdown, my_socket, rewrite_fcntl_shim, rewrite_ioctl_shim,
 };
 use crate::poll::{my_poll, my_select};
+use crate::report::my_exit_now;
 use crate::process::{
     my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_pthread_threadid_np, my_vfork,
-    my_wait, my_wait4, my_waitpid,
-};
+    my_wait, my_wait4, my_waitpid, my_pthread_kill};
 use crate::process::{rewrite_getpid_shim, rewrite_getppid_shim};
 use crate::vmmap::{
     mach_vm_allocate, mach_vm_deallocate, mach_vm_map, my_mach_vm_allocate,
-    my_mach_vm_deallocate, my_mach_vm_map, my_mmap, my_munmap, my_shmat, my_shmdt};
+    my_mach_vm_deallocate, my_mach_vm_map, my_mmap, my_munmap, my_shmat, my_shmdt, my_madvise};
 use crate::sched::{self, my_id, State};
 use crate::shared;
 use crate::signals::{my_sigaction, my_signal};
@@ -271,6 +271,7 @@ extern "C" fn my_pthread_create(
         return unsafe { libc::pthread_create(t, attr, f, arg) };
     }
     count(C_CREATE);
+    sched::diag_point(0xD1A6_0000_0000_0001);
     let id = sched::add_thread();
     let start = Box::into_raw(Box::new(Start { f, arg, id }));
     let rc = unsafe { libc::pthread_create(t, attr, trampoline, start.cast()) };
@@ -348,6 +349,7 @@ extern "C" fn my_pthread_cond_wait(
     c: *mut libc::pthread_cond_t,
     m: *mut libc::pthread_mutex_t,
 ) -> c_int {
+    sched::diag_point(0xD1A6_0000_0000_0002);
     let Some(me) = my_id() else {
         return unsafe { libc::pthread_cond_wait(c, m) };
     };
@@ -461,6 +463,7 @@ fn cond_wake(c: usize, all: bool) {
 // a GCD worker sleeps in the kernel, and the waker cannot know which it has.
 
 extern "C" fn my_pthread_cond_signal(c: *mut libc::pthread_cond_t) -> c_int {
+    sched::diag_point(0xD1A6_0000_0000_0003);
     cond_wake(c as usize, false);
     unsafe { libc::pthread_cond_signal(c) }
 }
@@ -852,6 +855,7 @@ extern "C" fn my_nanosleep(req: *const libc::timespec, rem: *mut libc::timespec)
 }
 
 extern "C" fn my_usleep(us: u32) -> c_int {
+    sched::diag_point(0xD1A6_0000_0000_0004);
     if my_id().is_none() {
         return unsafe { libc::usleep(us) };
     }
@@ -909,9 +913,12 @@ interposers! {
     my_mach_vm_allocate => mach_vm_allocate,
     my_mach_vm_deallocate => mach_vm_deallocate,
     my_mmap => libc::mmap,
+    my_madvise => libc::madvise,
     my_munmap => libc::munmap,
     rewrite_getppid_shim => libc::getppid,
     my_kill => libc::kill,
+    my_exit_now => libc::_exit,
+    my_pthread_kill => libc::pthread_kill,
     my_sigaction => libc::sigaction,
     my_signal => libc::signal,
     my_read => libc::read,

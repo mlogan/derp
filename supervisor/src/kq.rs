@@ -564,12 +564,18 @@ pub unsafe extern "C" fn my_kevent(
             }
         }
         if n > 0 || timeout_ns == Some(0) {
+            if crate::net::diag_net() {
+                sched::trace_line(&format!("kq {kq} returns {n} timeout={timeout_ns:?}"));
+            }
             return n as c_int;
         }
         if outside {
             crate::io::note_outside_in_wait();
         }
         if crate::io::park_for_io(deadline) {
+            if crate::net::diag_net() {
+                sched::trace_line(&format!("kq {kq} timed out"));
+            }
             return 0;
         }
     }

@@ -18,12 +18,19 @@ fn python_ready() -> bool {
             .exists()
 }
 
-/// Run an example; None when it cannot run here.
-fn run_example(name: &str, seed: u64, scratch: &Path) -> Option<(String, String)> {
+/// Run an example: its schedule hash and the client's output.
+fn run_example(name: &str, seed: u64, scratch: &Path) -> (String, String) {
     common::supervisor_dylib();
     let manifest = examples_dir().join(name).join("run.yaml");
     let out = Command::new(common::rewrite_bin())
-        .args(["run", "--capture", "--stop-after", "120s", "--wall-limit", "120s"])
+        .args([
+            "run",
+            "--capture",
+            "--stop-after",
+            "120s",
+            "--wall-limit",
+            "120s",
+        ])
         .arg("--seed")
         .arg(seed.to_string())
         .arg("--scratch")
@@ -39,17 +46,34 @@ fn run_example(name: &str, seed: u64, scratch: &Path) -> Option<(String, String)
         .find_map(|l| l.strip_prefix("run.schedule_hash="))
         .expect("hash")
         .to_string();
-    let stdout = std::fs::read_to_string(scratch.join("stdout.1")).unwrap();
-    Some((hash, stdout))
+    // Every process's captured stdout, in order
+    let mut stdout = String::new();
+    for i in 0.. {
+        match std::fs::read_to_string(scratch.join(format!("stdout.{i}"))) {
+            Ok(text) => stdout.push_str(&text),
+            Err(_) => break,
+        }
+    }
+    (hash, stdout)
 }
 
 fn repeats(name: &str, expect: &str) {
+    repeats_with(name, expect, true);
+}
+
+/// `schedule` false: the output must repeat, the schedule hash is not
+/// held to (see the Go example's residual in `TASKS_EXAMPLES.md`).
+fn repeats_with(name: &str, expect: &str, schedule: bool) {
     let dir = common::scratch_dir(&format!("example_{name}"));
-    let first = run_example(name, 1, &dir.join("a")).unwrap();
+    let first = run_example(name, 1, &dir.join("a"));
     assert!(first.1.contains(expect), "{name}: {}", first.1);
-    let again = run_example(name, 1, &dir.join("b")).unwrap();
-    assert_eq!(again, first, "{name} did not repeat");
-    let other = run_example(name, 2, &dir.join("c")).unwrap();
+    let again = run_example(name, 1, &dir.join("b"));
+    if schedule {
+        assert_eq!(again, first, "{name} did not repeat");
+    } else {
+        assert_eq!(again.1, first.1, "{name}'s output did not repeat");
+    }
+    let other = run_example(name, 2, &dir.join("c"));
     assert_ne!(other.0, first.0, "{name}: seed 2 gave seed 1's schedule");
 }
 
@@ -72,4 +96,31 @@ fn the_postgres_example_repeats() {
         return;
     }
     repeats("postgres", "final: [400, 128920, 480]\n");
+}
+
+#[test]
+fn the_sqlite_example_repeats() {
+    if !python_ready() {
+        eprintln!("skipped: needs Homebrew's python@3.13 and the examples venv");
+        return;
+    }
+    repeats("sqlite", "800 rows from 4 workers, total 800\n");
+}
+
+#[test]
+fn the_memcached_example_repeats() {
+    if !python_ready() || !Path::new("/opt/homebrew/bin/memcached").exists() {
+        eprintln!("skipped: needs Homebrew's memcached and the examples venv");
+        return;
+    }
+    repeats("memcached", "logs: [25, 25, 25, 25]\n");
+}
+
+#[test]
+fn the_go_example_repeats() {
+    if !examples_dir().join("go/bin/kvgo").exists() {
+        eprintln!("skipped: build examples/go first (see examples/README.md)");
+        return;
+    }
+    repeats_with("go", "worker 7: ", false);
 }

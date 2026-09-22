@@ -33,6 +33,35 @@ Plan: `IMPLEMENTATION_PLAN_EXAMPLES.md`. Branch `mlogan-examples`.
   calls).
 - `examples/postgres`: 20 runs, one hash, one output; seed 2 another.
 
+## Done (2026-09-22, later)
+
+- `examples/sqlite` (four Python processes, WAL), `examples/memcached`:
+  three runs each, one hash, one output; memcached 10 of 10.
+- `examples/go` (a Go server and client): the output repeats every run;
+  the schedule hash falls into one of two values (9 and 7 of 16). The
+  two traces differ in exactly one line, an expiry of the client's main
+  thread at 7 ms that lands one hook earlier or later inside stack
+  copying (`getStackMap` against `pcvalue`), and nothing else: not the
+  thread order, the clocks, the calls or their results (every interposed
+  call in that quantum has the same remaining budget in both, until that
+  point). It needs the two Go processes to interact (each alone repeats
+  16 of 16), and is not Go's preemption signals (`asyncpreemptoff=1`
+  gives the same split), not a store-conditional retry (unhooked now),
+  not `madvise` (all succeed), not thread start-up (waiting for the new
+  thread to park changed nothing). Open.
+- For Go: supervisor stacks for the yield and counter entries (goroutine
+  stacks are small), `pthread_kill` between scheduled threads pending
+  until the target's take-up, `_exit` writes the report, resolver-free
+  lookups answered locally, `socket(AF_INET6)` refused in a run, the
+  retry branch after a store-conditional left unhooked, and the run
+  starts only once every guest's main thread is parked (two Go
+  processes fell into two schedules from the first quantum otherwise;
+  what in a guest's start-up tail interfered was not identified, only
+  that it did).
+- A run whose processes all exited ends at that virtual time, not at
+  its stop time.
+- `tests/examples_tests.rs` covers all five examples.
+
 ## Findings
 
 - A guest cannot run Apple's binaries (`/bin/sh`, `/bin/sleep`, `grep`):
@@ -49,8 +78,18 @@ Plan: `IMPLEMENTATION_PLAN_EXAMPLES.md`. Branch `mlogan-examples`.
   sequence against the machine's leftovers, the `shmat` address, and
   `shm_open` names colliding with a killed run's objects.
 - Python's interpreter is a dylib and stays unhooked: its threads switch
-  only at interposed calls.
+  only at interposed calls, and a Python process runs until it blocks
+  (the SQLite workers ran one after another until given a pause).
+  Rewriting the dylibs a guest loads would close this.
+- Go's own linker emits no `LC_FUNCTION_STARTS`; the external linker
+  does. Go's `procyield` spins on `cntvct_el0`, which the counter site
+  makes virtual.
+- `a_reseeded_run_is_the_plain_run_until_the_reseed` failed once in four
+  full-suite runs (a reseeded run did not repeat), as `TASKS_REVIEW2.md`
+  records once before; not reproduced alone.
 
 ## Remaining
 
-- More examples.
+- Rewriting the dylibs a guest loads.
+- More examples: replication and failover pairs, nginx, Sui's multi-node
+  network.

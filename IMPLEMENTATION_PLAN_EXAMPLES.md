@@ -55,7 +55,8 @@ What the systems need from the supervisor along the way is the real work.
 
 ## Order
 
-1 to 7 (done), README and tests (done), then more examples.
+1 to 7 (done), README and tests (done), then SQLite, memcached and a
+Go program (done), then more examples.
 
 ## Acceptance
 

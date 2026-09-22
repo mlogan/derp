@@ -329,6 +329,18 @@ closes a source of nondeterminism adds an item here.
   process is done the launcher arms a stop at the virtual time reached;
   every thread of a stopped process is made runnable and the first to
   take the baton up writes the report and ends the process.
+- *The run started as soon as every guest had attached, so a guest's
+  remaining start-up ran in real time while the first guest already ran
+  guest code*: two Go processes fell into one of two schedules from the
+  first quantum. The launcher hands the baton out only once every
+  guest's main thread is parked.
+- *A thread-directed signal (`pthread_kill`) from one scheduled thread to
+  another landed on a parked thread at a real moment*: Go preempts
+  goroutines and stops the world with SIGURG this way. The signal is
+  pending against the target thread and raised when it next takes the
+  baton up.
+- *A process that leaves through `_exit` skipped the exit hooks and never
+  reported*: Go does. `_exit` writes the report first.
 - *The supervisor timed its own wait with `Instant::now()`*: libSystem's
   clock call is routed to the interposer by dyld, so every spin moved the
   virtual clock. The supervisor reads real time only with
@@ -362,6 +374,12 @@ closes a source of nondeterminism adds an item here.
 - *A guest's own allocator (jemalloc) keeps its heap out of the seeded
   one*: its memory still comes from `mmap`, which the run places, so it
   runs repeatably, with the compact layout.
+- *The yield and counter entries pushed several hundred bytes of
+  registers onto whatever stack the hooked code ran on*: a goroutine's
+  stack has a guard of under a kilobyte, and the pushes landed on the
+  heap object below it (Go's collector found a corrupted heap). Each
+  scheduled thread has a supervisor stack for those entries, which leave
+  at most 48 bytes on the guest's stack.
 - *The environment's length decides where a guest's stack starts*: the
   supervisor's own variables are fixed-width, run-file guests start from
   a fixed environment (`pass-env:` names what is inherited), and the trace
@@ -457,6 +475,14 @@ closes a source of nondeterminism adds an item here.
   fail with `ENETUNREACH` and unknown names with `EAI_NONAME` unless the
   run file allows them; a connection that leaves is logged with its
   destination.
+- *A lookup that needs no resolver (a null host for a port, `localhost`,
+  a numeric address) went to libSystem's resolver, whose threads and
+  sockets are outside the run*: Go's cgo resolver asks it for every
+  port. Such lookups are answered by the supervisor.
+- *An IPv6 socket was the kernel's, and a dual-stack listener (Go's,
+  Postgres's) lived outside the run while clients connected to the
+  virtual address*: in a run, `socket(AF_INET6)` fails with
+  `EAFNOSUPPORT`, and programs fall back to IPv4.
 - *`send` on a kernel socket pair woke nobody* (tokio's signal self-pipe):
   `send`, `sendto` and `sendmsg` wake the scheduler's waiters, and `recv`
   on such a socket waits in the scheduler.
@@ -487,6 +513,10 @@ closes a source of nondeterminism adds an item here.
   shared stub body with a four-to-six-word trampoline per site, far
   callees through x16 islands at call sites, and rooms planted in the text
   at link time by `rewrite cargo` for the sites still out of reach.
+- *A store-conditional fails when an interrupt lands between it and its
+  load, and the retry branch after it was hooked*: the retry happened at
+  the hardware's whim and counted a hook. The branch right after an
+  exclusive store is part of the untouched span.
 - *Constant tables in hand-written assembly decoded as branches* (blst's
   SHA-256 constants): function-table entries without a symbol are left
   alone when most entries have one.

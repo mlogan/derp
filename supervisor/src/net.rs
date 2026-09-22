@@ -193,6 +193,12 @@ pub unsafe extern "C" fn my_socket(domain: c_int, ty: c_int, protocol: c_int) ->
         libc::SOCK_DGRAM => KIND_DGRAM,
         _ => 0,
     };
+    // The virtual network is IPv4: an IPv6 socket would be the kernel's,
+    // listening where no guest can reach it (Go's and Postgres's listeners
+    // try IPv6 first and fall back)
+    if active() && domain == libc::AF_INET6 && kind != 0 {
+        return crate::errno::fail(libc::EAFNOSUPPORT);
+    }
     if !active() || family == 0 || kind == 0 {
         return libc::socket(domain, ty, protocol);
     }
@@ -345,6 +351,9 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
             return libc::connect(fd, addr, len);
         }
         return crate::errno::fail(libc::ENETUNREACH);
+    }
+    if diag_net() {
+        sched::trace_line(&format!("net connect fd={fd} result={r:?}"));
     }
     status(r)
 }

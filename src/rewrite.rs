@@ -657,7 +657,11 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
         if stack_tainted {
             stats.stack_tainted_functions += 1;
         }
-        // Words inside an ldxr…stxr span (inclusive) are never touched.
+        // Words inside an ldxr…stxr span (inclusive) are never touched, nor
+        // is the retry branch right after the store: a store-conditional
+        // fails when an interrupt lands between the pair, so the retry
+        // happens at the hardware's whim, and a hooked retry would count
+        // a hook the run cannot repeat.
         let mut exclusive = vec![false; n];
         let mut open = false;
         for (i, c) in classes.iter().enumerate() {
@@ -666,11 +670,21 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
                 Class::ExclusiveStore => {
                     exclusive[i] = true;
                     open = false;
+                    let pc = start + (i * 4) as u64;
+                    let retry = match classes.get(i + 1) {
+                        Some(Class::Cbz { target, .. } | Class::BCond { target, .. }) => {
+                            *target <= pc
+                        }
+                        _ => false,
+                    };
+                    if retry {
+                        exclusive[i + 1] = true;
+                    }
                     continue;
                 }
                 _ => {}
             }
-            exclusive[i] = open;
+            exclusive[i] |= open;
         }
 
         for i in 0..n {

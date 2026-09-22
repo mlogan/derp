@@ -168,8 +168,13 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
         } else {
             String::new()
         };
+        let counters = if stats.counter_sites == 0 {
+            String::new()
+        } else {
+            format!(", {} counter reads", stats.counter_sites)
+        };
         eprintln!(
-            "rewrite: {} sites hooked{unreachable}{rooms} -> {}",
+            "rewrite: {} sites hooked{unreachable}{rooms}{counters} -> {}",
             stats.branch_sites + stats.call_sites + stats.mem_sites,
             out.display()
         );

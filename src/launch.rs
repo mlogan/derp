@@ -608,6 +608,9 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
         kill_all(&mut procs);
     }
     let deadlock = result?;
+    if let Some(coord) = &coord {
+        coord.remove_ipc_objects();
+    }
     let totals = coord.as_ref().map(Coordinator::totals).unwrap_or_default();
     let specs: Vec<Option<usize>> = procs.iter().map(|p| p.spec).collect();
     let wall_limited = procs.iter().any(|p| p.wall_limited);
@@ -734,6 +737,29 @@ fn respawn(
     }
     Ok(())
 }
+
+/// Only daemons are left. With a scheduler they are stopped at the virtual
+/// time reached, like `stop-after`, so that they report and exit on their
+/// own; a daemon that never takes the baton up again is killed after a
+/// real-time grace period. Without one they are killed now.
+fn stop_or_end(
+    coord: Option<&Coordinator>,
+    events: &Events,
+    procs: &mut [Tracked],
+    stopping: &mut bool,
+) {
+    match coord {
+        Some(coord) if !*stopping => {
+            coord.stop_now();
+            events.watch_timer(STOP_GRACE_MS);
+            *stopping = true;
+        }
+        Some(_) => {}
+        None => end_run(procs),
+    }
+}
+
+const STOP_GRACE_MS: u64 = 5000;
 
 fn end_run(procs: &mut [Tracked]) {
     kill_all(procs);
@@ -863,8 +889,9 @@ fn supervise_started(
         }
         coord.start();
     }
+    let mut stopping = false;
     if only_daemons_left(run, procs) {
-        end_run(procs);
+        stop_or_end(coord, events, procs, &mut stopping);
     }
 
     let mut deadlock = false;
@@ -880,8 +907,10 @@ fn supervise_started(
             }
         }
         if let Event::Timer = event {
-            for p in procs.iter_mut() {
-                p.wall_limited = p.status.is_none();
+            if !stopping {
+                for p in procs.iter_mut() {
+                    p.wall_limited = p.status.is_none();
+                }
             }
             end_run(procs);
             break;
@@ -898,12 +927,17 @@ fn supervise_started(
         while let Some(index) = gone.pop() {
             let status = procs[index].status.unwrap_or(0);
             let restarting = coord.is_some_and(|c| c.will_restart(index as u32, status));
-            if !restarting && only_daemons_left(run, procs) {
+            let last = !restarting && only_daemons_left(run, procs);
+            if last {
                 if let Some(coord) = coord {
                     coord.note_last_death(index as u32);
                 }
-                end_run(procs);
-                break;
+                // Armed before the death is passed on below: the hand-off
+                // then finds the stop among its deadlines
+                stop_or_end(coord, events, procs, &mut stopping);
+                if !stopping {
+                    break;
+                }
             }
             let Some(coord) = coord else { continue };
             if coord.process_died(index as u32, status) {

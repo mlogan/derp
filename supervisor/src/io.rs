@@ -109,6 +109,94 @@ pub fn wake_io() {
     sched::wake_io();
 }
 
+/// Note a System V object a guest made, for the launcher's cleanup.
+fn note_ipc(kind: u32, id: c_int, size: u64) {
+    if id < 0 {
+        return;
+    }
+    sched::with(|s, _| {
+        let n = s.nipc_objects as usize;
+        if n < crate::shared::MAX_IPC_OBJECTS {
+            s.ipc_objects[n] = (kind, id, size);
+            s.nipc_objects += 1;
+        }
+    });
+}
+
+/// The size a guest gave a shared memory segment when it made it.
+pub fn shm_size(id: c_int) -> Option<u64> {
+    sched::with(|s, _| {
+        s.ipc_objects[..s.nipc_objects as usize]
+            .iter()
+            .find(|&&(kind, i, _)| kind == crate::shared::IPC_SHM && i == id)
+            .map(|&(_, _, size)| size)
+    })
+    .flatten()
+}
+
+/// `shmget` with a key becomes a private segment (Postgres tries keys in
+/// sequence until one is free: how many tries depends on what the
+/// machine holds), and one a guest only looks up by key is not found.
+pub unsafe extern "C" fn my_shmget(key: libc::key_t, size: usize, flg: c_int) -> c_int {
+    sched::hook_event(sched::SITE_WAIT);
+    if sched::my_id().is_none() {
+        return libc::shmget(key, size, flg);
+    }
+    if key != libc::IPC_PRIVATE && flg & libc::IPC_CREAT == 0 {
+        return crate::errno::fail(libc::ENOENT);
+    }
+    let id = libc::shmget(libc::IPC_PRIVATE, size, flg);
+    note_ipc(crate::shared::IPC_SHM, id, size as u64);
+    id
+}
+
+pub unsafe extern "C" fn my_semget(key: libc::key_t, nsems: c_int, flg: c_int) -> c_int {
+    sched::hook_event(sched::SITE_WAIT);
+    if sched::my_id().is_none() {
+        return libc::semget(key, nsems, flg);
+    }
+    if key != libc::IPC_PRIVATE && flg & libc::IPC_CREAT == 0 {
+        return crate::errno::fail(libc::ENOENT);
+    }
+    let id = libc::semget(libc::IPC_PRIVATE, nsems, flg);
+    note_ipc(crate::shared::IPC_SEM, id, 0);
+    id
+}
+
+/// `semop`, a System V semaphore operation (Postgres's lightweight locks sleep
+/// on one per backend): tried without blocking, and parked like an I/O wait
+/// until another guest's operation changes something. An operation that
+/// gives (a positive `sem_op`) wakes the I/O waiters, so a blocked taker
+/// looks again.
+pub unsafe extern "C" fn my_semop(semid: c_int, sops: *mut libc::sembuf, nsops: usize) -> c_int {
+    sched::hook_event(sched::SITE_WAIT);
+    if sched::my_id().is_none() || sops.is_null() || nsops == 0 {
+        return libc::semop(semid, sops, nsops);
+    }
+    let ops = std::slice::from_raw_parts(sops, nsops);
+    let mut nowait: Vec<libc::sembuf> = ops.to_vec();
+    for op in &mut nowait {
+        op.sem_flg |= libc::IPC_NOWAIT as i16;
+    }
+    let gives = ops.iter().any(|op| op.sem_op > 0);
+    let wants_to_wait = ops
+        .iter()
+        .any(|op| op.sem_flg & libc::IPC_NOWAIT as i16 == 0);
+    loop {
+        let rc = libc::semop(semid, nowait.as_mut_ptr(), nsops);
+        if rc == 0 {
+            if gives {
+                wake_io();
+            }
+            return 0;
+        }
+        if *libc::__error() != libc::EAGAIN || !wants_to_wait {
+            return rc;
+        }
+        park_for_io(None);
+    }
+}
+
 fn ready(fd: c_int, events: libc::c_short) -> bool {
     let mut p = libc::pollfd {
         fd,
@@ -243,6 +331,9 @@ pub unsafe extern "C" fn my_read(fd: c_int, buf: *mut c_void, n: usize) -> isize
     if let Some(sock) = crate::net::lookup(fd) {
         return crate::net::recv_fd(fd, sock, buf.cast(), n, 0);
     }
+    if let Some(got) = crate::determinism::read_random(fd, buf, n) {
+        return got;
+    }
     when_readable(fd, || unsafe { libc::read(fd, buf, n) })
 }
 
@@ -251,6 +342,9 @@ pub unsafe extern "C" fn my_read_nocancel(fd: c_int, buf: *mut c_void, n: usize)
     if let Some(sock) = crate::net::lookup(fd) {
         return crate::net::recv_fd(fd, sock, buf.cast(), n, 0);
     }
+    if let Some(got) = crate::determinism::read_random(fd, buf, n) {
+        return got;
+    }
     when_readable(fd, || unsafe { read_nocancel(fd, buf, n) })
 }
 
@@ -258,6 +352,9 @@ pub unsafe extern "C" fn my_readv(fd: c_int, iov: *const libc::iovec, n: c_int) 
     sched::hook_event(sched::SITE_IO);
     if let Some(sock) = crate::net::lookup(fd) {
         return readv_virtual(fd, sock, iov, n);
+    }
+    if n > 0 && crate::determinism::read_random(fd, (*iov).iov_base, (*iov).iov_len).is_some() {
+        return (*iov).iov_len as isize;
     }
     when_readable(fd, || unsafe { libc::readv(fd, iov, n) })
 }
@@ -350,10 +447,12 @@ fn close_managed(fd: c_int, real: impl Fn() -> c_int) -> c_int {
 
 pub unsafe extern "C" fn my_close(fd: c_int) -> c_int {
     sched::hook_event(sched::SITE_IO);
+    crate::determinism::closed(fd);
     close_managed(fd, || unsafe { libc::close(fd) })
 }
 
 pub unsafe extern "C" fn my_close_nocancel(fd: c_int) -> c_int {
     sched::hook_event(sched::SITE_IO);
+    crate::determinism::closed(fd);
     close_managed(fd, || unsafe { close_nocancel(fd) })
 }

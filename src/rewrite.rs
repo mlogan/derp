@@ -16,7 +16,7 @@
 use crate::decode::{self, Class, FP, SP};
 use crate::macho::{self, MachO};
 use crate::rng::Rng;
-use crate::shared::{COUNTER_OFFSET, SLOT_OFFSET, STUB_BASE};
+use crate::shared::{COUNTER_ENTRY_OFFSET, COUNTER_OFFSET, SLOT_OFFSET, STUB_BASE};
 use crate::stub;
 
 /// Read-only header at the start of `__STUB`, in front of the stub code.
@@ -65,6 +65,8 @@ pub struct Stats {
     pub words: usize,
     pub branch_sites: usize,
     pub call_sites: usize,
+    /// Reads of the CPU's counter register, answered with the virtual clock
+    pub counter_sites: usize,
     pub mem_candidates: usize,
     pub mem_sites: usize,
     /// Sites a `b` could not reach from, or a trampoline reach a target
@@ -137,6 +139,8 @@ pub enum SiteKind {
     Call,
     Load,
     Store,
+    /// A read of the CPU's counter, answered with the virtual clock
+    Counter,
 }
 
 /// One hooked instruction
@@ -159,6 +163,7 @@ impl SiteKind {
             SiteKind::Call => "call",
             SiteKind::Load => "load",
             SiteKind::Store => "store",
+            SiteKind::Counter => "counter",
         }
     }
 
@@ -169,6 +174,7 @@ impl SiteKind {
             SiteKind::Call,
             SiteKind::Load,
             SiteKind::Store,
+            SiteKind::Counter,
         ]
         .into_iter()
         .find(|k| k.name() == name)
@@ -397,6 +403,60 @@ impl Builder {
         Ok(false)
     }
 
+    /// A counter read: the site becomes a `b` to a trampoline that calls the
+    /// supervisor's entry (`COUNTER_ENTRY_OFFSET`) with the register number
+    /// in the word after the call, for the entry to write the count into.
+    /// The entry pops x0 and x1 and returns past that word.
+    fn counter_stub(&mut self, site: u64, rt: u8) -> bool {
+        for area in 0..self.areas.len() {
+            self.at = area;
+            let mark = (self.len(), self.patches.len(), self.sites.len());
+            let start = self.pc();
+            let fits = match stub::b(site, start).ok_or(Error::OutOfRange {
+                site,
+                target: start,
+            }) {
+                Ok(site_word) => {
+                    self.patches.push((site, site_word));
+                    self.emit(stub::STR_X30_PRE);
+                    self.emit(stub::STP_X0_X1_PRE);
+                    self.emit(stub::movz_x(0, STUB_BASE as u64).expect("STUB_BASE fits one movz"));
+                    self.emit(stub::ldr_x_imm(1, 0, COUNTER_ENTRY_OFFSET));
+                    self.emit(stub::BLR_X1);
+                    let yield_pc = self.pc();
+                    self.emit(u32::from(rt));
+                    self.emit(stub::LDR_X30_POST);
+                    let pc = self.pc();
+                    match stub::b(pc, site + 4) {
+                        Some(w) => {
+                            self.emit(w);
+                            self.sites.push(Site {
+                                yield_pc,
+                                addr: site,
+                                kind: SiteKind::Counter,
+                            });
+                            self.areas[area]
+                                .capacity
+                                .is_none_or(|cap| (self.len() * 4) as u64 <= cap)
+                        }
+                        None => false,
+                    }
+                }
+                Err(_) => false,
+            };
+            if fits {
+                self.at = 0;
+                return true;
+            }
+            self.areas[area].code.truncate(mark.0);
+            self.patches.truncate(mark.1);
+            self.sites.truncate(mark.2);
+        }
+        self.unreachable += 1;
+        self.at = 0;
+        false
+    }
+
     fn stub_or_far(
         &mut self,
         site: u64,
@@ -597,7 +657,11 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
         if stack_tainted {
             stats.stack_tainted_functions += 1;
         }
-        // Words inside an ldxr…stxr span (inclusive) are never touched.
+        // Words inside an ldxr…stxr span (inclusive) are never touched, nor
+        // is the retry branch right after the store: a store-conditional
+        // fails when an interrupt lands between the pair, so the retry
+        // happens at the hardware's whim, and a hooked retry would count
+        // a hook the run cannot repeat.
         let mut exclusive = vec![false; n];
         let mut open = false;
         for (i, c) in classes.iter().enumerate() {
@@ -606,11 +670,21 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
                 Class::ExclusiveStore => {
                     exclusive[i] = true;
                     open = false;
+                    let pc = start + (i * 4) as u64;
+                    let retry = match classes.get(i + 1) {
+                        Some(Class::Cbz { target, .. } | Class::BCond { target, .. }) => {
+                            *target <= pc
+                        }
+                        _ => false,
+                    };
+                    if retry {
+                        exclusive[i + 1] = true;
+                    }
                     continue;
                 }
                 _ => {}
             }
-            exclusive[i] = open;
+            exclusive[i] |= open;
         }
 
         for i in 0..n {
@@ -677,6 +751,13 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
                     let guard = Guard::Tbz { rt, bit, nonzero };
                     if b.stub(pc, guard, false, jump(target, false))? {
                         stats.branch_sites += 1;
+                    }
+                }
+                // x29 and up are never a counter's destination in practice;
+                // such a site is left alone rather than given a slot
+                Class::Counter { rt } if rt < 29 => {
+                    if b.counter_stub(pc, rt) {
+                        stats.counter_sites += 1;
                     }
                 }
                 Class::Mem { base } => {

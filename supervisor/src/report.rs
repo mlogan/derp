@@ -1,5 +1,6 @@
 //! End-of-run report to the launcher, plus a stderr log.
 
+use std::ffi::c_int;
 use std::fmt::Write as _;
 
 /// Write `msg` to stderr without allocating; interposers may log before
@@ -17,6 +18,7 @@ pub fn log(msg: &str) {
 }
 
 pub fn write_report() {
+    crate::sched::dump_diag_mem();
     if !crate::coord::connected() {
         return;
     }
@@ -39,6 +41,14 @@ pub fn write_report() {
 
 extern "C" fn at_exit() {
     write_report();
+}
+
+/// `_exit` skips the exit hooks: the report first (Go leaves this way).
+pub unsafe extern "C" fn my_exit_now(code: c_int) -> ! {
+    if crate::sched::my_id().is_some() {
+        write_report();
+    }
+    libc::_exit(code)
 }
 
 pub fn install_exit_hook() {

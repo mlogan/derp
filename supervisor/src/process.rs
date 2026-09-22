@@ -576,6 +576,31 @@ std::arch::global_asm!(
     "b _rewrite_getppid_impl",
 );
 
+/// `pthread_kill` to another scheduled thread of this process (Go
+/// preempts goroutines and stops the world this way, with SIGURG): the
+/// target is parked, so the signal is pending against it and raised when
+/// it next takes the baton up, where its handler runs with the baton. To
+/// the calling thread, or to a thread the scheduler does not run, it is
+/// the kernel's.
+pub unsafe extern "C" fn my_pthread_kill(t: libc::pthread_t, sig: c_int) -> c_int {
+    if sig == 0 || !(1..32).contains(&sig) || sched::my_id().is_none() || t == libc::pthread_self() {
+        return libc::pthread_kill(t, sig);
+    }
+    let queued = sched::with(|s, pid| {
+        let id = s.find_pthread(pid, t as u64)?;
+        if s.threads[id].state == shared::T_EXITED {
+            return None;
+        }
+        s.threads[id].sig_pending |= 1 << sig;
+        Some(())
+    })
+    .flatten();
+    match queued {
+        Some(()) => 0,
+        None => libc::pthread_kill(t, sig),
+    }
+}
+
 pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
     if !in_run() || !shared::is_virtual_pid(vpid) {
         return libc::kill(vpid, sig);
@@ -599,6 +624,9 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
         libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask);
         // Blocked here, the kernel must find a thread that takes it
         let taken_here = sig != 0 && libc::sigismember(&raw const mask, sig) == 0;
+        if (1..32).contains(&sig) {
+            sched::with(|s, pid| s.procs[pid as usize].sig_counts[sig as usize] += 1);
+        }
         if taken_here && sched::on_scheduled_thread() {
             let rc = libc::pthread_kill(libc::pthread_self(), sig);
             return if rc == 0 { 0 } else { crate::errno::fail(rc) };
@@ -609,7 +637,17 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
         return 0;
     }
     if sig != libc::SIGTERM && sig != libc::SIGKILL {
-        crate::report::log("kill: only SIGTERM and SIGKILL reach another guest; signal dropped");
+        if !(1..32).contains(&sig) {
+            return crate::errno::fail(libc::EINVAL);
+        }
+        // The target is parked: it takes the signal when it next takes
+        // the baton up, and a wait of its on the signal sees it now
+        sched::with(|s, _| {
+            let p = &mut s.procs[target as usize];
+            p.sig_pending |= 1 << sig;
+            p.sig_counts[sig as usize] += 1;
+        });
+        sched::wake_io();
         return 0;
     }
     if sig == libc::SIGTERM {

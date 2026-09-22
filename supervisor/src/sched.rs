@@ -76,7 +76,40 @@ static STRAY_EXPIRIES: AtomicU64 = AtomicU64::new(0);
 /// The thread's scheduler id lives in a pthread key (value `id + 1`) rather
 /// than a Rust thread-local: the key's destructor is the thread's teardown
 /// hook and receives the id even after dyld has torn down TLV storage.
-static ID_KEY: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+static rewrite_id_key: AtomicUsize = AtomicUsize::new(usize::MAX);
+use rewrite_id_key as ID_KEY;
+
+/// A stack per scheduled thread for the yield and counter entries, by
+/// `id + 1` (0: none). Guest code may be on a goroutine's stack, with a
+/// guard of under a kilobyte below `sp`; the entries push several hundred
+/// bytes of registers, so they switch here first and leave at most 32
+/// bytes on the guest's stack (the stub's pushes).
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+static rewrite_stack_tops: [AtomicUsize; shared::MAX_THREADS + 1] =
+    [const { AtomicUsize::new(0) }; shared::MAX_THREADS + 1];
+const ENTRY_STACK_SIZE: usize = 256 << 10;
+
+fn give_entry_stack(id: usize) {
+    if id + 1 >= rewrite_stack_tops.len() || rewrite_stack_tops[id + 1].load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            ENTRY_STACK_SIZE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        )
+    };
+    if p != libc::MAP_FAILED {
+        rewrite_stack_tops[id + 1].store(p as usize + ENTRY_STACK_SIZE, Ordering::Relaxed);
+    }
+}
 
 thread_local! {
     /// Depth of pass-through sections: while positive, interposed calls on
@@ -136,6 +169,7 @@ pub fn process_seed(seed: u64, proc_index: u32) -> u64 {
 }
 
 pub fn set_my_id(id: usize) {
+    give_entry_stack(id);
     set_identity(Some(id));
     let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
     PORTS.lock().push((port, id));
@@ -224,7 +258,7 @@ pub fn pid() -> u32 {
     PID.load(Ordering::Relaxed)
 }
 
-fn shared() -> Option<&'static Shared> {
+pub fn shared() -> Option<&'static Shared> {
     unsafe { SHARED.load(Ordering::Relaxed).as_ref() }
 }
 
@@ -306,6 +340,7 @@ pub static OUTSIDE_WAKES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 extern "C" {
     fn rewrite_scheduler_yield();
+    fn rewrite_counter_read();
 }
 
 /// Fold the hooks consumed from the current quantum into `HOOKS`.
@@ -390,6 +425,20 @@ fn map_shared_file(path: &str) -> Option<(*mut Shared, usize)> {
 
 fn scheduler_slot() -> *mut usize {
     (shared::STUB_BASE + shared::SLOT_OFFSET as usize) as *mut usize
+}
+
+fn counter_slot() -> *mut usize {
+    (shared::STUB_BASE + shared::COUNTER_ENTRY_OFFSET as usize) as *mut usize
+}
+
+/// Called from a counter-read trampoline, through `rewrite_counter_read`,
+/// with the guest's registers saved: the virtual clock in the counter's
+/// ticks, which the trampoline's site register receives.
+#[no_mangle]
+pub extern "C" fn rewrite_counter_impl() -> u64 {
+    let ticks = crate::determinism::counter_ticks();
+    diag_point(0xD1A6_0000_0000_0000 | (ticks & 0xFFFF_FFFF));
+    ticks
 }
 
 pub fn fatal(msg: &str) -> ! {
@@ -481,6 +530,7 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     }
     if std::env::var_os(PASSIVE_VAR).is_some() {
         map_region(-1, Shared::SIZE);
+        unsafe { counter_slot().write(rewrite_counter_read as *const () as usize) };
         return;
     }
     let mut key: libc::pthread_key_t = 0;
@@ -499,7 +549,10 @@ pub fn init(info: Option<Info>, cfg: &Config) {
         }
         Err(_) => start_private_run(cfg),
     };
-    unsafe { scheduler_slot().write(rewrite_scheduler_yield as *const () as usize) };
+    unsafe {
+        scheduler_slot().write(rewrite_scheduler_yield as *const () as usize);
+        counter_slot().write(rewrite_counter_read as *const () as usize);
+    }
     SHARED.store(std::ptr::from_ref(sh).cast_mut(), Ordering::Relaxed);
     open_trace();
     load_mask();
@@ -594,7 +647,138 @@ pub fn peek_clock() -> Option<u64> {
 
 /// A read of the virtual clock by the guest, or None outside a run.
 pub fn clock_read() -> Option<u64> {
-    with(|s, _| s.clock_read())
+    let now = with(|s, _| s.clock_read());
+    if let Some(now) = now {
+        trace_clock_read(now);
+    }
+    now
+}
+
+/// Diagnostic: `DIAG_TRACE_HOOKS=lo..hi` (virtual ns) traces every
+/// interposed call in that window with the quantum's remaining hooks and
+/// the caller's chain: where two runs' hook consumption first drifts.
+static TRACE_HOOKS: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+
+/// Diagnostic: a named point in an interposer, with the quantum's
+/// remaining hooks, under the same window as `trace_hook_event`.
+pub fn diag_point(label: u64) {
+    if my_id().is_none() {
+        return;
+    }
+    if let Some(sh) = shared() {
+        trace_hook_event(label, unsafe { *sh.counter() });
+    }
+}
+
+/// Diagnostic: the hook trace kept in memory (no syscall per event, which
+/// would slow the thread and hide a real-time race) and written at exit.
+const DIAG_MEM_ENTRIES: usize = 1 << 16;
+static DIAG_MEM: SpinLock<Vec<(u64, i64, usize, usize)>> = SpinLock::new(Vec::new());
+
+pub fn dump_diag_mem() {
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    let entries = std::mem::take(&mut *DIAG_MEM.lock());
+    if fd < 0 || entries.is_empty() {
+        return;
+    }
+    let mut text = String::new();
+    for (site, left, a, b) in entries {
+        let _ = writeln!(text, "p{} mem hook site={site:#x} left={left} {a:#x} {b:#x}", pid());
+    }
+    unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) };
+}
+
+#[inline(never)]
+fn trace_hook_event(site: u64, left: i64) {
+    let window = TRACE_HOOKS.get_or_init(|| {
+        let v = std::env::var("DIAG_TRACE_HOOKS").ok()?;
+        let (lo, hi) = v.split_once("..")?;
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    });
+    let Some((lo, hi)) = *window else { return };
+    let now = now();
+    if now < lo || now > hi {
+        return;
+    }
+    if std::env::var_os("DIAG_TRACE_HOOKS_MEM").is_some() {
+        let mut fp: *const usize;
+        unsafe { std::arch::asm!("mov {}, x29", out(reg) fp) };
+        let mut pcs = [0usize; 2];
+        for pc in &mut pcs {
+            if fp.is_null() || (fp as usize) & 7 != 0 {
+                break;
+            }
+            let (next, ret) = unsafe { (*fp as *const usize, *fp.add(1)) };
+            *pc = ret;
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        let mut mem = DIAG_MEM.lock();
+        if mem.len() < DIAG_MEM_ENTRIES {
+            mem.push((site, left, pcs[0], pcs[1]));
+        }
+        return;
+    }
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let mut fp: *const usize;
+    unsafe { std::arch::asm!("mov {}, x29", out(reg) fp) };
+    let mut line = format!("p{} t{:?} hook site={site:#x} left={left}", pid(), my_id());
+    for _ in 0..8 {
+        if fp.is_null() || (fp as usize) & 7 != 0 {
+            break;
+        }
+        let (next, ret) = unsafe { (*fp as *const usize, *fp.add(1)) };
+        let _ = write!(line, " {ret:#x}");
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    line.push('\n');
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
+}
+
+/// Diagnostic: `DIAG_TRACE_CLOCK=lo..hi` (virtual ns) in the guest's
+/// environment traces every clock read in that window with the reader's
+/// call chain (frame pointers), to find a read that comes and goes.
+static TRACE_CLOCK: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+
+#[inline(never)]
+fn trace_clock_read(now: u64) {
+    let window = TRACE_CLOCK.get_or_init(|| {
+        let v = std::env::var("DIAG_TRACE_CLOCK").ok()?;
+        let (lo, hi) = v.split_once("..")?;
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    });
+    let Some((lo, hi)) = *window else { return };
+    if now < lo || now > hi {
+        return;
+    }
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let mut fp: *const usize;
+    unsafe { std::arch::asm!("mov {}, x29", out(reg) fp) };
+    let mut line = format!("p{} t{:?} clock read {now}", pid(), my_id());
+    for _ in 0..10 {
+        if fp.is_null() || (fp as usize) & 7 != 0 {
+            break;
+        }
+        let (next, ret) = unsafe { (*fp as *const usize, *fp.add(1)) };
+        let _ = write!(line, " {ret:#x}");
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    line.push('\n');
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
 }
 
 static YIELDS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -733,10 +917,12 @@ impl After {
                 // Traced too: a quantum ended here, switch or not, and
                 // masking this site would move the run
                 trace_switch(me, me, self.issued, site, self.clock);
+                die_if_stopped();
                 if self.unsettled {
                     take_up_baton(sh);
                 } else {
                     install_quantum(self.quantum);
+                    deliver_pending_signals();
                 }
                 true
             }
@@ -775,10 +961,50 @@ pub fn signal_crashed(s: &mut shared::State) -> bool {
 /// released at this point of the schedule and not at some later one, and
 /// until a thread of this process that exited is gone.
 pub fn take_up_baton(sh: &Shared) {
+    die_if_stopped();
     // Before the counter is ours: the exiting thread's last hooks go
     // against the count it left behind
     wait_out_exit();
     wait_out_deaths(sh, true);
+    deliver_pending_signals();
+}
+
+/// Signals other guests sent this process while it was parked: raised on
+/// this thread, here and now, so the handlers run with the baton at a
+/// point of the schedule. Ones this thread blocks stay pending for another.
+fn deliver_pending_signals() {
+    let Some(me) = my_id() else { return };
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask) };
+    let take = with(|s, pid| {
+        let mut take = 0u64;
+        let mine = s.threads[me].sig_pending;
+        let p = &mut s.procs[pid as usize];
+        for sig in 1..32 {
+            if (p.sig_pending | mine) & (1 << sig) != 0
+                && unsafe { libc::sigismember(&raw const mask, sig) } == 0
+            {
+                take |= 1 << sig;
+            }
+        }
+        p.sig_pending &= !take;
+        s.threads[me].sig_pending &= !take;
+        take
+    })
+    .unwrap_or(0);
+    for sig in 1..32 {
+        if take & (1 << sig) != 0 {
+            unsafe { libc::pthread_kill(libc::pthread_self(), sig) };
+        }
+    }
+}
+
+/// The run's stop reached this process: its report, then its end. Its
+/// death passes the baton on to the next stopped process.
+fn die_if_stopped() {
+    if with(|s, pid| s.procs[pid as usize].stopped) == Some(true) {
+        die();
+    }
 }
 
 /// Threads whose exit the next holder waited for, and the longest wait
@@ -951,6 +1177,16 @@ fn open_trace() {
     TRACE_FD.store(high, Ordering::Relaxed);
 }
 
+/// Diagnostic: a line of the trace
+pub fn trace_line(text: &str) {
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let line = format!("p{} t{:?} {text}\n", pid(), my_id());
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
+}
+
 fn trace_outside_expiry(site: u64) {
     let fd = TRACE_FD.load(Ordering::Relaxed);
     if fd < 0 {
@@ -991,6 +1227,7 @@ pub fn hook_event(site: u64) {
         return;
     }
     let Some(sh) = shared() else { return };
+    trace_hook_event(site, unsafe { *sh.counter() });
     let expired = unsafe {
         let counter = sh.counter();
         *counter -= 1;
@@ -1178,6 +1415,126 @@ pub fn report(out: &mut String) {
     }
 }
 
+// A counter read's entry. On entry [sp] holds the guest's x0 and x1 (the
+// trampoline pushed them) and x30 points at the word holding the site's
+// register number. Every other register the guest may have live is saved
+// here, x0..x28 in one block so the result can be dropped into the slot
+// of any of them; x29 and x30 are never a counter's destination.
+std::arch::global_asm!(
+    ".globl _rewrite_counter_read",
+    ".p2align 2",
+    "_rewrite_counter_read:",
+    // x0 and x1 are scratch here (the trampoline pushed the guest's). Find
+    // this thread's entry stack: its id from the key in the TSD block.
+    "str x2, [sp, #-16]!",
+    "mrs x2, tpidrro_el0",
+    "and x2, x2, #0xfffffffffffffff8",
+    "adrp x0, _rewrite_id_key@PAGE",
+    "ldr x0, [x0, _rewrite_id_key@PAGEOFF]",
+    "ldr x2, [x2, x0, lsl #3]",
+    "and x2, x2, #0xffffffff",
+    "adrp x0, _rewrite_stack_tops@PAGE",
+    "add x0, x0, _rewrite_stack_tops@PAGEOFF",
+    "ldr x0, [x0, x2, lsl #3]",
+    "ldr x2, [sp], #16",
+    "mov x1, sp",
+    "cbz x0, 1f",
+    "mov sp, x0",
+    "1:",
+    // [sp] holds the guest's sp; the guest's x0 and x1 are at [that]
+    "str x1, [sp, #-16]!",
+    "stp x29, x30, [sp, #-16]!",
+    "mov x29, sp",
+    "sub sp, sp, #240",
+    "stp x2, x3, [sp, #16]",
+    "ldr x2, [x29, #16]",
+    "ldp x2, x3, [x2]",
+    "stp x2, x3, [sp, #0]",
+    "stp x4, x5, [sp, #32]",
+    "stp x6, x7, [sp, #48]",
+    "stp x8, x9, [sp, #64]",
+    "stp x10, x11, [sp, #80]",
+    "stp x12, x13, [sp, #96]",
+    "stp x14, x15, [sp, #112]",
+    "stp x16, x17, [sp, #128]",
+    "stp x18, x19, [sp, #144]",
+    "stp x20, x21, [sp, #160]",
+    "stp x22, x23, [sp, #176]",
+    "stp x24, x25, [sp, #192]",
+    "stp x26, x27, [sp, #208]",
+    "str x28, [sp, #224]",
+    "mrs x2, nzcv",
+    "mrs x3, fpsr",
+    "stp x2, x3, [sp, #-16]!",
+    "stp q0, q1, [sp, #-32]!",
+    "stp q2, q3, [sp, #-32]!",
+    "stp q4, q5, [sp, #-32]!",
+    "stp q6, q7, [sp, #-32]!",
+    "stp q8, q9, [sp, #-32]!",
+    "stp q10, q11, [sp, #-32]!",
+    "stp q12, q13, [sp, #-32]!",
+    "stp q14, q15, [sp, #-32]!",
+    "stp q16, q17, [sp, #-32]!",
+    "stp q18, q19, [sp, #-32]!",
+    "stp q20, q21, [sp, #-32]!",
+    "stp q22, q23, [sp, #-32]!",
+    "stp q24, q25, [sp, #-32]!",
+    "stp q26, q27, [sp, #-32]!",
+    "stp q28, q29, [sp, #-32]!",
+    "stp q30, q31, [sp, #-32]!",
+    "bl _rewrite_counter_impl",
+    // The block of x0..x28 sits at x29 - 240; the site's register is the
+    // word at x30 (saved at [x29, #8])
+    "ldr x1, [x29, #8]",
+    "ldr w1, [x1]",
+    "sub x2, x29, #240",
+    "str x0, [x2, x1, lsl #3]",
+    "ldp q30, q31, [sp], #32",
+    "ldp q28, q29, [sp], #32",
+    "ldp q26, q27, [sp], #32",
+    "ldp q24, q25, [sp], #32",
+    "ldp q22, q23, [sp], #32",
+    "ldp q20, q21, [sp], #32",
+    "ldp q18, q19, [sp], #32",
+    "ldp q16, q17, [sp], #32",
+    "ldp q14, q15, [sp], #32",
+    "ldp q12, q13, [sp], #32",
+    "ldp q10, q11, [sp], #32",
+    "ldp q8, q9, [sp], #32",
+    "ldp q6, q7, [sp], #32",
+    "ldp q4, q5, [sp], #32",
+    "ldp q2, q3, [sp], #32",
+    "ldp q0, q1, [sp], #32",
+    "ldp x2, x3, [sp], #16",
+    "msr nzcv, x2",
+    "msr fpsr, x3",
+    // x0 and x1 go back to the trampoline's push on the guest's stack
+    "ldp x2, x3, [sp, #0]",
+    "ldr x4, [x29, #16]",
+    "stp x2, x3, [x4]",
+    "ldp x2, x3, [sp, #16]",
+    "ldp x4, x5, [sp, #32]",
+    "ldp x6, x7, [sp, #48]",
+    "ldp x8, x9, [sp, #64]",
+    "ldp x10, x11, [sp, #80]",
+    "ldp x12, x13, [sp, #96]",
+    "ldp x14, x15, [sp, #112]",
+    "ldp x16, x17, [sp, #128]",
+    "ldp x18, x19, [sp, #144]",
+    "ldp x20, x21, [sp, #160]",
+    "ldp x22, x23, [sp, #176]",
+    "ldp x24, x25, [sp, #192]",
+    "ldp x26, x27, [sp, #208]",
+    "ldr x28, [sp, #224]",
+    "add sp, sp, #240",
+    "ldp x29, x30, [sp], #16",
+    "ldr x0, [sp]",
+    "mov sp, x0",
+    "ldp x0, x1, [sp], #16",
+    "add x30, x30, #4",
+    "ret",
+);
+
 // Saves every register the guest may have live (the stub already saved x0,
 // x1 and x30), calls the Rust scheduler, and restores them. x18 is the
 // platform register and x19-x28 are callee-saved, so neither needs saving.
@@ -1187,6 +1544,24 @@ std::arch::global_asm!(
     ".globl _rewrite_scheduler_yield",
     ".p2align 2",
     "_rewrite_scheduler_yield:",
+    // x0 and x1 are scratch (the stub saved them). This thread's entry
+    // stack, by its id from the key in the TSD block; none: stay
+    "str x2, [sp, #-16]!",
+    "mrs x2, tpidrro_el0",
+    "and x2, x2, #0xfffffffffffffff8",
+    "adrp x0, _rewrite_id_key@PAGE",
+    "ldr x0, [x0, _rewrite_id_key@PAGEOFF]",
+    "ldr x2, [x2, x0, lsl #3]",
+    "and x2, x2, #0xffffffff",
+    "adrp x0, _rewrite_stack_tops@PAGE",
+    "add x0, x0, _rewrite_stack_tops@PAGEOFF",
+    "ldr x0, [x0, x2, lsl #3]",
+    "ldr x2, [sp], #16",
+    "mov x1, sp",
+    "cbz x0, 1f",
+    "mov sp, x0",
+    "1:",
+    "str x1, [sp, #-16]!",
     "stp x29, x30, [sp, #-16]!",
     "mov x29, sp",
     "stp x2, x3, [sp, #-16]!",
@@ -1216,7 +1591,10 @@ std::arch::global_asm!(
     "stp q26, q27, [sp, #-32]!",
     "stp q28, q29, [sp, #-32]!",
     "stp q30, q31, [sp, #-32]!",
+    // The site: the return address the stub body saved last, at the top
+    // of the guest's stack, whose sp is at [x29, #16]
     "ldr x0, [x29, #16]",
+    "ldr x0, [x0]",
     "bl _rewrite_yield_impl",
     "ldp q30, q31, [sp], #32",
     "ldp q28, q29, [sp], #32",
@@ -1246,5 +1624,7 @@ std::arch::global_asm!(
     "ldp x4, x5, [sp], #16",
     "ldp x2, x3, [sp], #16",
     "ldp x29, x30, [sp], #16",
+    "ldr x0, [sp]",
+    "mov sp, x0",
     "ret",
 );

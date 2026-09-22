@@ -46,14 +46,16 @@ What the systems need from the supervisor along the way is the real work.
    `kill(vpid, 0)` answers liveness. `EVFILT_SIGNAL` and `EVFILT_PROC`
    registrations on virtual pids are the run's: readiness from the
    pending-signal counts and the process table.
-7. **Whatever else postgres needs** once signals work (SysV semaphores
-   are the likely next).
+7. **Whatever else postgres needs** once signals work: `semop` as a
+   scheduler wait; keyed System V objects made private and removed at
+   the end; `shmat` placed; `shm_open` names per run; `setitimer` as a
+   virtual deadline; `getrusage` virtual.
 8. Examples README, per-example tests, `.gitignore` for the venv and
    the data directory.
 
 ## Order
 
-1 to 5 (done), README and tests, then 6, 7, then more examples.
+1 to 7 (done), README and tests (done), then more examples.
 
 ## Acceptance
 

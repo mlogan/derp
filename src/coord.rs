@@ -232,6 +232,27 @@ impl Coordinator {
         deadlock
     }
 
+    /// Remove the System V objects the guests made: a run leaves nothing
+    /// in the machine's namespace.
+    pub fn remove_ipc_objects(&self) {
+        let s = self.shared.lock();
+        for &(kind, id, _) in &s.ipc_objects[..s.nipc_objects as usize] {
+            unsafe {
+                if kind == crate::shared::IPC_SHM {
+                    libc::shmctl(id, libc::IPC_RMID, std::ptr::null_mut());
+                } else {
+                    libc::semctl(id, 0, libc::IPC_RMID);
+                }
+            }
+        }
+        for name in &s.pshm_names[..s.npshm_names as usize] {
+            let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+            if let Ok(c) = CString::new(&name[..end]) {
+                unsafe { libc::shm_unlink(c.as_ptr()) };
+            }
+        }
+    }
+
     pub fn totals(&self) -> Totals {
         let s = self.shared.lock();
         Totals {

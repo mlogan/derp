@@ -608,6 +608,9 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
         kill_all(&mut procs);
     }
     let deadlock = result?;
+    if let Some(coord) = &coord {
+        coord.remove_ipc_objects();
+    }
     let totals = coord.as_ref().map(Coordinator::totals).unwrap_or_default();
     let specs: Vec<Option<usize>> = procs.iter().map(|p| p.spec).collect();
     let wall_limited = procs.iter().any(|p| p.wall_limited);

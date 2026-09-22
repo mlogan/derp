@@ -407,7 +407,7 @@ impl Builder {
     /// supervisor's entry (`COUNTER_ENTRY_OFFSET`) with the register number
     /// in the word after the call, for the entry to write the count into.
     /// The entry pops x0 and x1 and returns past that word.
-    fn counter_stub(&mut self, site: u64, rt: u8) -> Result<bool, Error> {
+    fn counter_stub(&mut self, site: u64, rt: u8) -> bool {
         for area in 0..self.areas.len() {
             self.at = area;
             let mark = (self.len(), self.patches.len(), self.sites.len());
@@ -446,7 +446,7 @@ impl Builder {
             };
             if fits {
                 self.at = 0;
-                return Ok(true);
+                return true;
             }
             self.areas[area].code.truncate(mark.0);
             self.patches.truncate(mark.1);
@@ -454,7 +454,7 @@ impl Builder {
         }
         self.unreachable += 1;
         self.at = 0;
-        Ok(false)
+        false
     }
 
     fn stub_or_far(
@@ -742,7 +742,7 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
                 // x29 and up are never a counter's destination in practice;
                 // such a site is left alone rather than given a slot
                 Class::Counter { rt } if rt < 29 => {
-                    if b.counter_stub(pc, rt)? {
+                    if b.counter_stub(pc, rt) {
                         stats.counter_sites += 1;
                     }
                 }

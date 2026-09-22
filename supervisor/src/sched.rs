@@ -224,7 +224,7 @@ pub fn pid() -> u32 {
     PID.load(Ordering::Relaxed)
 }
 
-fn shared() -> Option<&'static Shared> {
+pub fn shared() -> Option<&'static Shared> {
     unsafe { SHARED.load(Ordering::Relaxed).as_ref() }
 }
 
@@ -618,6 +618,45 @@ pub fn clock_read() -> Option<u64> {
     now
 }
 
+/// Diagnostic: `DIAG_TRACE_HOOKS=lo..hi` (virtual ns) traces every
+/// interposed call in that window with the quantum's remaining hooks and
+/// the caller's chain: where two runs' hook consumption first drifts.
+static TRACE_HOOKS: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+
+#[inline(never)]
+fn trace_hook_event(site: u64, left: i64) {
+    let window = TRACE_HOOKS.get_or_init(|| {
+        let v = std::env::var("DIAG_TRACE_HOOKS").ok()?;
+        let (lo, hi) = v.split_once("..")?;
+        Some((lo.parse().ok()?, hi.parse().ok()?))
+    });
+    let Some((lo, hi)) = *window else { return };
+    let now = now();
+    if now < lo || now > hi {
+        return;
+    }
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let mut fp: *const usize;
+    unsafe { std::arch::asm!("mov {}, x29", out(reg) fp) };
+    let mut line = format!("p{} t{:?} hook site={site:#x} left={left}", pid(), my_id());
+    for _ in 0..8 {
+        if fp.is_null() || (fp as usize) & 7 != 0 {
+            break;
+        }
+        let (next, ret) = unsafe { (*fp as *const usize, *fp.add(1)) };
+        let _ = write!(line, " {ret:#x}");
+        if next <= fp {
+            break;
+        }
+        fp = next;
+    }
+    line.push('\n');
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
+}
+
 /// Diagnostic: `DIAG_TRACE_CLOCK=lo..hi` (virtual ns) in the guest's
 /// environment traces every clock read in that window with the reader's
 /// call chain (frame pointers), to find a read that comes and goes.
@@ -797,6 +836,7 @@ impl After {
                     take_up_baton(sh);
                 } else {
                     install_quantum(self.quantum);
+                    deliver_pending_signals();
                 }
                 true
             }
@@ -840,6 +880,34 @@ pub fn take_up_baton(sh: &Shared) {
     // against the count it left behind
     wait_out_exit();
     wait_out_deaths(sh, true);
+    deliver_pending_signals();
+}
+
+/// Signals other guests sent this process while it was parked: raised on
+/// this thread, here and now, so the handlers run with the baton at a
+/// point of the schedule. Ones this thread blocks stay pending for another.
+fn deliver_pending_signals() {
+    let mut mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &raw mut mask) };
+    let take = with(|s, pid| {
+        let p = &mut s.procs[pid as usize];
+        let mut take = 0u64;
+        for sig in 1..32 {
+            if p.sig_pending & (1 << sig) != 0
+                && unsafe { libc::sigismember(&raw const mask, sig) } == 0
+            {
+                take |= 1 << sig;
+            }
+        }
+        p.sig_pending &= !take;
+        take
+    })
+    .unwrap_or(0);
+    for sig in 1..32 {
+        if take & (1 << sig) != 0 {
+            unsafe { libc::pthread_kill(libc::pthread_self(), sig) };
+        }
+    }
 }
 
 /// The run's stop reached this process: its report, then its end. Its
@@ -1070,6 +1138,7 @@ pub fn hook_event(site: u64) {
         return;
     }
     let Some(sh) = shared() else { return };
+    trace_hook_event(site, unsafe { *sh.counter() });
     let expired = unsafe {
         let counter = sh.counter();
         *counter -= 1;

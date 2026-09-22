@@ -30,7 +30,10 @@ directory and point `PYTHONPATH` at it.
   are the run's now.
 - `postgres/`: a server (its data directory prepared natively, since
   `initdb` shells out) and a four-thread client doing updates, deletes
-  and inserts in transactions. Not yet repeatable: see the plan.
+  and inserts in transactions. Postgres is many processes that signal
+  each other, watch the postmaster's pid, sleep on System V semaphores,
+  time statements with `setitimer`, and claim shared memory by keys and
+  names; each of those is the run's now.
 
 ## Limits worth knowing
 

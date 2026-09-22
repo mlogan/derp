@@ -215,6 +215,47 @@ pub unsafe extern "C" fn my_mach_vm_deallocate(task: u32, addr: u64, size: u64) 
     rc
 }
 
+/// Segments attached here, `(address, length)`, for `shmdt` to give back
+static ATTACHED: SpinLock<Vec<(u64, u64)>> = SpinLock::new(Vec::new());
+
+/// `shmat` without an address: the segment lands in the region, whose
+/// stretch is unreserved for it first (the kernel maps a segment only
+/// onto free space).
+pub unsafe extern "C" fn my_shmat(id: i32, addr: *const c_void, flg: i32) -> *mut c_void {
+    let size = if addr.is_null() {
+        crate::io::shm_size(id)
+    } else {
+        None
+    };
+    if let Some(size) = size {
+        let len = round_up(size.max(1));
+        if let Some(at) = take(len) {
+            mach_vm_deallocate(mach_task_self_, at, len);
+            let p = libc::shmat(id, at as *const c_void, flg);
+            if p as usize != usize::MAX {
+                PLACED.fetch_add(1, Ordering::Relaxed);
+                ATTACHED.lock().push((at, len));
+                return p;
+            }
+            give_back(at, len);
+        }
+    }
+    libc::shmat(id, addr, flg)
+}
+
+pub unsafe extern "C" fn my_shmdt(addr: *const c_void) -> i32 {
+    let rc = libc::shmdt(addr);
+    if rc == 0 {
+        let mut attached = ATTACHED.lock();
+        if let Some(i) = attached.iter().position(|&(a, _)| a == addr as u64) {
+            let (a, len) = attached.remove(i);
+            drop(attached);
+            give_back(a, len);
+        }
+    }
+    rc
+}
+
 pub unsafe extern "C" fn my_mmap(
     addr: *mut c_void,
     len: usize,

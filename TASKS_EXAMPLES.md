@@ -18,6 +18,20 @@ Plan: `IMPLEMENTATION_PLAN_EXAMPLES.md`. Branch `mlogan-examples`.
   clock reads with call chains, `DIAG_TRACE_NET=1` traces virtual-socket
   transfers and the real kqueue's events.
 - `examples/redis`: four runs, one hash, one output.
+- Signals between guests (delivered at the target's next baton take-up,
+  on the Stay path too), `kill(pid, 0)`, `EVFILT_PROC` on virtual pids
+  and `EVFILT_SIGNAL` as the run's watches (`sigwatch.c`).
+- `semop` as a scheduler wait; keyed `shmget`/`semget` made private and
+  removed at the run's end; `shmat` placed in the region; `shm_open`
+  names prefixed with the run's pid and unlinked at the end; `getrusage`
+  virtual (`sysvsem.c`).
+- `setitimer`/`alarm`/`getitimer` as a virtual per-process deadline whose
+  SIGALRM wakes a blocked thread (`itimer.c`).
+- `DIAG_TRACE_HOOKS=lo..hi`: every interposed call with the quantum's
+  remaining hooks and the caller's chain, which is how the last three
+  Postgres inputs were found (a drift of 1, then 31 hooks between two
+  calls).
+- `examples/postgres`: 20 runs, one hash, one output; seed 2 another.
 
 ## Findings
 
@@ -27,15 +41,16 @@ Plan: `IMPLEMENTATION_PLAN_EXAMPLES.md`. Branch `mlogan-examples`.
 - Redis's monotonic clock is the CPU counter (`monotonic.c`, "ARM
   CNTVCT"); its hash seed is `/dev/urandom`; its zone is
   `gettimeofday`'s. Three real inputs, all now the run's.
-- Postgres: children watch the postmaster with `EVFILT_PROC` on a
-  virtual pid, which the real kqueue rejects, so every child decides the
-  postmaster died; latches are SIGURG, procsignals SIGUSR1, and the
-  supervisor drops both. Needs plan items 6 and 7.
+- Postgres needed, in the order found: `EVFILT_PROC` on the postmaster's
+  virtual pid (the real kqueue rejects it: every child decided the
+  postmaster died), signals between guests (SIGURG latches, SIGUSR1),
+  `semop` (a backend slept in the kernel with the baton: the run stalled),
+  `setitimer` (real SIGALRMs on parked threads), System V keys tried in
+  sequence against the machine's leftovers, the `shmat` address, and
+  `shm_open` names colliding with a killed run's objects.
 - Python's interpreter is a dylib and stays unhooked: its threads switch
   only at interposed calls.
 
 ## Remaining
 
-- Plan items 6 and 7 (postgres).
-- Tests for the examples (skipped when not installed).
 - More examples.

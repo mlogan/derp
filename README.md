@@ -230,6 +230,25 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   order; the launcher is pid 1. A scheduled thread's `pthread_threadid_np`
   is its index in the run plus a billion (kernel thread ids differ from
   run to run; RocksDB mixes one into its DB session ids).
+- System V semaphores (`semop`, what Postgres's lightweight locks sleep
+  on) are waited for by the scheduler, and a keyed segment or set a
+  guest creates (`shmget`, `semget`) is private to the run and removed
+  when it ends, as is a POSIX shared memory object (`shm_open`, given a
+  per-run name): keys and names are a namespace of the whole machine,
+  and what one run leaves there would change the next run's tries. A
+  segment attaches (`shmat`) in the reserved region. `getrusage` reports
+  the virtual clock as CPU time.
+- A process's interval timer (`setitimer(ITIMER_REAL)`, `alarm`) is a
+  virtual deadline: its SIGALRM is pending from that moment of the
+  schedule and wakes a blocked thread of the process, instead of landing
+  on a parked thread at a real moment (Postgres times statements so).
+- A signal one guest sends another (`kill` with anything but SIGTERM and
+  SIGKILL, which end the target) is delivered when the target next takes
+  the baton up, on that thread, so its handler runs at a point of the
+  schedule; `kill(pid, 0)` says whether a guest lives. A kqueue watch on
+  a guest's pid (`EVFILT_PROC`) or on a signal (`EVFILT_SIGNAL`) is the
+  run's too: Postgres's children watch the postmaster and its latches are
+  SIGURG.
 - A read of the CPU's counter register (`mrs xN, cntvct_el0`, what Redis
   and others take their monotonic clock from, past every library) is
   rewritten into a read of the virtual clock, in the counter's ticks. The

@@ -43,6 +43,116 @@ struct Kq {
     /// Idents of the user events registered: a scheduled thread's `kevent`
     /// triggers them, so a wait on them is the scheduler's
     user_events: Vec<usize>,
+    /// Watches on what the run knows and the kernel does not: another
+    /// guest's death (`EVFILT_PROC` on a virtual pid) and signals guests
+    /// send (`EVFILT_SIGNAL`)
+    watches: Vec<Watch>,
+}
+
+struct Watch {
+    ident: usize,
+    filter: i16,
+    flags: u16,
+    fflags: u32,
+    udata: *mut c_void,
+    /// The signal's count when this last fired
+    seen: u32,
+}
+
+/// The process index behind a virtual pid, if it is one of the run's
+fn process_of(vpid: usize) -> Option<usize> {
+    crate::shared::proc_of(i32::try_from(vpid).ok()?).map(|p| p as usize)
+}
+
+/// Whether a change is a watch of ours rather than the kernel's.
+fn is_watch(ev: &libc::kevent) -> bool {
+    let (ident, filter) = (ev.ident, ev.filter);
+    (filter == libc::EVFILT_PROC && process_of(ident).is_some())
+        || (filter == libc::EVFILT_SIGNAL && (1..32).contains(&ident))
+}
+
+fn watch(kq: &mut Kq, ev: &libc::kevent) {
+    let at = kq
+        .watches
+        .iter()
+        .position(|w| w.ident == ev.ident && w.filter == ev.filter);
+    if ev.flags & libc::EV_DELETE != 0 {
+        if let Some(at) = at {
+            kq.watches.remove(at);
+        }
+        return;
+    }
+    if ev.flags & libc::EV_ADD == 0 {
+        return;
+    }
+    let seen = if ev.filter == libc::EVFILT_SIGNAL {
+        sched::with(|s, pid| s.procs[pid as usize].sig_counts[ev.ident]).unwrap_or(0)
+    } else {
+        0
+    };
+    let w = Watch {
+        ident: ev.ident,
+        filter: ev.filter,
+        flags: ev.flags & (libc::EV_CLEAR | libc::EV_ONESHOT | libc::EV_DISPATCH),
+        fflags: ev.fflags,
+        udata: ev.udata,
+        seen,
+    };
+    match at {
+        Some(at) => kq.watches[at] = w,
+        None => kq.watches.push(w),
+    }
+}
+
+/// Events the watches have now: a watched guest's death (once), signals
+/// sent since the watch last fired.
+fn collect_watches(kq: &mut Kq, out: &mut [libc::kevent], mut n: usize) -> usize {
+    let mut fired = Vec::new();
+    for (i, w) in kq.watches.iter_mut().enumerate() {
+        if n == out.len() {
+            break;
+        }
+        let event = if w.filter == libc::EVFILT_PROC {
+            let Some(target) = process_of(w.ident) else { continue };
+            let status = sched::with(|s, _| {
+                let p = &s.procs[target];
+                (p.state == crate::shared::P_EXITED || p.killed).then_some(p.exit_status)
+            })
+            .flatten();
+            let Some(status) = status else { continue };
+            fired.push(i);
+            // NOTE_EXIT; the status comes along when NOTE_EXITSTATUS was asked
+            let data = if w.fflags & 0x0400_0000 != 0 { status as isize } else { 0 };
+            Some((0x8000_0000u32, data))
+        } else {
+            let count =
+                sched::with(|s, pid| s.procs[pid as usize].sig_counts[w.ident]).unwrap_or(0);
+            if count == w.seen {
+                continue;
+            }
+            let delta = count - w.seen;
+            w.seen = count;
+            if w.flags & libc::EV_ONESHOT != 0 {
+                fired.push(i);
+            }
+            Some((0, delta as isize))
+        };
+        if let Some((fflags, data)) = event {
+            out[n] = libc::kevent {
+                ident: w.ident,
+                filter: w.filter,
+                flags: w.flags | libc::EV_ADD,
+                fflags,
+                data,
+                udata: w.udata,
+            };
+            n += 1;
+        }
+    }
+    for i in fired.into_iter().rev() {
+        kq.watches.remove(i);
+    }
+    n
 }
 
 /// A change of a call that wants receipts
@@ -115,6 +225,7 @@ impl Kq {
             guest_objects: Vec::new(),
             external: Vec::new(),
             user_events: Vec::new(),
+            watches: Vec::new(),
         }
     }
 }
@@ -277,6 +388,17 @@ pub unsafe extern "C" fn my_kevent(
         });
         let k = &mut kqs.0[at];
         for ev in changes {
+            if is_watch(ev) {
+                watch(k, ev);
+                if ev.flags & libc::EV_RECEIPT != 0 {
+                    ordered.push(Step::Ours(libc::kevent {
+                        flags: ev.flags | libc::EV_ERROR,
+                        data: 0,
+                        ..*ev
+                    }));
+                }
+                continue;
+            }
             let io = ev.filter == libc::EVFILT_READ || ev.filter == libc::EVFILT_WRITE;
             let fd = ev.ident as c_int;
             match crate::net::lookup(fd) {
@@ -318,6 +440,7 @@ pub unsafe extern "C" fn my_kevent(
         let ours = !k.regs.is_empty()
             || !k.guest_objects.is_empty()
             || !k.user_events.is_empty()
+            || !k.watches.is_empty()
             || k.external.is_empty();
         (ours, !k.external.is_empty())
     };
@@ -400,7 +523,10 @@ pub unsafe extern "C" fn my_kevent(
         let mut n = {
             let mut kqs = KQS.lock();
             match kqs.0.iter_mut().find(|k| k.fds.contains(&kq)) {
-                Some(k) => collect(k, out),
+                Some(k) => {
+                    let n = collect(k, out);
+                    collect_watches(k, out, n)
+                }
                 None => 0,
             }
         };

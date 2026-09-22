@@ -1,6 +1,6 @@
-# Working with Claude Code on DVM
+# Working with Claude Code on DERP
 
-This document describes the development workflow and methodology used for building the DVM project with Claude Code.
+This document describes the development workflow and methodology used for building DERP with Claude Code.
 
 ## Overview
 
@@ -305,7 +305,7 @@ git log --oneline  # Review history
 Run clippy before every commit:
 
 ```bash
-cargo clippy
+cargo clippy --workspace --all-targets
 ```
 
 The project is configured with `clippy::all` and `clippy::pedantic` warnings enabled. Fix all warnings before committing.
@@ -400,95 +400,47 @@ Before committing, verify:
 
 ---
 
-## DVM Project Status
+## DERP project status
 
-**Current Phase**: Phase 8 (Complete) - malloc/free, system calls, hello world
-- Implementation Plan: `IMPLEMENTATION_PLAN_PHASE8.md`
-- Task Tracking: `TASKS_PHASE8.md`
-- Tests: 296 passing
-- `scripts/bench-quick.sh` for fast regression checks; record numbers from
-  a full `cargo bench` only
-- `dvm run prog.{c,rs,ll}` compiles through LLVM IR (`src/llvm/`) and runs
-  it; `VM::run()` is the ARM64 JIT, `VM::run_rust()` the interpreter. Both
-  must stay exactly equivalent (`tests/jit_tests.rs`, `tests/llvm_tests.rs`).
-- Programs talk to the VM only through `SYSCALL` (exit, write, read, sbrk,
-  mmap, munmap, abort); there is no libc. `malloc` is guest code
-  (`runtime/malloc.c`, linked in on demand), never a VM service.
+DERP, the Deterministic Execution and Replay Platform, runs native arm64
+Mach-O programs under a deterministic baton scheduler: the rewriter
+(`src/`, the `rewrite` binary) hooks branches, calls and a sparse set of
+memory accesses, and the supervisor dylib (`supervisor/`) owns the
+schedule, the clock, the entropy, the heap layout and the virtual
+network of every guest. Usage in `README.md`. The project began as the
+rewriting experiment of an earlier interpreter-based project (DVM); this
+repository's history starts there.
 
-**Previous Phases**: 1 (core VM), 2 (benchmarks and optimizations),
-3 (threads, processes, deterministic scheduler), 4 (JIT), 5 (LLVM IR
-compiler), 6 (register allocation), 7 (benchmark corpus and performance).
-See `TASKS_PHASE{N}.md`.
+**Phases, each with a plan and a progress file** (`IMPLEMENTATION_PLAN_X.md`,
+`TASKS_X.md`), all merged:
+- Rewrite experiment (`REWRITE`): Mach-O rewriter, stubs, baton
+  scheduler, seeded quanta, virtual clock and entropy. Results in
+  `docs/REWRITE_RESULTS.md`.
+- Multi-process runs (`MULTIPROC`): one scheduler in shared memory for
+  several guests on virtual hosts, virtual pids, pipes, a virtual network
+  with a fixed latency, one virtual clock. `docs/MULTIPROC_RESULTS.md`.
+- Run files, host directories, real programs (`RUNFILE`).
+- Process fault injection (`FAULTS`): seeded crashes and restart policies.
+- Tokio guest (`TOKIO`): `tests/programs/kv`.
+- Seeded heap layout (`HEAP`), seed bisection (`BISECT`, `rewrite
+  bisect`), site minimisation (`SUSPECTS`, `rewrite suspects`).
+- Review of the tools (`TASKS_REVIEW2.md`).
+- Sui under the supervisor (`TASKS_SUI.md`): compact stubs, rooms for
+  binaries past 128 MB (`rewrite cargo`), `--stop-after`, `--wall-limit`,
+  CPU time in the report.
+- Examples of real systems (`EXAMPLES`): `examples/` holds Redis,
+  Postgres, SQLite, memcached and Go, with `tests/examples_tests.rs`. Go
+  is set aside with a residual recorded in `TASKS_EXAMPLES.md`.
 
-**Rewrite experiment** (branch `mlogan-rewrite`): the repository and
-`supervisor/` run native arm64 Mach-O binaries under a
-deterministic baton scheduler. Plan in `IMPLEMENTATION_PLAN_REWRITE.md`,
-progress in `TASKS_REWRITE.md`, results in `docs/REWRITE_RESULTS.md`.
+**Nondeterminism list**: `README.md` has a section "Nondeterminism found
+and fixed": one item per source of nondeterminism (or supervisor bug)
+closed, in the form *problem*: what was wrong, then what was done, in
+plain sentences. Every change that closes one must add its item there,
+in the same commit, under the fitting heading.
 
-**Multi-process runs** (branch `mlogan-multiproc`, plan complete): one
-scheduler in shared memory for several guests on virtual hosts, with
-virtual pids, pipe and lock readiness waits, a virtual network (stream and
-datagram sockets, `poll`/`select`/`kevent`), one virtual clock, and a fixed
-`--net-latency` as the seam for a network simulator.
-`rewrite run --manifest FILE`. Plan in `IMPLEMENTATION_PLAN_MULTIPROC.md`,
-progress and deviations in `TASKS_MULTIPROC.md`, results in
-`docs/MULTIPROC_RESULTS.md`, usage in `README.md`. Rewritten
-binaries need the supervisor dylib; default-linked guests work.
-
-**Run files, host directories, real programs** (same branch, complete): run
-files are YAML, every host gets a fresh directory per run that its path
-names are held to, and Homebrew's curl fetches from Python's `http.server`
-repeatably. Plan in `IMPLEMENTATION_PLAN_RUNFILE.md`, progress and findings
-in `TASKS_RUNFILE.md`.
-
-**Process fault injection** (branch `mlogan-fault-injection`, complete):
-seeded crashes in virtual time and run-file restart policies with virtual
-downtime. Plan in `IMPLEMENTATION_PLAN_FAULTS.md`, progress, limits and
-review results in `TASKS_FAULTS.md`.
-
-**Tokio guest** (branch `mlogan-tokio-kv`, complete): `tests/programs/kv`,
-a key-value server and clients on tokio using most of `tokio::sync`, runs
-repeatably, also under fault injection. Plan in
-`IMPLEMENTATION_PLAN_TOKIO.md`, findings in `TASKS_TOKIO.md`.
-
-**Seeded heap layout** (branch `mlogan-seeded-heap`, complete): where a
-guest's heap blocks land, and whether a freed block is reused at once, is
-drawn from the seed, so bugs that depend on pointer order can be found and
-replayed. Plan in `IMPLEMENTATION_PLAN_HEAP.md`, progress in
-`TASKS_HEAP.md`.
-
-**Seed bisection** (branch `mlogan-seed-bisect`, complete): `rewrite
-bisect` replays a failing seed with every random stream (schedule, faults,
-heap layout, entropy) reseeded at a virtual time and binary-searches for
-when the failure was decided. Plan in
-`IMPLEMENTATION_PLAN_BISECT.md`, results and limits in `TASKS_BISECT.md`.
-
-**Site minimisation** (branch `mlogan-site-bisect`, complete): `rewrite
-suspects` masks switch points at hooked loads and stores (then branches
-and calls) until no site can be dropped, and names their source lines.
-Plan in `IMPLEMENTATION_PLAN_SUSPECTS.md`, results in `TASKS_SUSPECTS.md`.
-
-**Review of PRs #4 to #10** (branch `mlogan-review-fixes`): findings and
-what was done about each in `TASKS_REVIEW2.md`. Since then the guest heap
-is 32 GB of address space (`heap-size` to change it), guests outlive neither the launcher nor a dead lock
-owner, the supervisor allocates from its own heap, and the trace and mask
-paths reach guests through the shared state, not their environment.
-
-**Examples of real systems** (branch `mlogan-examples`, in progress):
-`examples/` holds Redis and Postgres run files with Python
-clients, each repeatable. Plan in `IMPLEMENTATION_PLAN_EXAMPLES.md`,
-progress and findings in `TASKS_EXAMPLES.md`, setup in
-`examples/README.md`.
-
-**Nondeterminism list**: `README.md` has a section
-"Nondeterminism found and fixed": one item per source of nondeterminism
-(or supervisor bug) closed, in the form *problem*: what was wrong, then
-what was done, in plain sentences. Every change that closes one must add
-its item there, in the same commit, under the fitting heading.
-
-**Next Phase**: Not yet planned
-
----
+**Next**: not yet planned. Candidates in `TASKS_EXAMPLES.md`
+"Remaining": rewriting the dylibs a guest loads, replication and
+failover examples, Sui's multi-node network.
 
 ## Questions?
 

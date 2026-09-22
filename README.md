@@ -1,4 +1,11 @@
-# rewrite
+# DERP: Deterministic Execution and Replay Platform
+
+Runs native arm64 programs, several processes on virtual hosts if wanted,
+so that a run is a function of its seed: the same seed gives the same
+thread interleaving, clock, entropy, heap layout and network traffic
+every time, and a failing run replays, bisects to the moment it was
+decided, and names the lines it needs. The tool is `rewrite`, after what
+it does first.
 
 Rewrites arm64 Mach-O executables so that branches (and a sparse set of
 memory accesses) pass through stubs, and runs them under a supervisor

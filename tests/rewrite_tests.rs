@@ -279,6 +279,26 @@ fn thread_stacks_and_mappings_land_in_the_region_and_repeat() {
     assert_eq!(again, first);
 }
 
+/// A guest key destructor younger than the supervisor's runs after it in
+/// the last round, once the baton is handed on; jemalloc's thread cache
+/// cleanup is one, and re-arms itself for more rounds. Its hooks and its
+/// work must not overlap the next thread's: the schedule must repeat.
+#[test]
+fn an_exiting_threads_last_destructors_do_not_overlap_the_schedule() {
+    let dir = common::scratch_dir("exitdtor");
+    let exe = common::build_c("exitdtor", &dir, &[]);
+    let rw_path = dir.join("exitdtor.rw");
+    rewrite_to(&exe, &rw_path, &Options::default());
+    let (o, first) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+    assert_eq!(o.exit_code(), Some(0), "{first}");
+    assert!(o.report.get_u64("exit_waits").unwrap() >= 8, "{first}");
+    let hash = o.report.get("schedule_hash").unwrap().to_string();
+    for _ in 0..4 {
+        let (again, _) = run(&rw_path, &[], Some(common::supervisor_dylib()), 1);
+        assert_eq!(again.report.get("schedule_hash").unwrap(), &hash);
+    }
+}
+
 /// The kernel frees an exited thread's stack itself, at a moment of real
 /// time, and would grant an `mmap` hint into the hole once it has: the run
 /// places a hinted request like one without an address.

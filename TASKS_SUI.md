@@ -88,6 +88,19 @@ the log is `DIR/net/sui.log.2027-01-15` (the virtual clock's date).
     time, no user-space call to see). Runs with jemalloc parted in its
     radix tree (`rtree_metadata_read`, `lg_ceil`) on one run in three.
     `mappings_hinted` in the report.
+11. **The next thread waits for an exiting thread to be gone.** The
+    supervisor's pthread key is the oldest, so its destructor runs first
+    in each of libpthread's four rounds; it hands the baton on in the
+    last. Destructors of younger keys still run in that round, off the
+    baton, in real time: jemalloc's thread cache cleanup, which re-arms
+    itself every round, ran hooked code (shifting the baton holder's
+    expiry within its quantum: same issued count, different site) and
+    touched the arenas while another thread ran. Four runs in a hundred
+    parted at one thread exit at 39.8 s. Now the exiting thread leaves
+    its Mach port behind and the next holder in that process spins until
+    the port is dead (`exit_waits`, `exit_wait_max_ns` in the report).
+    `exitdtor.c`, whose destructor re-arms itself through all four rounds,
+    gave six hashes in six runs before and one after.
 
 ## Build sizes and reach (2026-09-22)
 
@@ -121,13 +134,15 @@ real) runs consensus and executes checkpoints; three runs give the same
 hash, 535,232,343 hooks, identical traces and logs.
 
 sui-node's default allocator is jemalloc, which keeps the heap out of
-the seeded allocator; two runs with it parted inside jemalloc's own code
+the seeded allocator; runs with it parted inside jemalloc's own code
 (`rtree_metadata_read`, `lg_ceil`) with identical logs but different
-hashes. The cause was change 10 above (a hinted `mmap` granted or not by
-a real-time race with an exiting thread's stack); with it, three runs
-with jemalloc agree (hash 4dc53a27de14494b, 539,458,903 hooks, 9 hinted
-mappings), and nine runs without the fix agreed too: the race is rare.
-`--no-default-features` is still the way to a seeded heap layout.
+hashes. Two causes, both real-time races at thread exit: change 10 (a
+hinted `mmap` granted or not, depending on whether the kernel had freed
+an exited thread's stack yet) and change 11 (jemalloc's last-round key
+destructor running off the baton). With only change 10, 96 runs in 100
+agreed and the other 4 parted at the same thread exit; the system
+allocator's build agreed 43 times in 43. `--no-default-features` is
+still the way to a seeded heap layout.
 
 The planner had two bugs on this binary that the 150 MB test program did
 not show: a stretch boundary past the end of the text made its loop push
@@ -167,6 +182,9 @@ not_restarted_after_it`, `a_single_program_run_stops_too`,
 `thread_stacks_and_mappings_land_in_the_region_and_repeat` (`stacks.c`),
 `a_hinted_mapping_is_placed_by_the_run_not_granted_by_the_kernel`
 (`hint.c`),
+`an_exiting_threads_last_destructors_do_not_overlap_the_schedule`
+(`exitdtor.c`),
+`a_wall_limit_ends_a_native_run_and_cpu_time_is_reported`,
 `the_outside_network_is_refused_unless_allowed` (`outside.c`). The far
 callee tails and unreachable sites have no test: they need a program of
 over 120 MB.

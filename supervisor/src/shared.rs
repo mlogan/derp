@@ -219,6 +219,10 @@ pub struct ProcRec {
     pub parent: u32,
     /// Raw wait status, valid once `state` is `P_EXITED`
     pub exit_status: i32,
+    /// Mach port of a thread of this process that handed the baton on
+    /// from its teardown and may still be running destructors (0: none);
+    /// the next holder in this process waits for it to be gone
+    pub exiting_port: u32,
     /// Virtual time at which the run learned of the death (0: alive)
     pub died_at: u64,
     /// The parent has collected the exit with `waitpid`

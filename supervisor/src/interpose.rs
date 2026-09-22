@@ -255,6 +255,10 @@ pub extern "C" fn thread_teardown(value: *mut c_void) {
     sched::set_identity(Some(id));
     sched::wake_all(join_key(id));
     sched::set_identity(None);
+    // Destructors of keys younger than ours (jemalloc's thread cache, which
+    // re-arms itself every round) still run in this round, after the baton
+    // is handed on: the next holder waits until this thread is gone
+    sched::note_exiting();
     sched::forget_thread();
     sched::yield_baton_as(id, State::Exited, 0, None);
 }

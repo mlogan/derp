@@ -212,8 +212,16 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   keeps its heap out of the seeded one, so its layout is not the seed's
   to vary, and a bug that depends on pointer order shows on fewer seeds.
   It runs repeatably all the same: its memory comes from `mmap`, which
-  the run places. Build with the system allocator to get the seeded
-  layout (`--no-default-features` for sui-node).
+  the run places, and its per-thread cleanup runs before the next thread
+  does (below). Build with the system allocator to get the seeded layout
+  (`--no-default-features` for sui-node).
+- A thread's exit is complete, for the schedule, when the kernel says the
+  thread is gone. The supervisor hands the baton on from the exiting
+  thread's key destructor, and destructors of keys the guest made later
+  (jemalloc's thread cache, which re-arms itself for every round) still
+  run after that, off the baton; the next thread to run in that process
+  waits, in real time, until the exiting thread's Mach port is dead. The
+  report counts `exit_waits` and the longest, `exit_wait_max_ns`.
 - Heap addresses are a function of the seed, and differ between seeds:
   how two blocks compare, and whether `free` then `malloc` returns the
   same block, goes both ways across seeds. A bug that depends on pointer

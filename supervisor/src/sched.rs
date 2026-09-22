@@ -148,6 +148,8 @@ static PORTS: SpinLock<Vec<(u32, usize)>> = SpinLock::new(Vec::new());
 
 extern "C" {
     fn pthread_mach_thread_np(t: libc::pthread_t) -> u32;
+    fn thread_info(thread: u32, flavor: u32, info: *mut u32, count: *mut u32) -> i32;
+    fn mach_port_mod_refs(task: u32, name: u32, right: u32, delta: i32) -> i32;
     fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
     fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
     fn mach_port_deallocate(task: u32, name: u32) -> i32;
@@ -768,9 +770,66 @@ pub fn signal_crashed(s: &mut shared::State) -> bool {
 
 /// The baton is ours: before running, wait in real time until every crashed
 /// process is really dead, so that what its death releases in the kernel is
-/// released at this point of the schedule and not at some later one.
+/// released at this point of the schedule and not at some later one, and
+/// until a thread of this process that exited is gone.
 pub fn take_up_baton(sh: &Shared) {
+    // Before the counter is ours: the exiting thread's last hooks go
+    // against the count it left behind
+    wait_out_exit();
     wait_out_deaths(sh, true);
+}
+
+/// Threads whose exit the next holder waited for, and the longest wait
+static EXIT_WAITS: AtomicU64 = AtomicU64::new(0);
+static EXIT_WAIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+static SAID_EXIT_STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The exiting thread's teardown continues after it hands the baton on:
+/// the rest of the last round's key destructors, then libpthread's own
+/// end. Leave its port behind, with a send right of ours so the name is
+/// not reused, for the next holder to wait on.
+pub fn note_exiting() {
+    let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
+    if unsafe { mach_port_mod_refs(mach_task_self_, port, MACH_PORT_RIGHT_SEND, 1) } != 0 {
+        return;
+    }
+    with(|s, pid| s.procs[pid as usize].exiting_port = port);
+}
+
+const MACH_PORT_RIGHT_SEND: u32 = 0;
+const THREAD_BASIC_INFO: u32 = 3;
+const THREAD_BASIC_INFO_COUNT: u32 = 10;
+
+/// Whether the thread behind `port` still exists: its port dies with it.
+fn thread_alive(port: u32) -> bool {
+    let mut info = [0u32; THREAD_BASIC_INFO_COUNT as usize];
+    let mut count = THREAD_BASIC_INFO_COUNT;
+    unsafe { thread_info(port, THREAD_BASIC_INFO, info.as_mut_ptr(), &raw mut count) == 0 }
+}
+
+/// Wait, in real time, until the thread of this process that last handed
+/// the baton on from its teardown is gone: what its last destructors do
+/// (hooks, an allocator's bookkeeping) then happens at this point of the
+/// schedule and overlaps nothing.
+fn wait_out_exit() {
+    let port = with(|s, pid| s.procs[pid as usize].exiting_port).unwrap_or(0);
+    if port == 0 {
+        return;
+    }
+    let began = std::time::Instant::now();
+    while thread_alive(port) {
+        if began.elapsed() > std::time::Duration::from_secs(30) {
+            if !SAID_EXIT_STUCK.swap(true, Ordering::Relaxed) {
+                crate::report::log("an exited thread is not gone after 30 s; no longer waiting for it");
+            }
+            break;
+        }
+        unsafe { libc::sched_yield() };
+    }
+    unsafe { mach_port_deallocate(mach_task_self_, port) };
+    with(|s, pid| s.procs[pid as usize].exiting_port = 0);
+    EXIT_WAITS.fetch_add(1, Ordering::Relaxed);
+    EXIT_WAIT_MAX_NS.fetch_max(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
 /// `take_up_baton` for a thread that already runs: its quantum stands.
@@ -1068,6 +1127,12 @@ pub fn report(out: &mut String) {
         out,
         "stray_expiries={}",
         STRAY_EXPIRIES.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(out, "exit_waits={}", EXIT_WAITS.load(Ordering::Relaxed));
+    let _ = writeln!(
+        out,
+        "exit_wait_max_ns={}",
+        EXIT_WAIT_MAX_NS.load(Ordering::Relaxed)
     );
     let _ = writeln!(
         out,

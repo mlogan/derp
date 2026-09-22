@@ -144,8 +144,11 @@ fn run_mode(
         disable_aslr: true,
         heap_size: rewrite::launch::DEFAULT_HEAP,
         stdout: Some(out_path.clone()),
+        stderr: None,
         seed,
         quantum: rewrite::launch::DEFAULT_QUANTUM,
+        stop_at_ns: 0,
+        wall_limit_ms: 0,
         passive,
         rewrite: None,
     };

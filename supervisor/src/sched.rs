@@ -6,7 +6,7 @@
 
 use std::ffi::c_void;
 use std::fmt::Write;
-use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use crate::shared::{self, Handoff, Shared};
 use crate::spin::SpinLock;
@@ -68,6 +68,10 @@ static INFO: SpinLock<Option<Info>> = SpinLock::new(None);
 /// `HOOKS` what it consumed before that.
 static LAST_QUANTUM: AtomicI64 = AtomicI64::new(0);
 static HOOKS: AtomicI64 = AtomicI64::new(0);
+/// Quantum expiries taken by threads outside the schedule, and by
+/// scheduled threads not holding the baton
+static OUTSIDE_EXPIRIES: AtomicU64 = AtomicU64::new(0);
+static STRAY_EXPIRIES: AtomicU64 = AtomicU64::new(0);
 
 /// The thread's scheduler id lives in a pthread key (value `id + 1`) rather
 /// than a Rust thread-local: the key's destructor is the thread's teardown
@@ -144,6 +148,10 @@ static PORTS: SpinLock<Vec<(u32, usize)>> = SpinLock::new(Vec::new());
 
 extern "C" {
     fn pthread_mach_thread_np(t: libc::pthread_t) -> u32;
+    fn mach_absolute_time() -> u64;
+    fn mach_timebase_info(info: *mut [u32; 2]) -> i32;
+    fn thread_info(thread: u32, flavor: u32, info: *mut u32, count: *mut u32) -> i32;
+    fn mach_port_mod_refs(task: u32, name: u32, right: u32, delta: i32) -> i32;
     fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
     fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
     fn mach_port_deallocate(task: u32, name: u32) -> i32;
@@ -192,7 +200,7 @@ pub fn forget_thread() {
 }
 
 /// Whether this process has threads the scheduler does not run.
-fn has_outside_threads() -> bool {
+pub fn has_outside_threads() -> bool {
     let mut list: *mut u32 = std::ptr::null_mut();
     let mut count = 0u32;
     if unsafe { task_threads(mach_task_self_, &raw mut list, &raw mut count) } != 0 {
@@ -261,13 +269,27 @@ pub fn wake_all(addr: usize) -> usize {
         if outside {
             note_outside_wake(s, pid);
         }
-        s.wake_all(pid, addr as u64)
+        let woken = s.wake_all(pid, addr as u64);
+        if outside && woken > 0 {
+            let _ = FIRST_OUTSIDE_WAKE_NS.compare_exchange(
+                0,
+                s.clock_ns.max(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+        woken
     });
     if woken > 0 && outside {
         OUTSIDE_WAKES.fetch_add(woken as u64, Ordering::Relaxed);
     }
     woken
 }
+
+/// Virtual time of the first outside wake that made a thread runnable
+/// (0: none), for finding what let real time into the schedule
+pub static FIRST_OUTSIDE_WAKE_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// A wake from a thread the scheduler does not run: see
 /// `ProcRec::outside_wakes`.
@@ -429,6 +451,8 @@ fn start_private_run(cfg: &Config) -> (&'static Shared, usize) {
     let mem = map_region(-1, Shared::SIZE);
     let sh = unsafe { Shared::init(mem, cfg.seed, cfg.quantum_lo, cfg.quantum_hi) };
     let mut s = sh.lock();
+    // A lone program inherits the environment; the network too
+    s.net.outside_allowed = true;
     let pid = s.add_proc(0, shared::NO_PROC);
     s.procs[pid as usize].state = shared::P_LIVE;
     s.procs[pid as usize].real_pid = unsafe { libc::getpid() };
@@ -448,6 +472,7 @@ const PASSIVE_VAR: &str = "REWRITE_PASSIVE";
 /// launcher), then park the main thread until it is handed the baton.
 pub fn init(info: Option<Info>, cfg: &Config) {
     *INFO.lock() = info;
+    crate::vmmap::init();
     if let Some(spins) = std::env::var("REWRITE_PARK_SPINS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -513,6 +538,7 @@ pub fn become_forked_child(child: u32) {
     PORTS.force_unlock();
     PORTS.lock().clear();
     crate::alloc::forked();
+    crate::vmmap::forked();
     crate::hostfs::forked();
     crate::signals::forked();
     crate::io::forked();
@@ -629,7 +655,7 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
         describe_blocked();
         fatal("deadlock: every thread is blocked");
     }
-    let began = std::time::Instant::now();
+    let began = real_now_ns();
     loop {
         unsafe { libc::usleep(200) };
         sh.exit_if_orphaned();
@@ -640,7 +666,7 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
         if after.carry_out(sh, me, state, site) {
             return;
         }
-        if began.elapsed() > std::time::Duration::from_secs(30) {
+        if real_now_ns().saturating_sub(began) > 30_000_000_000 {
             fatal("deadlock: every thread is blocked, and no outside thread woke one");
         }
     }
@@ -746,9 +772,80 @@ pub fn signal_crashed(s: &mut shared::State) -> bool {
 
 /// The baton is ours: before running, wait in real time until every crashed
 /// process is really dead, so that what its death releases in the kernel is
-/// released at this point of the schedule and not at some later one.
+/// released at this point of the schedule and not at some later one, and
+/// until a thread of this process that exited is gone.
 pub fn take_up_baton(sh: &Shared) {
+    // Before the counter is ours: the exiting thread's last hooks go
+    // against the count it left behind
+    wait_out_exit();
     wait_out_deaths(sh, true);
+}
+
+/// Threads whose exit the next holder waited for, and the longest wait
+static EXIT_WAITS: AtomicU64 = AtomicU64::new(0);
+static EXIT_WAIT_MAX_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Real time, in nanoseconds, straight from the kernel's clock. The
+/// supervisor must not read the clock through libSystem on a scheduled
+/// thread: dyld routes libSystem's own clock calls to the interposers too,
+/// and every read would move the virtual clock.
+pub fn real_now_ns() -> u64 {
+    static TIMEBASE: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
+    let (numer, denom) = *TIMEBASE.get_or_init(|| {
+        let mut info = [0u32; 2];
+        unsafe { mach_timebase_info(&raw mut info) };
+        (u64::from(info[0].max(1)), u64::from(info[1].max(1)))
+    });
+    (unsafe { mach_absolute_time() }) * numer / denom
+}
+static SAID_EXIT_STUCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The exiting thread's teardown continues after it hands the baton on:
+/// the rest of the last round's key destructors, then libpthread's own
+/// end. Leave its port behind, with a send right of ours so the name is
+/// not reused, for the next holder to wait on.
+pub fn note_exiting() {
+    let port = unsafe { pthread_mach_thread_np(libc::pthread_self()) };
+    if unsafe { mach_port_mod_refs(mach_task_self_, port, MACH_PORT_RIGHT_SEND, 1) } != 0 {
+        return;
+    }
+    with(|s, pid| s.procs[pid as usize].exiting_port = port);
+}
+
+const MACH_PORT_RIGHT_SEND: u32 = 0;
+const THREAD_BASIC_INFO: u32 = 3;
+const THREAD_BASIC_INFO_COUNT: u32 = 10;
+
+/// Whether the thread behind `port` still exists: its port dies with it.
+fn thread_alive(port: u32) -> bool {
+    let mut info = [0u32; THREAD_BASIC_INFO_COUNT as usize];
+    let mut count = THREAD_BASIC_INFO_COUNT;
+    unsafe { thread_info(port, THREAD_BASIC_INFO, info.as_mut_ptr(), &raw mut count) == 0 }
+}
+
+/// Wait, in real time, until the thread of this process that last handed
+/// the baton on from its teardown is gone: what its last destructors do
+/// (hooks, an allocator's bookkeeping) then happens at this point of the
+/// schedule and overlaps nothing.
+fn wait_out_exit() {
+    let port = with(|s, pid| s.procs[pid as usize].exiting_port).unwrap_or(0);
+    if port == 0 {
+        return;
+    }
+    let began = real_now_ns();
+    while thread_alive(port) {
+        if real_now_ns().saturating_sub(began) > 30_000_000_000 {
+            if !SAID_EXIT_STUCK.swap(true, Ordering::Relaxed) {
+                crate::report::log("an exited thread is not gone after 30 s; no longer waiting for it");
+            }
+            break;
+        }
+        unsafe { libc::sched_yield() };
+    }
+    unsafe { mach_port_deallocate(mach_task_self_, port) };
+    with(|s, pid| s.procs[pid as usize].exiting_port = 0);
+    EXIT_WAITS.fetch_add(1, Ordering::Relaxed);
+    EXIT_WAIT_MAX_NS.fetch_max(real_now_ns().saturating_sub(began), Ordering::Relaxed);
 }
 
 /// `take_up_baton` for a thread that already runs: its quantum stands.
@@ -797,6 +894,11 @@ fn wait_out_deaths(sh: &Shared, new_quantum: bool) {
 /// The scheduler crashed this process: its threads are already out of the
 /// schedule, so all that is left is to go the way a crash goes.
 fn die() -> ! {
+    // A process the run's stop ends has done nothing wrong: its report is
+    // still wanted (the exit hook will not run)
+    if with(|s, pid| s.procs[pid as usize].stopped) == Some(true) {
+        crate::report::write_report();
+    }
     unsafe { libc::kill(libc::getpid(), libc::SIGKILL) };
     loop {
         unsafe { libc::pause() };
@@ -847,6 +949,17 @@ fn open_trace() {
     let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 200) };
     unsafe { libc::close(fd) };
     TRACE_FD.store(high, Ordering::Relaxed);
+}
+
+fn trace_outside_expiry(site: u64) {
+    let fd = TRACE_FD.load(Ordering::Relaxed);
+    if fd < 0 {
+        return;
+    }
+    let mut line = String::new();
+    let who = my_id().map_or("outside".to_string(), |id| format!("t{id}"));
+    let _ = writeln!(line, "p{} {who} expiry without the baton site={site:#x}", pid());
+    unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
 }
 
 fn trace_switch(from: usize, to: usize, issued: u64, site: u64, clock: u64) {
@@ -974,8 +1087,18 @@ pub extern "C" fn rewrite_yield_impl(stub_pc: u64) {
     }
     with(|s, _| s.expiries += 1);
     if my_id().is_some() {
+        if !baton_is_mine() {
+            // Hooked code ran on a scheduled thread without the baton: it
+            // ate the holder's quantum at a moment of real time
+            STRAY_EXPIRIES.fetch_add(1, Ordering::Relaxed);
+            trace_outside_expiry(stub_pc);
+        }
         yield_baton(State::Runnable, stub_pc);
     } else if let Some(q) = with(|s, _| s.renew_quantum()) {
+        // A thread outside the schedule ran hooked code: its hooks moved
+        // the scheduled threads' expiries, at a moment of real time
+        OUTSIDE_EXPIRIES.fetch_add(1, Ordering::Relaxed);
+        trace_outside_expiry(stub_pc);
         settle_hooks();
         install_quantum(q);
     }
@@ -1008,6 +1131,42 @@ pub fn report(out: &mut String) {
     );
     let _ = writeln!(
         out,
+        "first_outside_wake_ns={}",
+        FIRST_OUTSIDE_WAKE_NS.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "outside_expiries={}",
+        OUTSIDE_EXPIRIES.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "stray_expiries={}",
+        STRAY_EXPIRIES.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(out, "exit_waits={}", EXIT_WAITS.load(Ordering::Relaxed));
+    let _ = writeln!(
+        out,
+        "exit_wait_max_ns={}",
+        EXIT_WAIT_MAX_NS.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "mappings_placed={}",
+        crate::vmmap::PLACED.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "mappings_overflowed={}",
+        crate::vmmap::OVERFLOWED.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
+        "mappings_hinted={}",
+        crate::vmmap::HINTED.load(Ordering::Relaxed)
+    );
+    let _ = writeln!(
+        out,
         "io_waits={}",
         crate::io::IO_WAITS.load(Ordering::Relaxed)
     );
@@ -1022,6 +1181,8 @@ pub fn report(out: &mut String) {
 // Saves every register the guest may have live (the stub already saved x0,
 // x1 and x30), calls the Rust scheduler, and restores them. x18 is the
 // platform register and x19-x28 are callee-saved, so neither needs saving.
+// The site is the return address the shared stub body saved last, at the
+// top of the stack on entry: our own frame then puts it at [x29, #16].
 std::arch::global_asm!(
     ".globl _rewrite_scheduler_yield",
     ".p2align 2",
@@ -1055,7 +1216,7 @@ std::arch::global_asm!(
     "stp q26, q27, [sp, #-32]!",
     "stp q28, q29, [sp, #-32]!",
     "stp q30, q31, [sp, #-32]!",
-    "mov x0, x30",
+    "ldr x0, [x29, #16]",
     "bl _rewrite_yield_impl",
     "ldp q30, q31, [sp], #32",
     "ldp q28, q29, [sp], #32",

@@ -236,11 +236,12 @@ pub unsafe extern "C" fn my_listen(fd: c_int, backlog: c_int) -> c_int {
 }
 
 static PASSTHROUGH_LOGGED: AtomicBool = AtomicBool::new(false);
+static REFUSED_LOGGED: AtomicBool = AtomicBool::new(false);
 
 /// The destination is outside the virtual network: swap the placeholder
 /// for a kernel socket at the same descriptor. What comes back over it is
 /// input to the run.
-unsafe fn leave_virtual_network(fd: c_int, sock: u32, domain: c_int) -> bool {
+unsafe fn leave_virtual_network(fd: c_int, sock: u32, domain: c_int, dest: &Addr) -> bool {
     let ty = if kind_of(sock) == KIND_DGRAM {
         libc::SOCK_DGRAM
     } else {
@@ -264,9 +265,14 @@ unsafe fn leave_virtual_network(fd: c_int, sock: u32, domain: c_int) -> bool {
         s.net.passthrough += 1;
     });
     if !PASSTHROUGH_LOGGED.swap(true, Ordering::Relaxed) {
-        crate::report::log(
-            "connection to an address outside the virtual network; its traffic is input",
-        );
+        let name = if dest.family == FAMILY_UNIX {
+            String::from_utf8_lossy(dest.path()).into_owned()
+        } else {
+            format!("{}:{}", std::net::Ipv4Addr::from(dest.ip), dest.port)
+        };
+        crate::report::log(&format!(
+            "connection to {name}, outside the virtual network; its traffic is input"
+        ));
     }
     true
 }
@@ -292,6 +298,7 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
     };
     let dgram = kind_of(sock) == KIND_DGRAM;
     let mut outside = false;
+    let mut refused = false;
     let r = blocking(fd, Wait::Never, |s, pid| {
         let here = s.procs[pid as usize].host;
         let host = if dest.family == FAMILY_INET {
@@ -299,7 +306,8 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
                 Ok(h) => h,
                 Err(true) => return Err(NetError::Errno(libc::EHOSTUNREACH)),
                 Err(false) => {
-                    outside = true;
+                    outside = s.net.outside_allowed;
+                    refused = !outside;
                     return Err(NetError::Errno(libc::ENETUNREACH));
                 }
             }
@@ -321,13 +329,19 @@ pub unsafe extern "C" fn my_connect(fd: c_int, addr: *const Sockaddr, len: Sockl
     if dest.family == FAMILY_UNIX && r == Err(libc::ECONNREFUSED) && is_system_socket(&dest) {
         outside = true;
     }
+    if refused && !REFUSED_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::report::log(
+            "connection to an address outside the virtual network refused; \
+             `outside-network: allow` in the run file lets it through",
+        );
+    }
     if outside {
         let domain = if dest.family == FAMILY_UNIX {
             libc::AF_UNIX
         } else {
             libc::AF_INET
         };
-        if leave_virtual_network(fd, sock, domain) {
+        if leave_virtual_network(fd, sock, domain, &dest) {
             return libc::connect(fd, addr, len);
         }
         return crate::errno::fail(libc::ENETUNREACH);

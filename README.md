@@ -23,9 +23,21 @@ Options worth knowing:
 - `--manifest FILE` is the run file, in YAML (below). Hosts get `10.0.0.1`
   upward in the order listed and are reachable by name. `--net-latency 5ms`
   delays traffic between different hosts in virtual time.
+- `--stop-after 30s` ends the run at that virtual time: whatever still
+  runs is killed at that point of the schedule, reported as `stopped`,
+  and does not fail the run. For servers that never exit by themselves,
+  and for comparing what a program did in a fixed span of virtual time.
+  Also `stop-after:` in the run file; it needs the supervisor.
+- `--wall-limit 60s` (`wall-limit:` in the run file) does the same at a
+  real time, and works for `--native` runs too, which have no virtual
+  clock. Every process reports `cpu_user_ns` and `cpu_system_ns`, the CPU
+  time it used, and `run.cpu_*` sum them: what a program cost natively
+  and under the supervisor in the same span.
 - `--capture` writes each guest's stdout to `stdout.<index>` in the
-  `--scratch` directory. The report goes to stderr: `run.*` totals, then
-  `p<index>.*` per process.
+  `--scratch` directory, and `--capture-stderr` its stderr to
+  `stderr.<index>` (the supervisor's messages about that guest included;
+  without it they come out on ours). The report goes to stderr: `run.*`
+  totals, then `p<index>.*` per process.
 - `REWRITE_TRACE=file` appends one line per baton switch (from, to, hook
   events issued, site, virtual clock). Diff two of them to find where two
   runs part ways; the schedule hash covers the same values.
@@ -35,11 +47,15 @@ Options worth knowing:
 ## The run file
 
 ```yaml
-seed: 7                  # optional; the command line overrides these five
+seed: 7                  # optional; the command line overrides these six
 quantum: 1000..10000
 heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
+stop-after: 30s          # the run is over at this virtual time (default: never)
+wall-limit: 60s          # or at this real time, native runs included
+outside-network: refuse  # or allow: connections and name lookups beyond the
+                         # virtual network reach the real one (input, unrepeatable)
 env: { LOG_LEVEL: debug }   # for every process (guests start from a fixed environment)
 pass-env: [SSL_CERT_FILE]   # inherited from yours on purpose; nothing else is
 allow: [/opt/site-content]  # extra paths every host may touch
@@ -169,6 +185,17 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
 - A wait (`poll`, `select`, `kevent`) may not depend on a descriptor whose
   other end is outside the run: nothing could repeat it. Such a wait is
   logged, and only the guests' side ever ends it.
+- In a run-file run, connecting to an address outside the virtual network
+  fails with `ENETUNREACH` and looking up a name the run does not know
+  fails with `EAI_NONAME`, unless the run file says `outside-network:
+  allow`; then they reach the real network and what comes back is input.
+  A lone `rewrite run prog` allows them.
+- A wait a system library makes for itself (libdispatch for a block on a
+  GCD worker, libxpc for a reply: what the Security framework does to load
+  certificates, what the resolver does) is made in the kernel with the
+  baton: nothing else in the run moves until it is over, so however long
+  it takes, the run is the same. The report counts them as
+  `system_wait`.
 - A handler for any other signal runs when the kernel delivers it, at a
   moment of real time, on whichever thread it lands, usually one that is
   parked. What it does is input to the run. It may call anything; a wake
@@ -181,12 +208,82 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   cost memory. `heap-size: 128G` in the run file or `--heap-size` changes
   it (64 MB to 4 TB). A seeded layout scatters blocks, so leave it roomy:
   a quarter holds the small size classes and the rest the large blocks.
+- A guest with an allocator of its own (jemalloc, sui-node's default)
+  keeps its heap out of the seeded one, so its layout is not the seed's
+  to vary, and a bug that depends on pointer order shows on fewer seeds.
+  It runs repeatably all the same: its memory comes from `mmap`, which
+  the run places, and its per-thread cleanup runs before the next thread
+  does (below). Build with the system allocator to get the seeded layout
+  (`--no-default-features` for sui-node).
+- A thread's exit is complete, for the schedule, when the kernel says the
+  thread is gone. The supervisor hands the baton on from the exiting
+  thread's key destructor, and destructors of keys the guest made later
+  (jemalloc's thread cache, which re-arms itself for every round) still
+  run after that, off the baton; the next thread to run in that process
+  waits, in real time, until the exiting thread's Mach port is dead. The
+  report counts `exit_waits` and the longest, `exit_wait_max_ns`.
 - Heap addresses are a function of the seed, and differ between seeds:
   how two blocks compare, and whether `free` then `malloc` returns the
   same block, goes both ways across seeds. A bug that depends on pointer
   order shows on some seeds and replays on those.
 - Guests see virtual pids from 100,000 up (above any real pid), in spawn
-  order; the launcher is pid 1.
+  order; the launcher is pid 1. A scheduled thread's `pthread_threadid_np`
+  is its index in the run plus a billion (kernel thread ids differ from
+  run to run; RocksDB mixes one into its DB session ids).
+- Where a scheduled thread's mappings land is the run's: thread stacks,
+  `pthread_t` blocks and `mmap`s without an address go to a reserved
+  region (64 GB at `0x7c_0000_0000`) in schedule order, so the kernel's
+  placement of what it maps meanwhile (GCD workers' stacks) cannot move
+  them. `pthread_self` is a stack address, and RocksDB seeds its skip-list
+  heights from it. An `mmap` with an address hint is placed like one
+  without: the kernel frees an exited thread's stack itself, in real
+  time, and would grant a hint into the hole once it had (jemalloc hints
+  at the end of its last extent). The report counts `mappings_placed`
+  and `mappings_hinted`. An exited thread's stack is not reused; the
+  region has room for about 30,000 threads of 2 MB.
+
+## Big programs
+
+Stubs are one shared body per program and a four-to-six-word trampoline
+per hooked site, so a release build of sui (106 MB of code, 2.5 million
+sites) has 45 MB of them. Every site must reach its trampoline, and the
+trampoline its target, with one `b` (±128 MB). The stub segment goes
+right after `__DATA`, so in a program whose code runs past about 120 MB
+the earliest sites cannot reach it: they are left as they are and counted
+(`unreachable` in `rewrite scan`, and in the "sites hooked" line; 2.5% of
+sui's sites). Code that is not hooked runs without preemption until it
+reaches a hook or a blocking call; the run stays deterministic. A callee
+too far for a `b` is reached through x16, as a linker's branch island
+would. Below `__TEXT` is not an option: the kernel wants `__PAGEZERO` to
+cover the low 4 GB and reserves everything up to the first segment.
+
+For the rest, room is made at link time: `rewrite cargo build …` runs
+cargo with `rewrite cc` as the linker (through the
+`CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER` variable; the program's own
+`Cargo.toml` and `.cargo/config` are not touched, and nothing happens
+unless you ask). `rewrite cc` links as `cc` would, and if the result has
+sites out of the stubs' reach it links once more with a `.space` object
+per 128 MB of text, placed in the middle of its stretch by an order file
+listing the symbols before it (`<program>.rooms/`). The rewriter writes
+the far sites' trampolines into those rooms, which are ordinary text.
+`<program>.rooms/report.txt` says what it did: how many sites were out of
+reach, how many rooms it made and how big, and how many sites still
+cannot be reached (cargo shows a linker's messages only when the link
+fails). `rewrite rooms <prog>` shows the plan for a program without
+linking it. A `-O0` `sui-node` (180 MB of code, 4.8 million sites, 70% of
+them out of reach) gets two rooms of 76 MB together and every site is
+hooked; `rewrite run` then says how much went into rooms. `rewrite run` on a program that needed this and did not
+get it says so. No arm64 instruction reaches further than a `b` in one
+word, and stubs below `__TEXT` are impossible: the kernel wants
+`__PAGEZERO` to cover the low 4 GB and reserves everything up to the
+first segment.
+
+A function-table entry without a symbol is a constant table in
+hand-written assembly (blst keeps its SHA-256 round constants that way),
+whose words would be hooked as instructions; such entries are left alone
+when the file names at least half of its functions (`unnamed_entries`).
+A room's order file leaves the megabyte around such an entry unlisted,
+so that it and the code reaching it with an `adr` stay together.
 
 ## Rewritten binaries only run under the supervisor
 
@@ -195,7 +292,7 @@ counter and the scheduler entry point in a fixed region at
 `0x78_0000_0000` that the supervisor dylib maps at startup (one private
 page per process, then the run's shared scheduler state). A default-linked
 binary has header room for one new segment, which holds the stub code;
-there is nowhere to put a writable word. Running `prog.rw3-…` directly
+there is nowhere to put a writable word. Running `prog.rw4-…` directly
 faults at the first hooked branch.
 
 `--no-supervisor` and `bench` still inject the dylib, in a passive mode

@@ -150,11 +150,40 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
         // The table first: a rewritten file that exists has one
         std::fs::rename(sites_path(&tmp), sites_path(&out))?;
         std::fs::rename(&tmp, &out)?;
+        let unreachable = if stats.unreachable_sites > 0 {
+            format!(
+                " ({} out of a b's reach, left alone)",
+                stats.unreachable_sites
+            )
+        } else {
+            String::new()
+        };
+        let rooms = if stats.rooms > 0 {
+            format!(
+                ", {} MB of them in {} room{}",
+                stats.room_bytes >> 20,
+                stats.rooms,
+                if stats.rooms == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
-            "rewrite: {} sites hooked -> {}",
+            "rewrite: {} sites hooked{unreachable}{rooms} -> {}",
             stats.branch_sites + stats.call_sites + stats.mem_sites,
             out.display()
         );
+        if stats.unreachable_sites > 0 {
+            eprintln!(
+                "rewrite: {}",
+                if stats.rooms == 0 {
+                    "the program is too big for every site to reach the stubs; building it with \
+                     `rewrite cargo build …` leaves room for them in its text (README, Big programs)"
+                } else {
+                    "its rooms are full: a room plan from an older build?"
+                }
+            );
+        }
     }
     // Also on a cache hit: the program may have gained a dSYM since
     link_debug_symbols(input, &out);

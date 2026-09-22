@@ -25,6 +25,11 @@ usage:
                                        none can be dropped, and names their source lines
   rewrite run|repeat [opts] --manifest FILE
                                        several processes under one scheduler; see below
+  rewrite cargo <cargo args…>          cargo, with `rewrite cc` as the linker: a program too big
+                                       for its sites to reach the stubs is linked again with
+                                       rooms for them in its text (README, Big programs)
+  rewrite cc <linker args…>            the linker driver `rewrite cargo` installs
+  rewrite rooms <prog>                 the rooms `rewrite cc` would give <prog>, and why
 options:
   --runs N                             repetitions for repeat (default 100)
   --seed S                             run seed (default 0)
@@ -45,13 +50,24 @@ options:
                                        (default: a directory under the system temp dir)
   --capture                            manifest run: each guest's stdout goes to stdout.<index>
                                        in the scratch directory instead of ours
+  --capture-stderr                     and its stderr to stderr.<index>, with the supervisor's
+                                       messages about it
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
+  --stop-after T                       the run is over at this virtual time: what still runs
+                                       is killed there, reported as stopped, and does not
+                                       fail the run (for servers that never exit)
+  --wall-limit T                       the same at this real time, for native runs too: to
+                                       compare the CPU time (cpu_user_ns, cpu_system_ns) a
+                                       program uses natively and under the supervisor
 run file:
-  seed: 7                              optional; the command line overrides these four
+  seed: 7                              optional; the command line overrides these six
   quantum: 1000..10000
   mem-hook-rate: 1/16
   net-latency: 5ms
+  heap-size: 32G
+  stop-after: 30s
+  wall-limit: 60s
   env: { LOG_LEVEL: debug }            for every process
   pass-env: [SSL_CERT_FILE]            inherited from your environment; nothing else is
   hosts:                               in order: 10.0.0.1, 10.0.0.2, ...
@@ -80,8 +96,15 @@ struct Cli {
     manifest: Option<PathBuf>,
     scratch: Option<PathBuf>,
     capture: bool,
+    /// Each guest's stderr to a file too; otherwise it stays ours, where
+    /// the supervisor's own messages about a guest are expected
+    capture_stderr: bool,
     net_latency_ns: u64,
     heap_size: u64,
+    /// Virtual time at which the run is over (0: when its processes are)
+    stop_after_ns: u64,
+    /// Real time after which it is over (0: never)
+    wall_limit_ms: u64,
     reseed_at: Option<u64>,
     reseed: u64,
     jobs: u32,
@@ -118,7 +141,20 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
         cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
     }
+    if let (Some(t), true) = (&m.stop_after, from_file("stop-after")) {
+        cli.stop_after_ns = parse_stop_after(t)?;
+    }
+    if let (Some(t), true) = (&m.wall_limit, from_file("wall-limit")) {
+        cli.wall_limit_ms = parse_stop_after(t)? / 1_000_000;
+    }
     Ok(cli)
+}
+
+fn parse_stop_after(v: &str) -> Result<u64, String> {
+    match parse_duration_ns(v) {
+        Some(0) | None => Err(format!("bad stop-after time {v}")),
+        Some(ns) => Ok(ns),
+    }
 }
 
 fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
@@ -130,8 +166,11 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         manifest: None,
         scratch: None,
         capture: false,
+        capture_stderr: false,
         net_latency_ns: 0,
         heap_size: launch::DEFAULT_HEAP,
+        stop_after_ns: 0,
+        wall_limit_ms: 0,
         reseed_at: None,
         reseed: 0,
         jobs: 4,
@@ -166,6 +205,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             "--manifest" => cli.manifest = Some(take_value(&mut args)?.into()),
             "--scratch" => cli.scratch = Some(take_value(&mut args)?.into()),
             "--capture" => cli.capture = true,
+            "--capture-stderr" => cli.capture_stderr = true,
             "--net-latency" => {
                 let v = take_value(&mut args)?;
                 cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
@@ -175,6 +215,14 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 let v = take_value(&mut args)?;
                 cli.heap_size = manifest::parse_size(&v).ok_or(format!("bad heap size {v}"))?;
                 cli.given.push("heap-size");
+            }
+            "--wall-limit" => {
+                cli.wall_limit_ms = parse_stop_after(&take_value(&mut args)?)? / 1_000_000;
+                cli.given.push("wall-limit");
+            }
+            "--stop-after" => {
+                cli.stop_after_ns = parse_stop_after(&take_value(&mut args)?)?;
+                cli.given.push("stop-after");
             }
             "--reseed-at" => {
                 let v = take_value(&mut args)?;
@@ -242,8 +290,11 @@ fn run_guest(
         disable_aslr: cli.disable_aslr,
         heap_size: cli.heap_size,
         stdout,
+        stderr: None,
         seed: cli.opts.seed,
         quantum: cli.quantum,
+        stop_at_ns: cli.stop_after_ns,
+        wall_limit_ms: cli.wall_limit_ms,
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
     };
@@ -314,6 +365,10 @@ fn stdout_file(scratch: &Path, index: usize) -> PathBuf {
     scratch.join(format!("stdout.{index}"))
 }
 
+fn stderr_file(scratch: &Path, index: usize) -> PathBuf {
+    scratch.join(format!("stderr.{index}"))
+}
+
 /// Start the manifest's processes under one scheduler. With `capture`,
 /// each guest's stdout goes to `stdout.<index>` in the scratch directory.
 fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallible<RunOutcome> {
@@ -371,6 +426,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
                 host: p.host,
                 env,
                 stdout: capture.then(|| stdout_file(&scratch, i)),
+                stderr: cli.capture_stderr.then(|| stderr_file(&scratch, i)),
                 cwd: Some(root.clone()),
                 daemon: p.daemon,
                 faults: p.faults,
@@ -390,7 +446,13 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
         reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
+        stop_at_ns: cli.stop_after_ns,
+        wall_limit_ms: cli.wall_limit_ms,
+        outside_network: m.outside_network,
     };
+    if run.stop_at_ns != 0 && (run.passive || run.dylib.is_none()) {
+        return Err("stop-after needs the supervisor: it is a virtual time".into());
+    }
     let has_faults = run
         .guests
         .iter()
@@ -430,6 +492,15 @@ fn print_run_report(o: &RunOutcome) {
     eprintln!("run.crashes_injected={}", o.totals.crashes_injected);
     eprintln!("run.restarts={}", o.totals.restarts);
     eprintln!("run.clock_ns={}", o.totals.clock_ns);
+    if o.totals.stopped_at != 0 {
+        eprintln!("run.stopped_at={}", o.totals.stopped_at);
+    }
+    if o.wall_limited {
+        eprintln!("run.wall_limited=true");
+    }
+    let cpu = |key: &str| -> u64 { o.guests.iter().filter_map(|g| g.report.get_u64(key)).sum() };
+    eprintln!("run.cpu_user_ns={}", cpu("cpu_user_ns"));
+    eprintln!("run.cpu_system_ns={}", cpu("cpu_system_ns"));
     if let Some((entry, life)) = failed_life(o) {
         eprintln!(
             "run.failure=entry {entry}: {}",
@@ -460,9 +531,10 @@ fn print_run_report(o: &RunOutcome) {
 }
 
 fn describe_status(o: &launch::Outcome) -> String {
-    match (o.exit_code(), o.signal()) {
-        (Some(c), _) => format!("exit {c}"),
-        (None, Some(s)) => format!("signal {s}"),
+    match (o.stopped, o.exit_code(), o.signal()) {
+        (true, ..) => "stopped".into(),
+        (_, Some(c), _) => format!("exit {c}"),
+        (_, None, Some(s)) => format!("signal {s}"),
         _ => "abnormal".into(),
     }
 }
@@ -470,7 +542,7 @@ fn describe_status(o: &launch::Outcome) -> String {
 /// Exit status of a manifest run: the first of the run file's entries
 /// whose last life did not exit 0. Earlier lives that crashed and were
 /// restarted do not count, what children return is their parents' business,
-/// and daemons are killed by design.
+/// and daemons and what the run's stop time killed are killed by design.
 fn exit_from_run(o: &RunOutcome) -> ExitCode {
     failed_life(o).map_or(ExitCode::SUCCESS, |(_, life)| exit_from(&o.guests[life]))
 }
@@ -481,7 +553,7 @@ fn failed_life(o: &RunOutcome) -> Option<(usize, usize)> {
     (0..o.initial)
         .filter(|&entry| !o.daemons[entry])
         .filter_map(|entry| Some((entry, o.specs.iter().rposition(|&s| s == Some(entry))?)))
-        .find(|&(_, life)| o.guests[life].exit_code() != Some(0))
+        .find(|&(_, life)| !o.guests[life].stopped && o.guests[life].exit_code() != Some(0))
 }
 
 /// The run a tool replays: the command line laid over the run file's own
@@ -499,7 +571,7 @@ fn replay_of(
     let path = cli.manifest.clone().unwrap();
     let m = manifest::parse(&std::fs::read_to_string(&path)?)?;
     let cli = with_run_file_settings(cli, &m)?;
-    let pass = vec![
+    let mut pass = vec![
         "--seed".to_string(),
         cli.opts.seed.to_string(),
         "--quantum".to_string(),
@@ -511,6 +583,10 @@ fn replay_of(
         "--heap-size".to_string(),
         cli.heap_size.to_string(),
     ];
+    if cli.stop_after_ns != 0 {
+        pass.push("--stop-after".to_string());
+        pass.push(format!("{}ns", cli.stop_after_ns));
+    }
     let replay = rewrite::replay::Replay {
         manifest: path,
         dir: scratch_dir(&cli).join(tool),
@@ -577,9 +653,10 @@ fn bisect(cli: &Cli) -> Fallible<()> {
 }
 
 fn exit_from(outcome: &launch::Outcome) -> ExitCode {
-    match (outcome.exit_code(), outcome.signal()) {
-        (Some(c), _) => ExitCode::from(c as u8),
-        (None, Some(s)) => fail(format!("guest killed by signal {s}")),
+    match (outcome.stopped, outcome.exit_code(), outcome.signal()) {
+        (true, ..) => ExitCode::SUCCESS,
+        (_, Some(c), _) => ExitCode::from(c as u8),
+        (_, None, Some(s)) => fail(format!("guest killed by signal {s}")),
         _ => fail("guest ended abnormally"),
     }
 }
@@ -694,6 +771,151 @@ fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
     result
 }
 
+/// The variable cargo reads the linker from, for the host's own target
+const LINKER_VAR: &str = "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER";
+
+/// `rewrite cargo …`: cargo with `rewrite cc` as the linker, through a
+/// script (cargo wants a program that takes the linker's arguments). No
+/// change to the program's own Cargo.toml or .cargo/config.
+fn rooms_cargo(args: Vec<OsString>) -> Fallible<ExitCode> {
+    let exe = std::env::current_exe()?;
+    let dir = std::env::temp_dir().join(format!("rewrite-cc-{}", unsafe { libc::getuid() }));
+    std::fs::create_dir_all(&dir)?;
+    let script = dir.join("rewrite-cc");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nexec \"{}\" cc \"$@\"\n", exe.display()),
+    )?;
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let mut cargo = std::process::Command::new("cargo");
+    cargo.args(&args);
+    if std::env::var_os(LINKER_VAR).is_none() {
+        cargo.env(LINKER_VAR, &script);
+    }
+    let status = cargo.status()?;
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+}
+
+/// `rewrite rooms <prog>`: the plan `rewrite cc` would make for it.
+fn rooms_plan(prog: &Path) -> Fallible<()> {
+    let m = read_macho(prog)?;
+    let stats = rw::scan(&m, &Options::default())?;
+    let total = stats.branch_sites + stats.call_sites + stats.unreachable_sites;
+    println!(
+        "sites={total} unreachable={} rooms={} room_bytes={}",
+        stats.unreachable_sites, stats.rooms, stats.room_bytes
+    );
+    let plan = (stats.unreachable_sites > 0)
+        .then(|| rewrite::rooms::plan(&m, &stats))
+        .flatten();
+    match plan {
+        None => println!("every site reaches the stubs: no rooms needed"),
+        Some(plan) => {
+            println!(
+                "far_sites={} order_file_lines={}",
+                plan.far_sites,
+                plan.order_file.lines().count()
+            );
+            for (name, bytes) in &plan.rooms {
+                println!("{name} {bytes} bytes");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `rewrite cc …`: link as `cc` would, then look at the result. An
+/// executable with sites out of the stub segment's reach is linked once
+/// more, with a room for them in its text (`rooms`). Anything else, and
+/// a failed link, is left as it is.
+fn rooms_link(args: Vec<OsString>) -> Fallible<ExitCode> {
+    let status = std::process::Command::new("cc").args(&args).status()?;
+    if !status.success() {
+        return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
+    }
+    let shared = ["-dynamiclib", "-shared", "-bundle", "-r"];
+    let out = args
+        .windows(2)
+        .find(|w| w[0] == "-o")
+        .map(|w| PathBuf::from(&w[1]));
+    let Some(out) = out else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    if args.iter().any(|a| shared.iter().any(|s| a == s)) {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Ok(m) = read_macho(&out) else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    if m.header.filetype != rewrite::macho::MH_EXECUTE {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Ok(stats) = rw::scan(&m, &Options::default()) else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let name = out
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if stats.unreachable_sites == 0 {
+        return Ok(ExitCode::SUCCESS);
+    }
+    if stats.rooms > 0 {
+        eprintln!(
+            "rewrite cc: {name}: {} sites out of a b's reach with the {} rooms it has",
+            stats.unreachable_sites, stats.rooms
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Some(plan) = rewrite::rooms::plan(&m, &stats) else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    drop(m);
+    let dir = PathBuf::from(format!("{}.rooms", out.display()));
+    std::fs::create_dir_all(&dir)?;
+    let order = dir.join("order.txt");
+    std::fs::write(&order, &plan.order_file)?;
+    let mut again: Vec<OsString> = args.clone();
+    for (symbol, bytes) in &plan.rooms {
+        let asm = dir.join(format!("{symbol}.s"));
+        let obj = dir.join(format!("{symbol}.o"));
+        std::fs::write(&asm, rewrite::rooms::assembly(symbol, *bytes))?;
+        let assembled = std::process::Command::new("cc")
+            .arg("-c")
+            .arg(&asm)
+            .arg("-o")
+            .arg(&obj)
+            .status()?;
+        if !assembled.success() {
+            return Err(format!("assembling {} failed", asm.display()).into());
+        }
+        again.push(obj.into());
+    }
+    again.push(format!("-Wl,-order_file,{}", order.display()).into());
+    let relinked = std::process::Command::new("cc").args(&again).status()?;
+    if !relinked.success() {
+        eprintln!("rewrite cc: {name}: linking with rooms failed; linked without");
+        let status = std::process::Command::new("cc").args(&args).status()?;
+        return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
+    }
+    let after = read_macho(&out).and_then(|m| Ok(rw::scan(&m, &Options::default())?))?;
+    let mb: u64 = plan.rooms.iter().map(|(_, b)| b).sum::<u64>() >> 20;
+    let report = format!(
+        "rewrite cc: {name}: {} of {} sites were out of a b's reach; linked again with {} room{} \
+         ({mb} MB) in the text; {} still out of reach",
+        plan.far_sites,
+        stats.branch_sites + stats.call_sites + stats.unreachable_sites,
+        plan.rooms.len(),
+        if plan.rooms.len() == 1 { "" } else { "s" },
+        after.unreachable_sites
+    );
+    // cargo shows a linker's stderr only when the link fails
+    eprintln!("{report}");
+    std::fs::write(dir.join("report.txt"), format!("{report}\n"))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Set by `bisect` and `suspects` on the runs they start: a run whose tool
 /// has gone is of no use, and its guests follow it out (`exit_if_orphaned`).
 const EXIT_WITH_PARENT: &str = "REWRITE_EXIT_WITH_PARENT";
@@ -717,6 +939,12 @@ fn main() -> ExitCode {
         return fail(USAGE);
     }
     let cmd = args.remove(0);
+    // Their arguments are cargo's and the linker's, not ours
+    match cmd.to_str() {
+        Some("cargo") => return rooms_cargo(args).unwrap_or_else(fail),
+        Some("cc") => return rooms_link(args).unwrap_or_else(fail),
+        _ => {}
+    }
     let cli = match parse_cli(args) {
         Ok(c) => c,
         Err(e) => return fail(e),
@@ -762,6 +990,9 @@ fn main() -> ExitCode {
             suspects(&cli).map(|()| ExitCode::SUCCESS)
         }
         Some("bench") if !rest.is_empty() => bench(cli, &rest).map(|()| ExitCode::SUCCESS),
+        Some("rooms") if rest.len() == 1 => {
+            rooms_plan(Path::new(&rest[0])).map(|()| ExitCode::SUCCESS)
+        }
         Some("repeat") if rest.is_empty() != cli.manifest.is_none() => {
             repeat(&cli, &rest).map(|()| ExitCode::SUCCESS)
         }

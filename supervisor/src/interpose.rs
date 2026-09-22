@@ -54,10 +54,14 @@ use crate::net::{
 };
 use crate::poll::{my_poll, my_select};
 use crate::process::{
-    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_vfork, my_wait, my_wait4,
-    my_waitpid,
+    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_pthread_threadid_np, my_vfork,
+    my_wait, my_wait4, my_waitpid,
 };
 use crate::process::{rewrite_getpid_shim, rewrite_getppid_shim};
+use crate::vmmap::{
+    mach_vm_allocate, mach_vm_deallocate, mach_vm_map, my_mach_vm_allocate,
+    my_mach_vm_deallocate, my_mach_vm_map, my_mmap, my_munmap,
+};
 use crate::sched::{self, my_id, State};
 use crate::shared;
 use crate::signals::{my_sigaction, my_signal};
@@ -118,7 +122,7 @@ const DISPATCH_TIME_NOW: u64 = 0;
 const DISPATCH_TIME_FOREVER: u64 = u64::MAX;
 
 /// Counts of interposed calls that took the scheduler path, for the report
-pub static COUNTS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+pub static COUNTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 pub const C_CREATE: usize = 0;
 pub const C_JOIN: usize = 1;
 pub const C_MUTEX: usize = 2;
@@ -128,7 +132,9 @@ pub const C_OSSYNC: usize = 5;
 pub const C_YIELD: usize = 6;
 pub const C_EXIT: usize = 7;
 pub const C_DISPATCH: usize = 8;
-pub const COUNT_NAMES: [&str; 9] = [
+/// Waits a system library made, taken to the kernel with the baton
+pub const C_SYSTEM: usize = 9;
+pub const COUNT_NAMES: [&str; 10] = [
     "create",
     "join",
     "mutex_wait",
@@ -138,7 +144,69 @@ pub const COUNT_NAMES: [&str; 9] = [
     "yield",
     "exit",
     "dispatch_wait",
+    "system_wait",
 ];
+
+/// A wait a system library makes on its own behalf (libdispatch waiting
+/// for a block on a GCD worker, libxpc for a reply) is ended by a thread
+/// the scheduler does not run, at a moment of real time. Blocked in the
+/// scheduler, the waiter would come back at a point of the schedule that
+/// depends on it. So such a wait is the real one, made with the baton:
+/// nothing else in the run moves until it is over, and the run is the
+/// same whenever that is. The caller's return address tells such a wait
+/// from the guest's own (Rust's parking is a dispatch semaphore, its
+/// futexes are ulocks), which other scheduled threads end.
+///
+/// Not quite exact: libc++'s `std::atomic::wait` is a ulock wait from a
+/// system library that a guest thread ends. A guest that uses it from C++
+/// would hold the baton in the kernel for the wake that cannot come.
+#[inline(never)]
+fn system_wait(caller: usize) -> bool {
+    if !crate::process::in_system_library(caller) {
+        return false;
+    }
+    count(C_SYSTEM);
+    true
+}
+
+extern "C" {
+    fn rewrite_ulock_wait_shim();
+    fn rewrite_ulock_wait2_shim();
+    fn rewrite_os_sync_wait_shim();
+    fn rewrite_os_sync_wait_timeout_shim();
+    fn rewrite_dispatch_semaphore_wait_shim();
+}
+
+// Each shim hands the caller's return address on as one more argument, in
+// the register after the call's own; the tail call keeps the link register
+// so the implementation returns straight to the caller.
+std::arch::global_asm!(
+    ".globl _rewrite_ulock_wait_shim",
+    ".p2align 2",
+    "_rewrite_ulock_wait_shim:",
+    "mov x4, x30",
+    "b _rewrite_ulock_wait_impl",
+    ".globl _rewrite_ulock_wait2_shim",
+    ".p2align 2",
+    "_rewrite_ulock_wait2_shim:",
+    "mov x5, x30",
+    "b _rewrite_ulock_wait2_impl",
+    ".globl _rewrite_os_sync_wait_shim",
+    ".p2align 2",
+    "_rewrite_os_sync_wait_shim:",
+    "mov x4, x30",
+    "b _rewrite_os_sync_wait_impl",
+    ".globl _rewrite_os_sync_wait_timeout_shim",
+    ".p2align 2",
+    "_rewrite_os_sync_wait_timeout_shim:",
+    "mov x6, x30",
+    "b _rewrite_os_sync_wait_timeout_impl",
+    ".globl _rewrite_dispatch_semaphore_wait_shim",
+    ".p2align 2",
+    "_rewrite_dispatch_semaphore_wait_shim:",
+    "mov x2, x30",
+    "b _rewrite_dispatch_semaphore_wait_impl",
+);
 
 fn count(i: usize) {
     COUNTS[i].fetch_add(1, Ordering::Relaxed);
@@ -187,6 +255,10 @@ pub extern "C" fn thread_teardown(value: *mut c_void) {
     sched::set_identity(Some(id));
     sched::wake_all(join_key(id));
     sched::set_identity(None);
+    // Destructors of keys younger than ours (jemalloc's thread cache, which
+    // re-arms itself every round) still run in this round, after the baton
+    // is handed on: the next holder waits until this thread is gone
+    sched::note_exiting();
     sched::forget_thread();
     sched::yield_baton_as(id, State::Exited, 0, None);
 }
@@ -418,6 +490,40 @@ fn futex_block(addr: *mut c_void, timeout_ns: u64) -> bool {
     !sched::block_until(addr as usize as u64, deadline)
 }
 
+/// The caller wants errors as negative errno values, not -1 and `errno`
+/// (libdispatch, which treats anything else as a bug in the kernel)
+const ULF_NO_ERRNO: u32 = 0x0100_0000;
+
+fn ulock_fail(op: u32, e: c_int) -> c_int {
+    if op & ULF_NO_ERRNO != 0 {
+        -e
+    } else {
+        crate::errno::fail(e)
+    }
+}
+
+/// A compare-and-wait timed out on the virtual clock. When a thread the
+/// scheduler does not run (a GCD worker doing the Security framework's
+/// work, say) is the one to wake it, virtual time says nothing about when
+/// that comes: wait the same again, for real, before reporting the
+/// timeout. `real` is the real call; its result is returned as it is.
+fn timed_out(addr: *mut c_void, value: u64, wide: bool, real: impl FnOnce() -> c_int, fail: c_int) -> c_int {
+    if !value_matches(addr, value, wide) {
+        return 0;
+    }
+    if sched::has_outside_threads() {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, Ordering::Relaxed) {
+            crate::report::log(
+                "a wait timed out in virtual time; waiting the same again in real time, \
+                 in case a thread outside the schedule is to end it",
+            );
+        }
+        return real();
+    }
+    fail
+}
+
 /// Sleep for `ns` of virtual time: a wait nothing but the deadline ends.
 fn sleep_ns(ns: u64) {
     let deadline = sched::now().saturating_add(ns);
@@ -489,8 +595,17 @@ fn unfair_wait(op: u32, addr: *mut c_void, value: u64, real: impl Fn() -> c_int)
     )
 }
 
-extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: u32) -> c_int {
-    if my_id().is_none() {
+#[no_mangle]
+pub extern "C" fn rewrite_ulock_wait_impl(
+    op: u32,
+    addr: *mut c_void,
+    value: u64,
+    timeout_us: u32,
+    caller: usize,
+) -> c_int {
+    // An unfair lock's owner may be a parked thread of ours (libdispatch's
+    // once gate): that wait stays the scheduler's, whoever made it
+    if my_id().is_none() || (!ulock_is_unfair(op) && system_wait(caller)) {
         return unsafe { __ulock_wait(op, addr, value, timeout_us) };
     }
     count(C_ULOCK);
@@ -503,20 +618,27 @@ extern "C" fn my_ulock_wait(op: u32, addr: *mut c_void, value: u64, timeout_us: 
         });
     }
     if futex_block(addr, u64::from(timeout_us) * 1000) {
-        0
-    } else {
-        crate::errno::fail(libc::ETIMEDOUT)
+        return 0;
     }
+    timed_out(
+        addr,
+        value,
+        ulock_is_wide(op),
+        || unsafe { __ulock_wait(op, addr, value, timeout_us) },
+        ulock_fail(op, libc::ETIMEDOUT),
+    )
 }
 
-extern "C" fn my_ulock_wait2(
+#[no_mangle]
+pub extern "C" fn rewrite_ulock_wait2_impl(
     op: u32,
     addr: *mut c_void,
     value: u64,
     timeout_ns: u64,
     value2: u64,
+    caller: usize,
 ) -> c_int {
-    if my_id().is_none() {
+    if my_id().is_none() || (!ulock_is_unfair(op) && system_wait(caller)) {
         return unsafe { __ulock_wait2(op, addr, value, timeout_ns, value2) };
     }
     count(C_ULOCK);
@@ -529,10 +651,15 @@ extern "C" fn my_ulock_wait2(
         });
     }
     if futex_block(addr, timeout_ns) {
-        0
-    } else {
-        crate::errno::fail(libc::ETIMEDOUT)
+        return 0;
     }
+    timed_out(
+        addr,
+        value,
+        ulock_is_wide(op),
+        || unsafe { __ulock_wait2(op, addr, value, timeout_ns, value2) },
+        ulock_fail(op, libc::ETIMEDOUT),
+    )
 }
 
 extern "C" fn my_ulock_wake(op: u32, addr: *mut c_void, wake_value: u64) -> c_int {
@@ -546,13 +673,15 @@ extern "C" fn my_ulock_wake(op: u32, addr: *mut c_void, wake_value: u64) -> c_in
     }
 }
 
-extern "C" fn my_os_sync_wait_on_address(
+#[no_mangle]
+pub extern "C" fn rewrite_os_sync_wait_impl(
     addr: *mut c_void,
     value: u64,
     size: usize,
     flags: u32,
+    caller: usize,
 ) -> c_int {
-    if my_id().is_none() {
+    if my_id().is_none() || system_wait(caller) {
         return unsafe { os_sync_wait_on_address(addr, value, size, flags) };
     }
     count(C_OSSYNC);
@@ -563,15 +692,17 @@ extern "C" fn my_os_sync_wait_on_address(
     0
 }
 
-extern "C" fn my_os_sync_wait_on_address_with_timeout(
+#[no_mangle]
+pub extern "C" fn rewrite_os_sync_wait_timeout_impl(
     addr: *mut c_void,
     value: u64,
     size: usize,
     flags: u32,
     clockid: u32,
     timeout_ns: u64,
+    caller: usize,
 ) -> c_int {
-    if my_id().is_none() {
+    if my_id().is_none() || system_wait(caller) {
         return unsafe {
             os_sync_wait_on_address_with_timeout(addr, value, size, flags, clockid, timeout_ns)
         };
@@ -581,10 +712,19 @@ extern "C" fn my_os_sync_wait_on_address_with_timeout(
         return 0;
     }
     if futex_block(addr, timeout_ns.max(1)) {
-        0
-    } else {
-        crate::errno::fail(libc::ETIMEDOUT)
+        return 0;
     }
+    timed_out(
+        addr,
+        value,
+        size == 8,
+        || {
+            sched::with_passthrough(|| unsafe {
+                os_sync_wait_on_address_with_timeout(addr, value, size, flags, clockid, timeout_ns)
+            })
+        },
+        crate::errno::fail(libc::ETIMEDOUT),
+    )
 }
 
 extern "C" fn my_os_sync_wake_by_address_any(addr: *mut c_void, size: usize, flags: u32) -> c_int {
@@ -654,8 +794,13 @@ fn dispatch_timeout_ns(timeout: u64) -> u64 {
 /// Rust's `Thread::park` sits on one of these. A zero timeout is a
 /// try-wait, which lets the count live in libdispatch while the blocking
 /// moves into the scheduler.
-extern "C" fn my_dispatch_semaphore_wait(sema: *mut c_void, timeout: u64) -> isize {
-    if my_id().is_none() {
+#[no_mangle]
+pub extern "C" fn rewrite_dispatch_semaphore_wait_impl(
+    sema: *mut c_void,
+    timeout: u64,
+    caller: usize,
+) -> isize {
+    if my_id().is_none() || system_wait(caller) {
         return unsafe { dispatch_semaphore_wait(sema, timeout) };
     }
     loop {
@@ -739,14 +884,14 @@ interposers! {
     my_pthread_rwlock_unlock => libc::pthread_rwlock_unlock,
     my_pthread_cond_signal => libc::pthread_cond_signal,
     my_pthread_cond_broadcast => libc::pthread_cond_broadcast,
-    my_ulock_wait => __ulock_wait,
-    my_ulock_wait2 => __ulock_wait2,
+    rewrite_ulock_wait_shim => __ulock_wait,
+    rewrite_ulock_wait2_shim => __ulock_wait2,
     my_ulock_wake => __ulock_wake,
-    my_os_sync_wait_on_address => os_sync_wait_on_address,
-    my_os_sync_wait_on_address_with_timeout => os_sync_wait_on_address_with_timeout,
+    rewrite_os_sync_wait_shim => os_sync_wait_on_address,
+    rewrite_os_sync_wait_timeout_shim => os_sync_wait_on_address_with_timeout,
     my_os_sync_wake_by_address_any => os_sync_wake_by_address_any,
     my_os_sync_wake_by_address_all => os_sync_wake_by_address_all,
-    my_dispatch_semaphore_wait => dispatch_semaphore_wait,
+    rewrite_dispatch_semaphore_wait_shim => dispatch_semaphore_wait,
     my_dispatch_semaphore_signal => dispatch_semaphore_signal,
     my_sched_yield => libc::sched_yield,
     my_pthread_yield_np => pthread_yield_np,
@@ -761,6 +906,12 @@ interposers! {
     my_wait4 => libc::wait4,
     my_wait => libc::wait,
     rewrite_getpid_shim => libc::getpid,
+    my_pthread_threadid_np => libc::pthread_threadid_np,
+    my_mach_vm_map => mach_vm_map,
+    my_mach_vm_allocate => mach_vm_allocate,
+    my_mach_vm_deallocate => mach_vm_deallocate,
+    my_mmap => libc::mmap,
+    my_munmap => libc::munmap,
     rewrite_getppid_shim => libc::getppid,
     my_kill => libc::kill,
     my_sigaction => libc::sigaction,

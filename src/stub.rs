@@ -6,6 +6,7 @@ pub const STR_X30_PRE: u32 = 0xF81F_0FFE; // str x30, [sp, #-16]!
 pub const LDR_X30_POST: u32 = 0xF841_07FE; // ldr x30, [sp], #16
 pub const SUB_X1_X1_1: u32 = 0xD100_0421;
 pub const BLR_X0: u32 = 0xD63F_0000;
+pub const RET: u32 = 0xD65F_03C0;
 
 pub const B_RANGE: i64 = 128 << 20;
 
@@ -56,6 +57,22 @@ pub fn br(rn: u8) -> u32 {
     0xD61F_0000 | (u32::from(rn) << 5)
 }
 
+/// `adrp xd, target` from `pc`: the page of `target`, within 4 GB
+pub fn adrp(rd: u8, pc: u64, target: u64) -> Option<u32> {
+    let pages = ((target >> 12) as i64).wrapping_sub((pc >> 12) as i64);
+    if !(-(1 << 20)..(1 << 20)).contains(&pages) {
+        return None;
+    }
+    let imm = pages as u32;
+    Some(0x9000_0000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7_FFFF) << 5) | u32::from(rd))
+}
+
+/// `add xd, xn, #imm12`
+pub fn add_imm(rd: u8, rn: u8, imm: u32) -> u32 {
+    debug_assert!(imm < 0x1000);
+    0x9100_0000 | (imm << 10) | (u32::from(rn) << 5) | u32::from(rd)
+}
+
 /// `movz xd, #imm16, lsl #shift` for a value with one non-zero 16-bit chunk
 pub fn movz_x(rd: u8, value: u64) -> Option<u32> {
     let shift = if value == 0 {
@@ -93,6 +110,13 @@ mod tests {
         assert_eq!(tbz(7, 40, false, 0x1018, 0x1000), Some(0xB647_FF47));
         assert_eq!(tbz(2, 3, true, 0x101C, 0x1000), Some(0x371F_FF22));
         assert_eq!(br(9), 0xD61F_0120);
+        assert_eq!(RET, 0xD65F_03C0);
+        assert_eq!(adrp(16, 0x1_0000, 0x1_1000), Some(0xB000_0010));
+        assert_eq!(adrp(16, 0x1_0000, 0x1_2000), Some(0xD000_0010));
+        assert_eq!(adrp(16, 0x1_2000, 0x1_0fff), Some(0xD0FF_FFF0));
+        assert_eq!(adrp(0, 0x1000, 0x1000), Some(0x9000_0000));
+        assert!(adrp(0, 0, 1 << 32).is_none());
+        assert_eq!(add_imm(16, 16, 0x123), 0x9104_8E10);
         assert_eq!(movz_x(0, 0x78_0000_0000), Some(0xD2C0_0F00));
         assert_eq!(movz_x(3, 0x1234), Some(0xD282_4683));
         assert_eq!(movz_x(0, 0), Some(0xD280_0000));

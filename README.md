@@ -232,10 +232,28 @@ too far for a `b` is reached through x16, as a linker's branch island
 would. Below `__TEXT` is not an option: the kernel wants `__PAGEZERO` to
 cover the low 4 GB and reserves everything up to the first segment.
 
+For the rest, room is made at link time: `rewrite cargo build …` runs
+cargo with `rewrite cc` as the linker (through the
+`CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER` variable; the program's own
+`Cargo.toml` and `.cargo/config` are not touched, and nothing happens
+unless you ask). `rewrite cc` links as `cc` would, and if the result has
+sites out of the stubs' reach it links once more with a `.space` object
+per 128 MB of text, placed in the middle of its stretch by an order file
+listing the symbols before it (`<program>.rooms/`). The rewriter writes
+the far sites' trampolines into those rooms, which are ordinary text.
+It says what it did: how many sites were out of reach, how many rooms
+it made and how big, and how many sites still cannot be reached. `rewrite run` on a program that needed this and did not
+get it says so. No arm64 instruction reaches further than a `b` in one
+word, and stubs below `__TEXT` are impossible: the kernel wants
+`__PAGEZERO` to cover the low 4 GB and reserves everything up to the
+first segment.
+
 A function-table entry without a symbol is a constant table in
 hand-written assembly (blst keeps its SHA-256 round constants that way),
 whose words would be hooked as instructions; such entries are left alone
 when the file names at least half of its functions (`unnamed_entries`).
+A room's order file leaves the megabyte around such an entry unlisted,
+so that it and the code reaching it with an `adr` stay together.
 
 ## Rewritten binaries only run under the supervisor
 

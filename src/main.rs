@@ -25,6 +25,10 @@ usage:
                                        none can be dropped, and names their source lines
   rewrite run|repeat [opts] --manifest FILE
                                        several processes under one scheduler; see below
+  rewrite cargo <cargo args…>          cargo, with `rewrite cc` as the linker: a program too big
+                                       for its sites to reach the stubs is linked again with
+                                       rooms for them in its text (README, Big programs)
+  rewrite cc <linker args…>            the linker driver `rewrite cargo` installs
 options:
   --runs N                             repetitions for repeat (default 100)
   --seed S                             run seed (default 0)
@@ -744,6 +748,120 @@ fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
     result
 }
 
+/// The variable cargo reads the linker from, for the host's own target
+const LINKER_VAR: &str = "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER";
+
+/// `rewrite cargo …`: cargo with `rewrite cc` as the linker, through a
+/// script (cargo wants a program that takes the linker's arguments). No
+/// change to the program's own Cargo.toml or .cargo/config.
+fn rooms_cargo(args: Vec<OsString>) -> Fallible<ExitCode> {
+    let exe = std::env::current_exe()?;
+    let dir = std::env::temp_dir().join(format!("rewrite-cc-{}", unsafe { libc::getuid() }));
+    std::fs::create_dir_all(&dir)?;
+    let script = dir.join("rewrite-cc");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\nexec \"{}\" cc \"$@\"\n", exe.display()),
+    )?;
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    let mut cargo = std::process::Command::new("cargo");
+    cargo.args(&args);
+    if std::env::var_os(LINKER_VAR).is_none() {
+        cargo.env(LINKER_VAR, &script);
+    }
+    let status = cargo.status()?;
+    Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
+}
+
+/// `rewrite cc …`: link as `cc` would, then look at the result. An
+/// executable with sites out of the stub segment's reach is linked once
+/// more, with a room for them in its text (`rooms`). Anything else, and
+/// a failed link, is left as it is.
+fn rooms_link(args: Vec<OsString>) -> Fallible<ExitCode> {
+    let status = std::process::Command::new("cc").args(&args).status()?;
+    if !status.success() {
+        return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
+    }
+    let shared = ["-dynamiclib", "-shared", "-bundle", "-r"];
+    let out = args
+        .windows(2)
+        .find(|w| w[0] == "-o")
+        .map(|w| PathBuf::from(&w[1]));
+    let Some(out) = out else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    if args.iter().any(|a| shared.iter().any(|s| a == s)) {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Ok(m) = read_macho(&out) else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    if m.header.filetype != rewrite::macho::MH_EXECUTE {
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Ok(stats) = rw::scan(&m, &Options::default()) else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let name = out
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if stats.unreachable_sites == 0 {
+        return Ok(ExitCode::SUCCESS);
+    }
+    if stats.rooms > 0 {
+        eprintln!(
+            "rewrite cc: {name}: {} sites out of a b's reach with the {} rooms it has",
+            stats.unreachable_sites, stats.rooms
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    let Some(plan) = rewrite::rooms::plan(&m, &stats) else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    drop(m);
+    let dir = PathBuf::from(format!("{}.rooms", out.display()));
+    std::fs::create_dir_all(&dir)?;
+    let order = dir.join("order.txt");
+    std::fs::write(&order, &plan.order_file)?;
+    let mut again: Vec<OsString> = args.clone();
+    for (symbol, bytes) in &plan.rooms {
+        let asm = dir.join(format!("{symbol}.s"));
+        let obj = dir.join(format!("{symbol}.o"));
+        std::fs::write(&asm, rewrite::rooms::assembly(symbol, *bytes))?;
+        let assembled = std::process::Command::new("cc")
+            .arg("-c")
+            .arg(&asm)
+            .arg("-o")
+            .arg(&obj)
+            .status()?;
+        if !assembled.success() {
+            return Err(format!("assembling {} failed", asm.display()).into());
+        }
+        again.push(obj.into());
+    }
+    again.push(format!("-Wl,-order_file,{}", order.display()).into());
+    let relinked = std::process::Command::new("cc").args(&again).status()?;
+    if !relinked.success() {
+        eprintln!("rewrite cc: {name}: linking with rooms failed; linked without");
+        let status = std::process::Command::new("cc").args(&args).status()?;
+        return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
+    }
+    let after = read_macho(&out).and_then(|m| Ok(rw::scan(&m, &Options::default())?))?;
+    let mb: u64 = plan.rooms.iter().map(|(_, b)| b).sum::<u64>() >> 20;
+    eprintln!(
+        "rewrite cc: {name}: {} of {} sites were out of a b's reach; linked again with {} room{} \
+         ({mb} MB) in the text; {} still out of reach",
+        plan.far_sites,
+        stats.branch_sites + stats.call_sites + stats.unreachable_sites,
+        plan.rooms.len(),
+        if plan.rooms.len() == 1 { "" } else { "s" },
+        after.unreachable_sites
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Set by `bisect` and `suspects` on the runs they start: a run whose tool
 /// has gone is of no use, and its guests follow it out (`exit_if_orphaned`).
 const EXIT_WITH_PARENT: &str = "REWRITE_EXIT_WITH_PARENT";
@@ -767,6 +885,12 @@ fn main() -> ExitCode {
         return fail(USAGE);
     }
     let cmd = args.remove(0);
+    // Their arguments are cargo's and the linker's, not ours
+    match cmd.to_str() {
+        Some("cargo") => return rooms_cargo(args).unwrap_or_else(fail),
+        Some("cc") => return rooms_link(args).unwrap_or_else(fail),
+        _ => {}
+    }
     let cli = match parse_cli(args) {
         Ok(c) => c,
         Err(e) => return fail(e),

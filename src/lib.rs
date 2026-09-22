@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod replay;
 pub mod rewrite;
 pub mod rng;
+pub mod rooms;
 #[path = "../supervisor/src/shared.rs"]
 pub mod shared;
 pub mod stub;

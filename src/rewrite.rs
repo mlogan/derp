@@ -73,6 +73,12 @@ pub struct Stats {
     /// Function-table entries without a symbol, left alone (constant
     /// tables in hand-written assembly)
     pub unnamed_entries: usize,
+    pub unnamed_addrs: Vec<u64>,
+    /// Rooms the program was linked with, and the trampoline bytes in them
+    pub rooms: usize,
+    pub room_bytes: u64,
+    /// Sites tried, per MB of text from the start of `__text`
+    pub sites_per_mb: Vec<u32>,
     pub exclusive_words: usize,
     pub data_in_code_words: usize,
     pub skipped_blr_x30: usize,
@@ -109,6 +115,7 @@ impl std::fmt::Display for Stats {
             self.unnamed_entries
         )?;
         writeln!(f, "stub_bytes={}", self.stub_bytes)?;
+        writeln!(f, "rooms={} room_bytes={}", self.rooms, self.room_bytes)?;
         write!(f, "mem_site_addrs=")?;
         for (i, a) in self.mem_site_addrs.iter().enumerate() {
             write!(f, "{}{a:#x}", if i == 0 { "" } else { "," })?;
@@ -219,6 +226,7 @@ impl From<macho::Error> for Error {
 }
 
 /// What the stub does after the counter check
+#[derive(Clone, Copy)]
 enum Tail {
     /// `island`: the site is a call, so x16 may be used to reach a far
     /// target, as a linker's branch island would
@@ -233,6 +241,7 @@ enum Tail {
 
 /// A local guard placed at the top of a stub for conditional sites; it
 /// branches past the stub when the original condition does not hold
+#[derive(Clone, Copy)]
 enum Guard {
     None,
     Cond(u8),
@@ -240,85 +249,152 @@ enum Guard {
     Tbz { rt: u8, bit: u8, nonzero: bool },
 }
 
-struct Builder {
-    text_addr: u64,
-    /// Address of the shared body
+/// A stretch of address space trampolines are written to: the `__STUB`
+/// segment, or a room the program was linked with (see `rooms`)
+struct Area {
+    base: u64,
+    /// Bytes it may hold (None: as many as it takes)
+    capacity: Option<u64>,
+    /// Address of this area's copy of the shared body
     common: u64,
-    /// Sites left alone because a `b` could not reach
-    unreachable: usize,
     code: Vec<u32>,
+}
+
+struct Builder {
+    /// The segment first, then the rooms in address order
+    areas: Vec<Area>,
+    /// The area being written
+    at: usize,
+    text_base: u64,
+    /// Sites left alone because no area was in a `b`'s reach
+    unreachable: usize,
+    /// Sites tried, per MB of text: what a room plan needs
+    site_buckets: Vec<u32>,
     patches: Vec<(u64, u32)>,
     sites: Vec<Site>,
 }
 
 impl Builder {
+    fn new(segment: u64, rooms: &[(u64, u64)], text_base: u64) -> Self {
+        let mut areas = vec![Area {
+            base: segment,
+            capacity: None,
+            common: 0,
+            code: Vec::new(),
+        }];
+        areas.extend(rooms.iter().map(|&(start, end)| Area {
+            base: start,
+            capacity: Some(end - start),
+            common: 0,
+            code: Vec::new(),
+        }));
+        let mut b = Builder {
+            areas,
+            at: 0,
+            text_base,
+            unreachable: 0,
+            site_buckets: Vec::new(),
+            patches: Vec::new(),
+            sites: Vec::new(),
+        };
+        for i in 0..b.areas.len() {
+            b.at = i;
+            b.emit_common();
+        }
+        b.at = 0;
+        b
+    }
+
     fn pc(&self) -> u64 {
-        self.text_addr + (self.code.len() * 4) as u64
+        self.areas[self.at].base + (self.areas[self.at].code.len() * 4) as u64
+    }
+
+    /// Address of word `i` of the area being written
+    fn word_addr(&self, i: usize) -> u64 {
+        self.areas[self.at].base + (i * 4) as u64
     }
 
     fn emit(&mut self, w: u32) {
-        self.code.push(w);
+        self.areas[self.at].code.push(w);
+    }
+
+    fn len(&self) -> usize {
+        self.areas[self.at].code.len()
+    }
+
+    fn set(&mut self, i: usize, w: u32) {
+        self.areas[self.at].code[i] = w;
     }
 
     /// The body every trampoline calls with x0, x1 and x30 live: count the
     /// event and, when the quantum is out, enter the scheduler. Its own
     /// x30 is the trampoline's return address, which names the site; the
     /// scheduler's entry reads it from the stack, where it is saved before
-    /// the call.
+    /// the call. One per area: a `bl` has to reach it.
     fn emit_common(&mut self) {
-        self.common = self.pc();
+        self.areas[self.at].common = self.pc();
         self.emit(stub::STP_X0_X1_PRE);
         self.emit(stub::movz_x(0, STUB_BASE as u64).expect("STUB_BASE fits one movz"));
         self.emit(stub::ldr_x_imm(1, 0, COUNTER_OFFSET));
         self.emit(stub::SUB_X1_X1_1);
         self.emit(stub::str_x_imm(1, 0, COUNTER_OFFSET));
-        let cbz_at = self.code.len();
+        let cbz_at = self.len();
         self.emit(0);
         let resume = self.pc();
         self.emit(stub::LDP_X0_X1_POST);
         self.emit(stub::RET);
         // Expired path
         let expired = self.pc();
-        self.code[cbz_at] = stub::cbz(
-            true,
-            1,
-            false,
-            self.text_addr + (cbz_at * 4) as u64,
-            expired,
-        )
-        .unwrap();
+        let w = stub::cbz(true, 1, false, self.word_addr(cbz_at), expired).unwrap();
+        self.set(cbz_at, w);
         // x0 still holds STUB_BASE here
         self.emit(stub::STR_X30_PRE);
         self.emit(stub::ldr_x_imm(0, 0, SLOT_OFFSET));
-        let skip_at = self.code.len();
+        let skip_at = self.len();
         self.emit(0);
         self.emit(stub::BLR_X0);
         let skip = self.pc();
-        self.code[skip_at] =
-            stub::cbz(true, 0, false, self.text_addr + (skip_at * 4) as u64, skip).unwrap();
+        let w = stub::cbz(true, 0, false, self.word_addr(skip_at), skip).unwrap();
+        self.set(skip_at, w);
         self.emit(stub::LDR_X30_POST);
         let pc = self.pc();
         self.emit(stub::b(pc, resume).unwrap());
     }
 
-    /// Emit one trampoline for `site` and record the site patch. `call`
-    /// means the site keeps a `bl` so x30 is set by hardware. Returns
-    /// false, having emitted nothing, when the site cannot reach its
-    /// trampoline or the trampoline its target: a program of over about
-    /// 120 MB has such sites, and they stay as they are.
+    /// Emit one trampoline for `site` and record the site patch, in the
+    /// first area a `b` reaches from the site and from which the tail
+    /// reaches its target: the segment, else a room. `call` means the
+    /// site keeps a `bl` so x30 is set by hardware. Returns false, having
+    /// emitted nothing, when no area will do: a program of over about
+    /// 120 MB has such sites unless it was linked with rooms, and they
+    /// stay as they are.
     fn stub(&mut self, site: u64, guard: Guard, call: bool, tail: Tail) -> Result<bool, Error> {
-        let mark = (self.code.len(), self.patches.len(), self.sites.len());
-        match self.stub_or_far(site, guard, call, tail) {
-            Ok(()) => Ok(true),
-            Err(Error::OutOfRange { .. }) => {
-                self.code.truncate(mark.0);
-                self.patches.truncate(mark.1);
-                self.sites.truncate(mark.2);
-                self.unreachable += 1;
-                Ok(false)
-            }
-            Err(e) => Err(e),
+        let bucket = (site.saturating_sub(self.text_base) >> 20) as usize;
+        if self.site_buckets.len() <= bucket {
+            self.site_buckets.resize(bucket + 1, 0);
         }
+        self.site_buckets[bucket] += 1;
+        for area in 0..self.areas.len() {
+            self.at = area;
+            let mark = (self.len(), self.patches.len(), self.sites.len());
+            let fits = match self.stub_or_far(site, guard, call, tail) {
+                Ok(()) => self.areas[area]
+                    .capacity
+                    .is_none_or(|cap| (self.len() * 4) as u64 <= cap),
+                Err(Error::OutOfRange { .. }) => false,
+                Err(e) => return Err(e),
+            };
+            if fits {
+                self.at = 0;
+                return Ok(true);
+            }
+            self.areas[area].code.truncate(mark.0);
+            self.patches.truncate(mark.1);
+            self.sites.truncate(mark.2);
+        }
+        self.at = 0;
+        self.unreachable += 1;
+        Ok(false)
     }
 
     fn stub_or_far(
@@ -345,13 +421,13 @@ impl Builder {
             None
         } else {
             self.emit(0);
-            Some(self.code.len() - 1)
+            Some(self.len() - 1)
         };
         self.emit(stub::STR_X30_PRE);
         let pc = self.pc();
-        let to_common = stub::bl(pc, self.common).ok_or(Error::OutOfRange {
+        let to_common = stub::bl(pc, self.areas[self.at].common).ok_or(Error::OutOfRange {
             site,
-            target: self.common,
+            target: self.areas[self.at].common,
         })?;
         self.emit(to_common);
         let yield_pc = self.pc();
@@ -391,8 +467,8 @@ impl Builder {
 
         if let Some(at) = guard_at {
             let fallthrough = self.pc();
-            let pc = self.text_addr + (at * 4) as u64;
-            self.code[at] = match guard {
+            let pc = self.word_addr(at);
+            let w = match guard {
                 Guard::None => unreachable!(),
                 Guard::Cond(c) => stub::b_cond(decode::invert_cond(c), pc, fallthrough).unwrap(),
                 Guard::Cbz { sf, rt, nonzero } => {
@@ -402,6 +478,7 @@ impl Builder {
                     stub::tbz(rt, bit, !nonzero, pc, fallthrough).unwrap()
                 }
             };
+            self.set(at, w);
             self.emit(b_to(fallthrough, site + 4)?);
         }
         Ok(())
@@ -434,43 +511,68 @@ fn b_to(site: u64, target: u64) -> Result<u32, Error> {
 /// decodes as a backward `b`). Compiled functions always have a symbol
 /// while the file has any, so such entries are left alone when symbols
 /// name at least half of the table; a stripped file hooks everything.
-fn function_ranges(m: &MachO) -> Result<(Vec<(u64, u64)>, usize), Error> {
+fn function_ranges(m: &MachO) -> Result<Ranges, Error> {
     let text = m.text_section()?;
     let end = text.addr + text.size;
     let starts = m.function_starts()?;
-    let symbols = m.symbol_addresses();
-    let named = |s: u64| symbols.binary_search(&s).is_ok();
+    let symbols = m.symbols();
+    let named = |s: u64| symbols.binary_search_by_key(&s, |&(a, _)| a).is_ok();
+    let is_room = |s: u64| {
+        let first = symbols.partition_point(|&(a, _)| a < s);
+        symbols[first..]
+            .iter()
+            .take_while(|&&(a, _)| a == s)
+            .any(|(_, name)| name.starts_with(ROOM_PREFIX))
+    };
     let mostly_named = starts.iter().filter(|&&s| named(s)).count() * 2 >= starts.len();
-    let mut out = Vec::with_capacity(starts.len());
-    let mut unnamed = 0;
+    let mut out = Ranges::default();
     for (i, &s) in starts.iter().enumerate() {
         if s < text.addr || s >= end {
             continue;
         }
         if mostly_named && !named(s) {
-            unnamed += 1;
+            out.unnamed += 1;
+            out.unnamed_addrs.push(s);
             continue;
         }
         let e = starts.get(i + 1).copied().unwrap_or(end).min(end);
-        if e > s {
-            out.push((s, e));
+        if e <= s {
+            continue;
+        }
+        if is_room(s) {
+            out.rooms.push((s, e));
+        } else {
+            out.functions.push((s, e));
         }
     }
-    Ok((out, unnamed))
+    Ok(out)
 }
+
+/// The function table sorted out: what to hook, what was passed over, and
+/// the rooms the program was linked with (`rooms`), which hold nothing
+/// yet and are the rewriter's to fill
+#[derive(Default)]
+struct Ranges {
+    functions: Vec<(u64, u64)>,
+    unnamed: usize,
+    unnamed_addrs: Vec<u64>,
+    rooms: Vec<(u64, u64)>,
+}
+
+/// Symbols the rooms are known by: `_rewrite_room_0`, `_rewrite_room_1`, ...
+pub const ROOM_PREFIX: &str = "_rewrite_room_";
 
 pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
     let layout = m.plan_layout()?;
-    let mut b = Builder {
-        text_addr: layout.text_addr + HEADER_SIZE,
-        common: 0,
-        unreachable: 0,
-        code: Vec::new(),
-        patches: Vec::new(),
-        sites: Vec::new(),
+    let ranges = function_ranges(m)?;
+    let text_base = m.text_section()?.addr;
+    let mut b = Builder::new(layout.text_addr + HEADER_SIZE, &ranges.rooms, text_base);
+    let mut stats = Stats {
+        unnamed_entries: ranges.unnamed,
+        unnamed_addrs: ranges.unnamed_addrs,
+        rooms: ranges.rooms.len(),
+        ..Stats::default()
     };
-    b.emit_common();
-    let mut stats = Stats::default();
     let mut rng = Rng::seed_from_u64(opts.seed);
     let (rate_num, rate_den) = opts.mem_rate;
     let dic: Vec<(u64, u64)> = m
@@ -479,9 +581,7 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
         .map(|&(a, len, _)| (a, a + u64::from(len)))
         .collect();
 
-    let (ranges, unnamed) = function_ranges(m)?;
-    stats.unnamed_entries = unnamed;
-    for (start, end) in ranges {
+    for (start, end) in ranges.functions {
         stats.functions += 1;
         let n = ((end - start) / 4) as usize;
         let words: Vec<u32> = (0..n)
@@ -601,17 +701,29 @@ pub fn rewrite(m: &MachO, opts: &Options) -> Result<Rewritten, Error> {
     }
 
     stats.unreachable_sites = b.unreachable;
+    stats.sites_per_mb = b.site_buckets;
     let mut stub_text = vec![0u8; HEADER_SIZE as usize];
     let put = |d: &mut [u8], off: u32, v: u64| {
         d[off as usize..off as usize + 8].copy_from_slice(&v.to_le_bytes());
     };
     put(&mut stub_text, HEADER_MAGIC, MAGIC);
-    put(&mut stub_text, HEADER_SITES, b.patches.len() as u64);
+    put(&mut stub_text, HEADER_SITES, b.sites.len() as u64);
     put(&mut stub_text, HEADER_MEM_SITES, stats.mem_sites as u64);
     put(&mut stub_text, HEADER_SEED, opts.seed);
-    stub_text.extend(b.code.iter().flat_map(|w| w.to_le_bytes()));
+    stub_text.extend(b.areas[0].code.iter().flat_map(|w| w.to_le_bytes()));
     stats.stub_bytes = stub_text.len();
-    let image = m.emit(&b.patches, &stub_text)?;
+    // A room's trampolines are text patches like the sites' own
+    let mut patches = b.patches;
+    for room in &b.areas[1..] {
+        stats.room_bytes += (room.code.len() * 4) as u64;
+        patches.extend(
+            room.code
+                .iter()
+                .enumerate()
+                .map(|(i, &w)| (room.base + (i * 4) as u64, w)),
+        );
+    }
+    let image = m.emit(&patches, &stub_text)?;
     Ok(Rewritten {
         image,
         stats,

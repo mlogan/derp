@@ -163,6 +163,17 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
             stats.branch_sites + stats.call_sites + stats.mem_sites,
             out.display()
         );
+        if stats.unreachable_sites > 0 {
+            eprintln!(
+                "rewrite: {}",
+                if stats.rooms == 0 {
+                    "the program is too big for every site to reach the stubs; building it with \
+                     `rewrite cargo build …` leaves room for them in its text (README, Big programs)"
+                } else {
+                    "its rooms are full: a room plan from an older build?"
+                }
+            );
+        }
     }
     // Also on a cache hit: the program may have gained a dSYM since
     link_debug_symbols(input, &out);

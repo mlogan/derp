@@ -336,26 +336,60 @@ impl MachO {
     /// Addresses of the symbols defined in a section (`N_SECT`, debug stabs
     /// left out), sorted; empty for a stripped file.
     pub fn symbol_addresses(&self) -> Vec<u64> {
+        let mut out: Vec<u64> = self.symbols().into_iter().map(|(a, _)| a).collect();
+        out.dedup();
+        out
+    }
+
+    /// The symbols defined in `__text`, `(address, name)`, in address order;
+    /// empty for a stripped file.
+    pub fn symbols(&self) -> Vec<(u64, String)> {
         const N_STAB: u8 = 0xE0;
         const N_TYPE: u8 = 0x0E;
         const N_SECT: u8 = 0x0E;
         let Some(c) = self.command(LC_SYMTAB) else {
             return Vec::new();
         };
-        let (symoff, nsyms) = (
-            u32_at(&c.bytes, 8).unwrap_or(0) as usize,
-            u32_at(&c.bytes, 12).unwrap_or(0) as usize,
-        );
-        let mut out: Vec<u64> = (0..nsyms)
+        let Some(text_index) = self.text_section_index() else {
+            return Vec::new();
+        };
+        let symoff = u32_at(&c.bytes, 8).unwrap_or(0) as usize;
+        let nsyms = u32_at(&c.bytes, 12).unwrap_or(0) as usize;
+        let stroff = u32_at(&c.bytes, 16).unwrap_or(0) as usize;
+        let strsize = u32_at(&c.bytes, 20).unwrap_or(0) as usize;
+        let strings = self.data.get(stroff..stroff + strsize).unwrap_or(&[]);
+        let mut out: Vec<(u64, String)> = (0..nsyms)
             .filter_map(|i| {
                 let entry = self.data.get(symoff + i * 16..symoff + i * 16 + 16)?;
                 let n_type = entry[4];
-                (n_type & N_STAB == 0 && n_type & N_TYPE == N_SECT).then(|| u64_at(entry, 8))?
+                if n_type & N_STAB != 0 || n_type & N_TYPE != N_SECT || entry[5] != text_index {
+                    return None;
+                }
+                let strx = u32_at(entry, 0)? as usize;
+                let name = strings.get(strx..)?;
+                let end = name.iter().position(|&b| b == 0)?;
+                Some((
+                    u64_at(entry, 8)?,
+                    String::from_utf8_lossy(&name[..end]).into_owned(),
+                ))
             })
             .collect();
-        out.sort_unstable();
-        out.dedup();
+        out.sort();
         out
+    }
+
+    /// The 1-based section index of `__TEXT,__text`, as `nlist` numbers them
+    fn text_section_index(&self) -> Option<u8> {
+        let mut index = 0u8;
+        for seg in &self.segments {
+            for sect in &seg.sections {
+                index += 1;
+                if seg.name == "__TEXT" && sect.name == "__text" {
+                    return Some(index);
+                }
+            }
+        }
+        None
     }
 
     /// `(addr, length, kind)` entries from `LC_DATA_IN_CODE`.

@@ -467,7 +467,9 @@ pub fn send_to(
         }
     }
     if diag_net() {
-        sched::trace_line(&format!("net send fd={fd} sock={sock} sent={done} of {len}"));
+        sched::trace_line(&format!(
+            "net send fd={fd} sock={sock} sent={done} of {len}"
+        ));
     }
     done as isize
 }

@@ -93,7 +93,8 @@ static rewrite_stack_tops: [AtomicUsize; shared::MAX_THREADS + 1] =
 const ENTRY_STACK_SIZE: usize = 256 << 10;
 
 fn give_entry_stack(id: usize) {
-    if id + 1 >= rewrite_stack_tops.len() || rewrite_stack_tops[id + 1].load(Ordering::Relaxed) != 0 {
+    if id + 1 >= rewrite_stack_tops.len() || rewrite_stack_tops[id + 1].load(Ordering::Relaxed) != 0
+    {
         return;
     }
     let p = unsafe {
@@ -683,7 +684,11 @@ pub fn dump_diag_mem() {
     }
     let mut text = String::new();
     for (site, left, a, b) in entries {
-        let _ = writeln!(text, "p{} mem hook site={site:#x} left={left} {a:#x} {b:#x}", pid());
+        let _ = writeln!(
+            text,
+            "p{} mem hook site={site:#x} left={left} {a:#x} {b:#x}",
+            pid()
+        );
     }
     unsafe { libc::write(fd, text.as_ptr().cast(), text.len()) };
 }
@@ -1062,7 +1067,9 @@ fn wait_out_exit() {
     while thread_alive(port) {
         if real_now_ns().saturating_sub(began) > 30_000_000_000 {
             if !SAID_EXIT_STUCK.swap(true, Ordering::Relaxed) {
-                crate::report::log("an exited thread is not gone after 30 s; no longer waiting for it");
+                crate::report::log(
+                    "an exited thread is not gone after 30 s; no longer waiting for it",
+                );
             }
             break;
         }
@@ -1194,7 +1201,11 @@ fn trace_outside_expiry(site: u64) {
     }
     let mut line = String::new();
     let who = my_id().map_or("outside".to_string(), |id| format!("t{id}"));
-    let _ = writeln!(line, "p{} {who} expiry without the baton site={site:#x}", pid());
+    let _ = writeln!(
+        line,
+        "p{} {who} expiry without the baton site={site:#x}",
+        pid()
+    );
     unsafe { libc::write(fd, line.as_ptr().cast(), line.len()) };
 }
 

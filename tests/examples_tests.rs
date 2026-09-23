@@ -62,7 +62,7 @@ fn repeats(name: &str, expect: &str) {
 }
 
 /// `schedule` false: the output must repeat, the schedule hash is not
-/// held to (see the Go example's residual in `TASKS_EXAMPLES.md`).
+/// held to (see the Go example's residual in `tracking/TASKS_EXAMPLES.md`).
 fn repeats_with(name: &str, expect: &str, schedule: bool) {
     let dir = common::scratch_dir(&format!("example_{name}"));
     let first = run_example(name, 1, &dir.join("a"));

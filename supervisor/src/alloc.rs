@@ -144,7 +144,7 @@ static HEAP: SpinLock<Heap> = SpinLock::new(Heap::new(REGION_HINT, REGION_SIZE, 
 
 /// The supervisor's own memory. In libmalloc our threads would collide on
 /// its locks in real time, and the loser's wait would reach the ulock
-/// interposer and the guest's schedule (`TASKS_TOKIO.md`).
+/// interposer and the guest's schedule (`tracking/TASKS_TOKIO.md`).
 static OWN: SpinLock<Heap> = SpinLock::new(Heap::new(OWN_HINT, OWN_SIZE, false));
 
 /// Between the guest's heap and the scheduler's fixed region

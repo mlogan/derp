@@ -120,7 +120,7 @@ At the end of each implementation session, **create a permanent task tracking fi
 - Before taking a break from the project
 - When significant milestones are reached
 
-**Naming Convention**: `TASKS_PHASE{N}.md` corresponds to `IMPLEMENTATION_PLAN_PHASE{N}.md`
+**Naming Convention**: `TASKS_PHASE{N}.md` corresponds to `IMPLEMENTATION_PLAN_PHASE{N}.md`; both live in `tracking/`
 
 ---
 
@@ -129,10 +129,11 @@ At the end of each implementation session, **create a permanent task tracking fi
 ```
 project/
 ├── PRD.md                          # Product Requirements (vision)
-├── IMPLEMENTATION_PLAN_PHASE1.md   # Phase 1 plan (what to build)
-├── TASKS_PHASE1.md                 # Phase 1 progress (what was built)
-├── IMPLEMENTATION_PLAN_PHASE2.md   # Phase 2 plan
-├── TASKS_PHASE2.md                 # Phase 2 progress
+├── tracking/
+│   ├── IMPLEMENTATION_PLAN_PHASE1.md   # Phase 1 plan (what to build)
+│   ├── TASKS_PHASE1.md                 # Phase 1 progress (what was built)
+│   ├── IMPLEMENTATION_PLAN_PHASE2.md   # Phase 2 plan
+│   └── TASKS_PHASE2.md                 # Phase 2 progress
 ├── CLAUDE.md                       # This file (how to work)
 └── src/                            # Implementation
 ```
@@ -411,8 +412,8 @@ network of every guest. Usage in `README.md`. The project began as the
 rewriting experiment of an earlier interpreter-based project (DVM); this
 repository's history starts there.
 
-**Phases, each with a plan and a progress file** (`IMPLEMENTATION_PLAN_X.md`,
-`TASKS_X.md`), all merged:
+**Phases, each with a plan and a progress file** in `tracking/`
+(`IMPLEMENTATION_PLAN_X.md`, `TASKS_X.md`), all merged:
 - Rewrite experiment (`REWRITE`): Mach-O rewriter, stubs, baton
   scheduler, seeded quanta, virtual clock and entropy. Results in
   `docs/REWRITE_RESULTS.md`.
@@ -424,13 +425,12 @@ repository's history starts there.
 - Tokio guest (`TOKIO`): `tests/programs/kv`.
 - Seeded heap layout (`HEAP`), seed bisection (`BISECT`, `rewrite
   bisect`), site minimisation (`SUSPECTS`, `rewrite suspects`).
-- Review of the tools (`TASKS_REVIEW2.md`).
-- Sui under the supervisor (`TASKS_SUI.md`): compact stubs, rooms for
+- Sui under the supervisor (`SUI`): compact stubs, rooms for
   binaries past 128 MB (`rewrite cargo`), `--stop-after`, `--wall-limit`,
   CPU time in the report.
 - Examples of real systems (`EXAMPLES`): `examples/` holds Redis,
   Postgres, SQLite, memcached and Go, with `tests/examples_tests.rs`. Go
-  is set aside with a residual recorded in `TASKS_EXAMPLES.md`.
+  is set aside with a residual recorded in `tracking/TASKS_EXAMPLES.md`.
 
 **Nondeterminism list**: `README.md` has a section "Nondeterminism found
 and fixed": one item per source of nondeterminism (or supervisor bug)
@@ -438,7 +438,7 @@ closed, in the form *problem*: what was wrong, then what was done, in
 plain sentences. Every change that closes one must add its item there,
 in the same commit, under the fitting heading.
 
-**Next**: not yet planned. Candidates in `TASKS_EXAMPLES.md`
+**Next**: not yet planned. Candidates in `tracking/TASKS_EXAMPLES.md`
 "Remaining": rewriting the dylibs a guest loads, replication and
 failover examples, Sui's multi-node network.
 

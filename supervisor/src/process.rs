@@ -583,7 +583,8 @@ std::arch::global_asm!(
 /// the calling thread, or to a thread the scheduler does not run, it is
 /// the kernel's.
 pub unsafe extern "C" fn my_pthread_kill(t: libc::pthread_t, sig: c_int) -> c_int {
-    if sig == 0 || !(1..32).contains(&sig) || sched::my_id().is_none() || t == libc::pthread_self() {
+    if sig == 0 || !(1..32).contains(&sig) || sched::my_id().is_none() || t == libc::pthread_self()
+    {
         return libc::pthread_kill(t, sig);
     }
     let queued = sched::with(|s, pid| {

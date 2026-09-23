@@ -2,11 +2,12 @@
 //! settings of the run. YAML:
 //!
 //! ```yaml
-//! seed: 7                  # optional; the command line overrides these five
+//! seed: 7                  # optional; the command line overrides these
 //! quantum: 1000..10000
 //! heap-size: 32G           # address space of each guest's heap
 //! mem-hook-rate: 1/16
 //! net-latency: 5ms
+//! switch-cost: 1ms         # virtual time a baton hand-off costs
 //! allow:                   # extra paths every host may touch
 //!   - /opt/site-content
 //! env: { LOG_LEVEL: debug } # for every process; guests start from a fixed
@@ -112,6 +113,7 @@ struct RawRun {
     quantum: Option<String>,
     mem_hook_rate: Option<Scalar>,
     net_latency: Option<Scalar>,
+    switch_cost: Option<Scalar>,
     heap_size: Option<Scalar>,
     stop_after: Option<Scalar>,
     wall_limit: Option<Scalar>,
@@ -245,6 +247,8 @@ pub struct Manifest {
     pub quantum: Option<String>,
     pub mem_hook_rate: Option<String>,
     pub net_latency: Option<String>,
+    /// Virtual time a baton hand-off costs
+    pub switch_cost: Option<String>,
     pub heap_size: Option<String>,
     /// Virtual time at which the run is over, whatever still runs
     pub stop_after: Option<String>,
@@ -311,6 +315,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         quantum: raw.quantum,
         mem_hook_rate: raw.mem_hook_rate.as_ref().map(Scalar::text),
         net_latency: raw.net_latency.as_ref().map(Scalar::text),
+        switch_cost: raw.switch_cost.as_ref().map(Scalar::text),
         heap_size: raw.heap_size.as_ref().map(Scalar::text),
         stop_after: raw.stop_after.as_ref().map(Scalar::text),
         wall_limit: raw.wall_limit.as_ref().map(Scalar::text),
@@ -521,6 +526,12 @@ hosts:
     fn a_bare_number_is_a_valid_latency() {
         let m = parse("net-latency: 5\nhosts: [{name: a, processes: [p]}]\n").unwrap();
         assert_eq!(m.net_latency.as_deref(), Some("5"));
+    }
+
+    #[test]
+    fn the_switch_cost_is_read_as_given() {
+        let m = parse("switch-cost: 50us\nhosts: [{name: a, processes: [p]}]\n").unwrap();
+        assert_eq!(m.switch_cost.as_deref(), Some("50us"));
     }
 
     #[test]

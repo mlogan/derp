@@ -30,6 +30,12 @@ Options worth knowing:
 - `--manifest FILE` is the run file, in YAML (below). Hosts get `10.0.0.1`
   upward in the order listed and are reachable by name. `--net-latency 5ms`
   delays traffic between different hosts in virtual time.
+- `--switch-cost 50us` (`switch-cost:` in the run file) is how far each
+  baton hand-off moves the virtual clock; the default is 1ms, and a clock
+  read moves it 1µs. In a run of many threaded servers (the Sui cluster in
+  `examples/sui`) hand-offs are most of the clock: at 1ms a fullnode
+  that waits on a chain of messages falls behind the validators and the
+  programs' own timeouts fire; at 50µs it keeps up. Run-file runs only.
 - `--stop-after 30s` ends the run at that virtual time: whatever still
   runs is killed at that point of the schedule, reported as `stopped`,
   and does not fail the run. For servers that never exit by themselves,
@@ -54,11 +60,12 @@ Options worth knowing:
 ## The run file
 
 ```yaml
-seed: 7                  # optional; the command line overrides these six
+seed: 7                  # optional; the command line overrides these
 quantum: 1000..10000
 heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
+switch-cost: 1ms         # virtual time a baton hand-off costs (the default)
 stop-after: 30s          # the run is over at this virtual time (default: never)
 wall-limit: 60s          # or at this real time, native runs included
 outside-network: refuse  # or allow: connections and name lookups beyond the

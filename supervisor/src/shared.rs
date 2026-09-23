@@ -170,7 +170,9 @@ pub fn is_virtual_pid(pid: i32) -> bool {
 }
 
 pub const PER_READ_NS: u64 = 1_000;
-pub const PER_YIELD_NS: u64 = 1_000_000;
+/// What a baton hand-off costs in virtual time, unless the run says
+/// otherwise (`switch-cost`)
+pub const DEFAULT_SWITCH_NS: u64 = 1_000_000;
 /// Key of sleeping threads: nothing wakes it but the deadline
 pub const SLEEP_KEY: u64 = 0x7FFF_FFFF_0002;
 
@@ -292,6 +294,8 @@ pub struct State {
     pub rng: Rng,
     pub quantum_lo: u32,
     pub quantum_hi: u32,
+    /// Virtual time each hand-off adds to the clock
+    pub switch_ns: u64,
     pub issued: u64,
     pub switches: u64,
     pub expiries: u64,
@@ -483,6 +487,7 @@ impl Shared {
         s.fault_rng = Rng::seed_from_u64(seed ^ 0xFA17_FA17_FA17_FA17);
         s.quantum_lo = quantum_lo;
         s.quantum_hi = quantum_hi;
+        s.switch_ns = DEFAULT_SWITCH_NS;
         s.trace_hash = 0xCBF2_9CE4_8422_2325;
         s.current = NO_THREAD;
         s.next_cond_seq = 1;
@@ -1113,7 +1118,7 @@ impl State {
         // Every yield, not only a switch: a lone compute thread must still
         // let a sleeper's deadline pass.
         if me.is_some() {
-            self.clock_ns += PER_YIELD_NS;
+            self.clock_ns += self.switch_ns;
         }
         self.choose(me, site)
     }

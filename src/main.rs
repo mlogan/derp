@@ -54,6 +54,7 @@ options:
                                        messages about it
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
+  --switch-cost T                      virtual time each baton hand-off costs (default 1ms)
   --stop-after T                       the run is over at this virtual time: what still runs
                                        is killed there, reported as stopped, and does not
                                        fail the run (for servers that never exit)
@@ -61,10 +62,11 @@ options:
                                        compare the CPU time (cpu_user_ns, cpu_system_ns) a
                                        program uses natively and under the supervisor
 run file:
-  seed: 7                              optional; the command line overrides these six
+  seed: 7                              optional; the command line overrides these
   quantum: 1000..10000
   mem-hook-rate: 1/16
   net-latency: 5ms
+  switch-cost: 1ms
   heap-size: 32G
   stop-after: 30s
   wall-limit: 60s
@@ -100,6 +102,7 @@ struct Cli {
     /// the supervisor's own messages about a guest are expected
     capture_stderr: bool,
     net_latency_ns: u64,
+    switch_ns: u64,
     heap_size: u64,
     /// Virtual time at which the run is over (0: when its processes are)
     stop_after_ns: u64,
@@ -122,6 +125,14 @@ fn parse_quantum(v: &str) -> Result<(u32, u32), String> {
         .ok_or(format!("bad quantum {v}"))
 }
 
+/// At least a microsecond: a lone thread that computes without reading the
+/// clock moves it only by its hand-offs, and a sleeper's deadline must pass.
+fn parse_switch_cost(v: &str) -> Result<u64, String> {
+    parse_duration_ns(v)
+        .filter(|&ns| ns >= 1_000)
+        .ok_or(format!("bad switch cost {v} (at least 1us)"))
+}
+
 /// The run's settings: the run file's, unless the command line gave them.
 fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, String> {
     let mut cli = cli.clone();
@@ -137,6 +148,9 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     }
     if let (Some(l), true) = (&m.net_latency, from_file("net-latency")) {
         cli.net_latency_ns = parse_duration_ns(l).ok_or(format!("bad duration {l}"))?;
+    }
+    if let (Some(c), true) = (&m.switch_cost, from_file("switch-cost")) {
+        cli.switch_ns = parse_switch_cost(c)?;
     }
     if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
         cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
@@ -168,6 +182,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         capture: false,
         capture_stderr: false,
         net_latency_ns: 0,
+        switch_ns: rewrite::shared::DEFAULT_SWITCH_NS,
         heap_size: launch::DEFAULT_HEAP,
         stop_after_ns: 0,
         wall_limit_ms: 0,
@@ -210,6 +225,10 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 let v = take_value(&mut args)?;
                 cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
                 cli.given.push("net-latency");
+            }
+            "--switch-cost" => {
+                cli.switch_ns = parse_switch_cost(&take_value(&mut args)?)?;
+                cli.given.push("switch-cost");
             }
             "--heap-size" => {
                 let v = take_value(&mut args)?;
@@ -471,6 +490,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
+        switch_ns: cli.switch_ns,
         reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
         stop_at_ns: cli.stop_after_ns,
         wall_limit_ms: cli.wall_limit_ms,
@@ -606,6 +626,8 @@ fn replay_of(
         format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
         "--net-latency".to_string(),
         format!("{}ns", cli.net_latency_ns),
+        "--switch-cost".to_string(),
+        format!("{}ns", cli.switch_ns),
         "--heap-size".to_string(),
         cli.heap_size.to_string(),
     ];

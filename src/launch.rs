@@ -147,6 +147,8 @@ pub struct Run {
     pub rewrite: Option<crate::rewrite::Options>,
     /// Virtual-time delay for traffic between different hosts
     pub net_latency_ns: u64,
+    /// Virtual time each baton hand-off costs
+    pub switch_ns: u64,
     /// Seed bisection: (virtual time, replacement seed)
     pub reseed: Option<(u64, u64)>,
     /// Virtual time at which the run is over whatever is still running
@@ -833,6 +835,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     }
     if let Some(c) = coord {
         c.set_net_latency(run.net_latency_ns);
+        c.set_switch_cost(run.switch_ns);
         c.set_outside_network(run.outside_network);
         c.set_stop_at(run.stop_at_ns);
         c.set_debug_paths();
@@ -1023,6 +1026,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         passive: cfg.passive,
         rewrite: cfg.rewrite.clone(),
         net_latency_ns: 0,
+        switch_ns: crate::shared::DEFAULT_SWITCH_NS,
         reseed: None,
         stop_at_ns: cfg.stop_at_ns,
         wall_limit_ms: cfg.wall_limit_ms,

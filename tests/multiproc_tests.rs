@@ -1706,6 +1706,46 @@ fn a_wall_limit_ends_a_native_run_and_cpu_time_is_reported() {
     assert!(err.contains("cpu_system_ns="), "{err}");
 }
 
+/// `switch-cost` sets how far a hand-off moves the virtual clock; a
+/// program that never reads the clock runs the same schedule either way.
+#[test]
+fn the_switch_cost_is_what_a_hand_off_adds_to_the_clock() {
+    let dir = common::scratch_dir("multiproc_switch_cost");
+    common::build_c("mutex", &dir, &[]);
+    let manifest = dir.join("mutex.yaml");
+    let write = |setting: &str| {
+        std::fs::write(
+            &manifest,
+            format!("{setting}hosts:\n  - name: a\n    processes:\n      - mutex\n"),
+        )
+        .unwrap();
+    };
+    let scratch = dir.join("scratch");
+    write("");
+    let slow = run_manifest(&manifest, &scratch, 1, 1);
+    let fast = run_manifest_with(&manifest, &scratch, 1, 1, &["--switch-cost", "10us"]);
+    write("switch-cost: 10us\n");
+    let from_file = run_manifest(&manifest, &scratch, 1, 1);
+    assert_eq!(slow.stdout, fast.stdout);
+    assert_eq!(slow.u64("run.switches"), fast.u64("run.switches"));
+    assert!(
+        slow.u64("run.switches") > 10,
+        "{}",
+        slow.u64("run.switches")
+    );
+    // Clock reads still cost a microsecond each
+    assert!(
+        fast.u64("run.clock_ns") * 50 < slow.u64("run.clock_ns"),
+        "{} vs {}",
+        fast.u64("run.clock_ns"),
+        slow.u64("run.clock_ns")
+    );
+    assert_eq!(
+        from_file.fields["run.schedule_hash"],
+        fast.fields["run.schedule_hash"]
+    );
+}
+
 /// A relative `allow:` entry names a path next to the run file, resolved
 /// through symlinks: guests name the target, not the link.
 #[test]

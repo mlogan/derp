@@ -158,9 +158,8 @@ accident, such as an absolute path into another host's directory or a
 `../other/data`. It is not a sandbox: paths are checked as text, so a
 symlink gets out. Program images are not checked.
 
-Plans and progress: `IMPLEMENTATION_PLAN_REWRITE.md`,
-`IMPLEMENTATION_PLAN_MULTIPROC.md`, `TASKS_REWRITE.md`,
-`TASKS_MULTIPROC.md`. Results: `docs/REWRITE_RESULTS.md` (single process)
+Plans and progress: `tracking/` (`IMPLEMENTATION_PLAN_X.md` and
+`TASKS_X.md` per phase). Results: `docs/REWRITE_RESULTS.md` (single process)
 and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
 
 ## What a guest must be
@@ -172,7 +171,7 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   rewritten on demand. Apple's own binaries (`/bin/sh`, `/usr/bin/curl`,
   `/usr/bin/python3`) ignore `DYLD_INSERT_LIBRARIES` and cannot be guests.
   Homebrew's can: its `curl` and `python3.13 -m http.server` run
-  repeatably (see `TASKS_RUNFILE.md`). Rewritten copies of installed
+  repeatably (see `tracking/TASKS_RUNFILE.md`). Rewritten copies of installed
   programs go to `$TMPDIR/rewrite-cache/`, not next to the program.
 - Threads the guest makes with `pthread_create` are scheduled. GCD worker
   threads are not, so **a guest may not submit work to Grand Central
@@ -222,7 +221,7 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   Go server and client (`examples/go`) run and their output repeats; the
   schedule hash of that pair takes one of two values, one quantum ending
   one hook apart in the runtime's stack copying, which
-  `TASKS_EXAMPLES.md` records with what was ruled out and what to try
+  `tracking/TASKS_EXAMPLES.md` records with what was ruled out and what to try
   next. A Go program alone repeats fully.
 - A guest with an allocator of its own (jemalloc, sui-node's default)
   keeps its heap out of the seeded one, so its layout is not the seed's

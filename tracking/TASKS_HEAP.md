@@ -11,7 +11,7 @@ Plan: `IMPLEMENTATION_PLAN_HEAP.md`. Branch `mlogan-seeded-heap`.
   - The region is 32 GB of address space at `0x2000_0000_0000` by default
     and the run's to set: `heap-size:` in the run file, `--heap-size` on
     the command line (64 MB to 4 TB). It was a fixed 4 GB, where scattered
-    slabs soon left no room for a 32 MB block (`TASKS_REVIEW2.md`). 64 KB
+    slabs soon left no room for a 32 MB block (review of PRs #4 to #10). 64 KB
     slabs, bitmap mapped on the side. Pooled classes take slabs from a
     window at one end chosen by the seed (a quarter of the region, at most
     64 GB); runs take the rest.
@@ -60,3 +60,5 @@ Plan: `IMPLEMENTATION_PLAN_HEAP.md`. Branch `mlogan-seeded-heap`.
 - No switch to turn it off. If a guest ever needs the compact layout, a
   run-file key is a few lines (`seed_layout` is simply not called).
 - Stack and image addresses stay fixed (ASLR off); only the heap varies.
+- When two freed blocks both come back, reuse is nearly last-in-first-out
+  (review of PRs #4 to #10, finding A5): recorded, not fixed.

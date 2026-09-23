@@ -341,6 +341,8 @@ Overhead on `loops 3` today (release build):
 - Stub cost work from the first experiment is still deferred.
 - The network simulator itself (latency distributions, loss, partitions,
   reordering) is the next project; its seam is `Net::deliver`.
+- Refactors deferred by the review of PRs #4 to #10: a `Layout` enum for
+  `Heap`, splitting `my_kevent` and `main.rs`.
 
 ### Decisions confirmed by Mark (2026-09-18)
 - Rewritten binaries require the supervisor dylib; passive mode replaces

@@ -203,10 +203,17 @@ unsafe fn service_is_numeric(service: *const c_char) -> bool {
 /// The answer to a lookup of nothing (this host: any address for a
 /// passive socket, else loopback), of `localhost`, or of a numeric IPv4
 /// address, as `(name, address)`.
-unsafe fn local_answer(node: *const c_char, hints: *const libc::addrinfo) -> Option<(Vec<u8>, u32)> {
+unsafe fn local_answer(
+    node: *const c_char,
+    hints: *const libc::addrinfo,
+) -> Option<(Vec<u8>, u32)> {
     if node.is_null() {
         let passive = !hints.is_null() && (*hints).ai_flags & libc::AI_PASSIVE != 0;
-        let ip = if passive { 0 } else { u32::from(std::net::Ipv4Addr::LOCALHOST) };
+        let ip = if passive {
+            0
+        } else {
+            u32::from(std::net::Ipv4Addr::LOCALHOST)
+        };
         return Some((b"localhost".to_vec(), ip));
     }
     let name = CStr::from_ptr(node).to_bytes();

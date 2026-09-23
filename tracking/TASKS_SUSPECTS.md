@@ -98,5 +98,5 @@ Unit test with a forked child that dies holding the lock, reaped and not.
   children a guest spawns are not minimised over.~~ Every process
   announces its image to the launcher once it holds the baton, and the
   report says what each ran (`p<i>.program`, `p<i>.image`); `suspects`
-  takes its programs from there (`TASKS_REVIEW2.md`, third pass).
+  takes its programs from there (review of PRs #4 to #10, third pass).
 - Needs `atos` (Xcode tools) for source lines; without it, addresses.

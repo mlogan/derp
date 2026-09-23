@@ -14,12 +14,14 @@ use crate::alloc::{
     my_posix_memalign, my_realloc, my_valloc,
 };
 use crate::determinism::{
-    my_arc4random, my_arc4random_buf, my_arc4random_uniform, my_cc_random_generate_bytes,
-    my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_gettimeofday,
-    my_mach_absolute_time, my_mach_continuous_time, my_time, my_alarm, my_getitimer, my_getrusage, my_setitimer};
+    my_alarm, my_arc4random, my_arc4random_buf, my_arc4random_uniform, my_cc_random_generate_bytes,
+    my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_getitimer, my_getrusage,
+    my_gettimeofday, my_mach_absolute_time, my_mach_continuous_time, my_setitimer, my_time,
+};
 use crate::files::{
-    my_flock, my_fsync, my_lseek, my_pread, my_pwrite, open_nocancel, rewrite_open_nocancel_shim,
-    rewrite_open_shim, rewrite_openat_shim, my_shm_unlink, rewrite_shm_open_shim};
+    my_flock, my_fsync, my_lseek, my_pread, my_pwrite, my_shm_unlink, open_nocancel,
+    rewrite_open_nocancel_shim, rewrite_open_shim, rewrite_openat_shim, rewrite_shm_open_shim,
+};
 use crate::gcd as gcd_real;
 use crate::gcd::{
     rewrite_dispatch_after_f_shim, rewrite_dispatch_after_shim, rewrite_dispatch_apply_f_shim,
@@ -52,17 +54,19 @@ use crate::net::{
     my_shutdown, my_socket, rewrite_fcntl_shim, rewrite_ioctl_shim,
 };
 use crate::poll::{my_poll, my_select};
-use crate::report::my_exit_now;
 use crate::process::{
-    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_pthread_threadid_np, my_vfork,
-    my_wait, my_wait4, my_waitpid, my_pthread_kill};
+    my_execve, my_fork, my_kill, my_posix_spawn, my_posix_spawnp, my_pthread_kill,
+    my_pthread_threadid_np, my_vfork, my_wait, my_wait4, my_waitpid,
+};
 use crate::process::{rewrite_getpid_shim, rewrite_getppid_shim};
-use crate::vmmap::{
-    mach_vm_allocate, mach_vm_deallocate, mach_vm_map, my_mach_vm_allocate,
-    my_mach_vm_deallocate, my_mach_vm_map, my_mmap, my_munmap, my_shmat, my_shmdt, my_madvise};
+use crate::report::my_exit_now;
 use crate::sched::{self, my_id, State};
 use crate::shared;
 use crate::signals::{my_sigaction, my_signal};
+use crate::vmmap::{
+    mach_vm_allocate, mach_vm_deallocate, mach_vm_map, my_mach_vm_allocate, my_mach_vm_deallocate,
+    my_mach_vm_map, my_madvise, my_mmap, my_munmap, my_shmat, my_shmdt,
+};
 
 #[repr(C)]
 struct Interpose {
@@ -508,7 +512,13 @@ fn ulock_fail(op: u32, e: c_int) -> c_int {
 /// work, say) is the one to wake it, virtual time says nothing about when
 /// that comes: wait the same again, for real, before reporting the
 /// timeout. `real` is the real call; its result is returned as it is.
-fn timed_out(addr: *mut c_void, value: u64, wide: bool, real: impl FnOnce() -> c_int, fail: c_int) -> c_int {
+fn timed_out(
+    addr: *mut c_void,
+    value: u64,
+    wide: bool,
+    real: impl FnOnce() -> c_int,
+    fail: c_int,
+) -> c_int {
     if !value_matches(addr, value, wide) {
         return 0;
     }

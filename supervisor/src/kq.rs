@@ -113,7 +113,9 @@ fn collect_watches(kq: &mut Kq, out: &mut [libc::kevent], mut n: usize) -> usize
             break;
         }
         let event = if w.filter == libc::EVFILT_PROC {
-            let Some(target) = process_of(w.ident) else { continue };
+            let Some(target) = process_of(w.ident) else {
+                continue;
+            };
             let status = sched::with(|s, _| {
                 let p = &s.procs[target];
                 (p.state == crate::shared::P_EXITED || p.killed).then_some(p.exit_status)
@@ -122,7 +124,11 @@ fn collect_watches(kq: &mut Kq, out: &mut [libc::kevent], mut n: usize) -> usize
             let Some(status) = status else { continue };
             fired.push(i);
             // NOTE_EXIT; the status comes along when NOTE_EXITSTATUS was asked
-            let data = if w.fflags & 0x0400_0000 != 0 { status as isize } else { 0 };
+            let data = if w.fflags & 0x0400_0000 != 0 {
+                status as isize
+            } else {
+                0
+            };
             Some((0x8000_0000u32, data))
         } else {
             let count =

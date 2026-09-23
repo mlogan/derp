@@ -73,7 +73,9 @@ static SAID_FULL: AtomicBool = AtomicBool::new(false);
 pub fn init() {
     let mut addr = BASE;
     if unsafe { mach_vm_allocate(mach_task_self_, &raw mut addr, SIZE, VM_FLAGS_FIXED) } != 0 {
-        crate::report::log("the address range for scheduled threads' mappings is occupied; the kernel places them");
+        crate::report::log(
+            "the address range for scheduled threads' mappings is occupied; the kernel places them",
+        );
         return;
     }
     *REGION.lock() = Some(Region {
@@ -115,7 +117,9 @@ fn take(len: u64) -> Option<u64> {
     if region.next + len > BASE + SIZE {
         OVERFLOWED.fetch_add(1, Ordering::Relaxed);
         if !SAID_FULL.swap(true, Ordering::Relaxed) {
-            crate::report::log("the region for scheduled threads' mappings is full; the kernel places the rest");
+            crate::report::log(
+                "the region for scheduled threads' mappings is full; the kernel places the rest",
+            );
         }
         return None;
     }
@@ -264,7 +268,9 @@ pub unsafe extern "C" fn my_shmdt(addr: *const c_void) -> i32 {
 pub unsafe extern "C" fn my_madvise(addr: *mut c_void, len: usize, advice: i32) -> i32 {
     let rc = libc::madvise(addr, len, advice);
     let err = if rc == 0 { 0 } else { *libc::__error() };
-    crate::sched::diag_point(0xD1A6_0000_0000_0100 | ((advice as u64 & 0xFF) << 8) | (err as u64 & 0xFF));
+    crate::sched::diag_point(
+        0xD1A6_0000_0000_0100 | ((advice as u64 & 0xFF) << 8) | (err as u64 & 0xFF),
+    );
     rc
 }
 
@@ -288,7 +294,14 @@ pub unsafe extern "C" fn my_mmap(
         }
         let rounded = round_up(len as u64);
         if let Some(at) = take(rounded) {
-            let p = libc::mmap(at as *mut c_void, len, prot, flags | libc::MAP_FIXED, fd, offset);
+            let p = libc::mmap(
+                at as *mut c_void,
+                len,
+                prot,
+                flags | libc::MAP_FIXED,
+                fd,
+                offset,
+            );
             if p != libc::MAP_FAILED {
                 PLACED.fetch_add(1, Ordering::Relaxed);
                 return p;

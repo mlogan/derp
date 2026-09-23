@@ -825,10 +825,10 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
     // A deadline of 0 would mean none; one in the past expires at once
     s.threads[me].deadline = deadline.map_or(0, |d| d.max(1));
     let handoff = s.hand_off(Some((me, st, key)), site);
-    let after = After::of(&mut s, handoff);
+    let after = After::of(&mut s, handoff, me, site);
     let stuck = state != State::Exited || s.any_alive();
     drop(s);
-    if after.carry_out(sh, me, state, site) || !stuck {
+    if after.carry_out(sh, me, state) || !stuck {
         return;
     }
 
@@ -850,9 +850,9 @@ pub fn yield_baton_as(me: usize, state: State, site: u64, deadline: Option<u64>)
         sh.exit_if_orphaned();
         let mut s = sh.lock();
         let handoff = s.choose(Some(me), site);
-        let after = After::of(&mut s, handoff);
+        let after = After::of(&mut s, handoff, me, site);
         drop(s);
-        if after.carry_out(sh, me, state, site) {
+        if after.carry_out(sh, me, state) {
             return;
         }
         if real_now_ns().saturating_sub(began) > 30_000_000_000 {
@@ -892,8 +892,6 @@ fn describe_blocked() {
 struct After {
     handoff: Handoff,
     quantum: i64,
-    issued: u64,
-    clock: u64,
     /// The hand-off crashed this process
     crashed_self: bool,
     /// Something is due when the baton is next taken up: a crashed process
@@ -902,26 +900,31 @@ struct After {
 }
 
 impl After {
-    fn of(s: &mut shared::State, handoff: Handoff) -> After {
+    /// Traced here, under the lock: the next holder may take the baton up
+    /// as soon as the lock is dropped (one polling in the idle loop need
+    /// not be unparked) and would trace its own switch first.
+    fn of(s: &mut shared::State, handoff: Handoff, me: usize, site: u64) -> After {
+        match handoff {
+            // A quantum ended here, switch or not, and masking this site
+            // would move the run
+            Handoff::Stay => trace_switch(me, me, s.issued, site, s.clock_ns),
+            Handoff::Switch { to, .. } => trace_switch(me, to, s.issued, site, s.clock_ns),
+            Handoff::Idle => {}
+        }
         After {
             handoff,
             quantum: s.pending_quantum,
-            issued: s.issued,
-            clock: s.clock_ns,
             crashed_self: s.procs[pid() as usize].killed,
             unsettled: signal_crashed(s) || s.procs[pid() as usize].child_deaths > 0,
         }
     }
 
     /// Returns false when the run was idle and the caller has to wait.
-    fn carry_out(self, sh: &Shared, me: usize, state: State, site: u64) -> bool {
+    fn carry_out(self, sh: &Shared, me: usize, state: State) -> bool {
         match self.handoff {
             Handoff::Idle if self.crashed_self => die(),
             Handoff::Idle => false,
             Handoff::Stay => {
-                // Traced too: a quantum ended here, switch or not, and
-                // masking this site would move the run
-                trace_switch(me, me, self.issued, site, self.clock);
                 die_if_stopped();
                 if self.unsettled {
                     take_up_baton(sh);
@@ -932,7 +935,6 @@ impl After {
                 true
             }
             Handoff::Switch { to, seen } => {
-                trace_switch(me, to, self.issued, site, self.clock);
                 sh.unpark(to);
                 // Our own crash comes after the baton is safely elsewhere
                 if self.crashed_self {

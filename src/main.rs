@@ -369,6 +369,31 @@ fn stderr_file(scratch: &Path, index: usize) -> PathBuf {
     scratch.join(format!("stderr.{index}"))
 }
 
+/// The run file's `allow:` entries as the supervisor compares them: as
+/// text, against paths with `/private` taken off `/tmp`, `/var` and
+/// `/etc`. A relative entry is next to the run file, like `argv[0]`, and
+/// is resolved through symlinks, since guests name the target.
+fn allowed_paths(base: &Path, allow: &[String]) -> Fallible<Vec<String>> {
+    allow
+        .iter()
+        .map(|entry| {
+            if entry.starts_with('/') {
+                return Ok(entry.clone());
+            }
+            let path = std::fs::canonicalize(base.join(entry))
+                .map_err(|e| format!("allow: {entry}: {e}"))?;
+            let text = path.to_string_lossy().into_owned();
+            let public = text.strip_prefix("/private").filter(|rest| {
+                ["/tmp", "/var", "/etc"].iter().any(|d| {
+                    rest.strip_prefix(d)
+                        .is_some_and(|r| r.is_empty() || r.starts_with('/'))
+                })
+            });
+            Ok(public.map_or(text.clone(), str::to_string))
+        })
+        .collect()
+}
+
 /// Start the manifest's processes under one scheduler. With `capture`,
 /// each guest's stdout goes to `stdout.<index>` in the scratch directory.
 fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallible<RunOutcome> {
@@ -387,6 +412,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
             cached_rewrite(&prog, &cli.opts)?
         });
     }
+    let allow = allowed_paths(base, &m.allow)?;
     prepare_scratch(scratch)?;
     let scratch = std::fs::canonicalize(scratch)?;
     let roots = rewrite::hostdir::prepare(&scratch, base, &m.hosts)?;
@@ -416,7 +442,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
             ];
             let policy = vec![
                 (rewrite::shared::HOST_ROOT_VAR.to_string(), text(root)),
-                (rewrite::shared::ALLOW_VAR.to_string(), m.allow.join(":")),
+                (rewrite::shared::ALLOW_VAR.to_string(), allow.join(":")),
             ];
             let env = layered(&[&fixed, &passed, &host_env, &m.env, &p.env, &policy]);
             Guest {

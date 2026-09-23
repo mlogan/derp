@@ -231,7 +231,7 @@ Recorded, not fixed:
   peer is outside the run is not woken by the outside ones.
 - ~~A process that dies holding the shared spinlock wedges the run.~~ The
   lock names its owner and is taken over from a dead one
-  (`TASKS_SUSPECTS.md`, `TASKS_REVIEW2.md`).
+  (`TASKS_SUSPECTS.md`).
 - Per-process hook counts are wrong when an outside thread expires the
   quantum, and across `execve` (report only).
 - Wake keys are per process: process-shared mutexes and condition variables

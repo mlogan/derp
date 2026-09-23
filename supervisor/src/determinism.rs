@@ -220,7 +220,9 @@ pub unsafe extern "C" fn my_setitimer(
     if which != libc::ITIMER_REAL || outside() || new.is_null() {
         return libc::setitimer(which, new, old);
     }
-    let ns = |tv: libc::timeval| (tv.tv_sec.max(0) as u64) * 1_000_000_000 + (tv.tv_usec.max(0) as u64) * 1000;
+    let ns = |tv: libc::timeval| {
+        (tv.tv_sec.max(0) as u64) * 1_000_000_000 + (tv.tv_usec.max(0) as u64) * 1000
+    };
     let value = ns((*new).it_value);
     let interval = ns((*new).it_interval);
     let Some(now) = crate::sched::peek_clock() else {
@@ -256,7 +258,11 @@ pub unsafe extern "C" fn my_getitimer(which: c_int, cur: *mut libc::itimerval) -
     let (left, interval) = crate::sched::with(|s, pid| {
         let p = &s.procs[pid as usize];
         (
-            if p.alarm_at == 0 { 0 } else { p.alarm_at.saturating_sub(now) },
+            if p.alarm_at == 0 {
+                0
+            } else {
+                p.alarm_at.saturating_sub(now)
+            },
             p.alarm_interval,
         )
     })

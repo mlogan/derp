@@ -50,7 +50,7 @@ directory and point `PYTHONPATH` at it.
   runtime's goroutine stacks, signal-based preemption, kqueue polling
   and counter-based spin waits are all covered. Support is partial: the
   output repeats, the schedule hash takes one of two values (one quantum
-  ends one hook apart), which `TASKS_EXAMPLES.md` records with the next
+  ends one hook apart), which `tracking/TASKS_EXAMPLES.md` records with the next
   steps; set aside for now.
 
 ## Limits worth knowing

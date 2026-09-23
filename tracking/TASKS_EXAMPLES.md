@@ -85,8 +85,8 @@ Plan: `IMPLEMENTATION_PLAN_EXAMPLES.md`. Branch `mlogan-examples`.
   does. Go's `procyield` spins on `cntvct_el0`, which the counter site
   makes virtual.
 - `a_reseeded_run_is_the_plain_run_until_the_reseed` failed once in four
-  full-suite runs (a reseeded run did not repeat), as `TASKS_REVIEW2.md`
-  records once before; not reproduced alone.
+  full-suite runs (a reseeded run did not repeat), as the review of
+  PRs #4 to #10 recorded once before; not reproduced alone.
 
 ## Go: set aside, and where to pick it up
 

@@ -102,3 +102,5 @@ rewriter hooked (chosen before the run).
   reference that deadlocks cannot be bisected (its report is not printed).
 - A gradual step (several contributing events) is reported as one
   interval; read the probe table.
+- The random streams restart after `execve` (review of PRs #4 to #10,
+  finding A8): recorded, not fixed.

@@ -515,10 +515,12 @@ extern "C" {
 }
 
 static RANGE: SpinLock<Option<(usize, usize)>> = SpinLock::new(None);
+static ALLOCATOR: SpinLock<Option<(usize, usize)>> = SpinLock::new(None);
 
 /// In the child of a `fork`: see `SpinLock::force_unlock`.
 pub fn forked() {
     RANGE.force_unlock();
+    ALLOCATOR.force_unlock();
     INHERIT.force_unlock();
 }
 
@@ -533,6 +535,41 @@ pub fn in_system_library(address: usize) -> bool {
         let mut len = 0usize;
         let start = unsafe { _dyld_get_shared_cache_range(&raw mut len) };
         (start as usize, len)
+    });
+    address >= start && address - start < len
+}
+
+extern "C" {
+    fn _dyld_image_count() -> u32;
+    fn _dyld_get_image_name(i: u32) -> *const std::ffi::c_char;
+    fn _dyld_get_image_header(index: u32) -> *const u32;
+    fn getsegmentdata(
+        mhp: *const u8,
+        segname: *const std::ffi::c_char,
+        size: *mut libc::c_ulong,
+    ) -> *mut u8;
+}
+
+/// Whether `address` is code of the system allocator, `libsystem_malloc`.
+pub fn in_system_allocator(address: usize) -> bool {
+    if !in_system_library(address) {
+        return false;
+    }
+    let mut range = ALLOCATOR.lock();
+    let (start, len) = *range.get_or_insert_with(|| unsafe {
+        for i in 0.._dyld_image_count() {
+            let name = std::ffi::CStr::from_ptr(_dyld_get_image_name(i)).to_bytes();
+            if name.ends_with(b"/libsystem_malloc.dylib") {
+                let mut size: libc::c_ulong = 0;
+                let text = getsegmentdata(
+                    _dyld_get_image_header(i).cast(),
+                    c"__TEXT".as_ptr(),
+                    &raw mut size,
+                );
+                return (text as usize, size as usize);
+            }
+        }
+        (0, 0)
     });
     address >= start && address - start < len
 }

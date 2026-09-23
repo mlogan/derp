@@ -362,6 +362,34 @@ pub extern "C" fn my_mach_absolute_time() -> u64 {
     monotonic_ns() * 3 / 125
 }
 
+extern "C" {
+    pub fn rewrite_mach_absolute_time_shim();
+}
+
+// The link register is the caller's return address; the tail call keeps it.
+std::arch::global_asm!(
+    ".globl _rewrite_mach_absolute_time_shim",
+    ".p2align 2",
+    "_rewrite_mach_absolute_time_shim:",
+    "mov x0, x30",
+    "b _rewrite_mach_absolute_time_impl",
+);
+
+/// The system allocator reads the time for its own bookkeeping (`free`
+/// does), as often as its heap's state says, and GCD workers shape that
+/// state in real time: CoreFoundation's allocations on a scheduled thread
+/// ticked the clock once more or less from run to run. Such a read sees
+/// the clock and does not move it.
+#[no_mangle]
+pub extern "C" fn rewrite_mach_absolute_time_impl(caller: usize) -> u64 {
+    if crate::sched::on_scheduled_thread() && crate::process::in_system_allocator(caller) {
+        if let Some(now) = crate::sched::peek_clock() {
+            return (MONOTONIC_BASE_NS + now) * 3 / 125;
+        }
+    }
+    my_mach_absolute_time()
+}
+
 pub extern "C" fn my_mach_continuous_time() -> u64 {
     monotonic_ns() * 3 / 125
 }

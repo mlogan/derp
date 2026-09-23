@@ -420,6 +420,13 @@ closes a source of nondeterminism adds an item here.
   nothing can run.
 - *Threads outside the schedule advanced the virtual clock when they read
   it*: they see the clock but do not move it.
+- *The system allocator's own time reads moved the clock*: libsystem_malloc
+  reads `mach_absolute_time` in `free` as often as its heap's state says,
+  and GCD workers shape that state in real time. CoreFoundation freeing
+  on a scheduled thread (the Security framework loading certificates in
+  sui-node) ticked the clock once more or less, and a Sui cluster parted
+  within two virtual seconds on five runs in six. A read whose caller is
+  in libsystem_malloc sees the clock and does not move it.
 - *`gettimeofday` left its time-zone argument unfilled*: Redis takes its
   zone from it and logged dates in 1970. It is filled with UTC.
 - *Reading `CNTVCT_EL0` returns the CPU's real-time counter*: the `mrs`

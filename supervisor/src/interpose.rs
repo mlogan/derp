@@ -16,7 +16,8 @@ use crate::alloc::{
 use crate::determinism::{
     my_alarm, my_arc4random, my_arc4random_buf, my_arc4random_uniform, my_cc_random_generate_bytes,
     my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_getitimer, my_getrusage,
-    my_gettimeofday, my_mach_absolute_time, my_mach_continuous_time, my_setitimer, my_time,
+    my_gettimeofday, my_mach_continuous_time, my_setitimer, my_time,
+    rewrite_mach_absolute_time_shim,
 };
 use crate::files::{
     my_flock, my_fsync, my_lseek, my_pread, my_pwrite, my_shm_unlink, open_nocancel,
@@ -1054,6 +1055,6 @@ interposers! {
     my_clock_gettime_nsec_np => clock_gettime_nsec_np,
     my_gettimeofday => libc::gettimeofday,
     my_time => libc::time,
-    my_mach_absolute_time => mach_absolute_time,
+    rewrite_mach_absolute_time_shim => mach_absolute_time,
     my_mach_continuous_time => mach_continuous_time,
 }

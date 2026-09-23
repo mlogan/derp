@@ -1162,7 +1162,10 @@ fn a_server_that_keeps_crashing_is_restarted_and_the_client_reconnects() {
     let manifest = dir.join("server.yaml");
     std::fs::write(
         &manifest,
-        r"hosts:
+        // The client pings until the stop, past every crash however fast
+        // the clock runs
+        r"stop-after: 3s
+hosts:
   - name: server
     processes:
       - argv: [ping_pong, pong, 7000]
@@ -1172,7 +1175,7 @@ fn a_server_that_keeps_crashing_is_restarted_and_the_client_reconnects() {
         crash: { every: 100ms..300ms, times: 3 }
   - name: client
     processes:
-      - ping_pong ping server 7000 120
+      - ping_pong ping server 7000 0
 ",
     )
     .unwrap();
@@ -1182,13 +1185,18 @@ fn a_server_that_keeps_crashing_is_restarted_and_the_client_reconnects() {
         let r = run_manifest(&manifest, &scratch, seed, 2);
         let (indices, lives) = pongs(&r.stdout[1]);
         // Every ping answered once, in order, by lives 1 to 4 in turn
-        assert_eq!(indices, (0..120).collect::<Vec<u32>>(), "seed {seed}");
+        assert!(indices.len() > 100, "seed {seed}: {} pongs", indices.len());
+        assert_eq!(
+            indices,
+            (0..indices.len() as u32).collect::<Vec<u32>>(),
+            "seed {seed}"
+        );
         assert!(
             lives.windows(2).all(|w| w[0] <= w[1]),
             "seed {seed}: {lives:?}"
         );
-        assert_eq!((lives[0], lives[119]), (1, 4), "seed {seed}");
-        assert!(r.stdout[1].ends_with("client life 1 done: 120 pongs, 3 reconnects\n"));
+        assert_eq!((lives[0], lives[lives.len() - 1]), (1, 4), "seed {seed}");
+        assert_eq!(r.fields["p1.status"], "stopped");
         assert_eq!(
             r.stdout[0],
             "server life 1 is up\nserver life 2 is up\nserver life 3 is up\nserver life 4 is up\n"
@@ -1326,14 +1334,15 @@ fn a_client_that_crashes_resumes_from_what_it_wrote_down() {
     let manifest = dir.join("client.yaml");
     std::fs::write(
         &manifest,
-        r"hosts:
+        r"stop-after: 2s
+hosts:
   - name: server
     processes:
       - argv: [ping_pong, pong, 7000]
         daemon: true
   - name: client
     processes:
-      - argv: [ping_pong, ping, server, 7000, 120]
+      - argv: [ping_pong, ping, server, 7000, 0]
         restart: on-failure
         restart-delay: 200ms
         crash: { every: 150ms..250ms, times: 2 }
@@ -1348,18 +1357,22 @@ fn a_client_that_crashes_resumes_from_what_it_wrote_down() {
         // none may be missing.
         let (mut indices, _) = pongs(&r.stdout[1]);
         indices.dedup();
-        assert_eq!(indices, (0..120).collect::<Vec<u32>>(), "seed {seed}");
+        assert!(indices.len() > 100, "seed {seed}: {} pongs", indices.len());
+        assert_eq!(
+            indices,
+            (0..indices.len() as u32).collect::<Vec<u32>>(),
+            "seed {seed}"
+        );
         assert_eq!(
             r.stdout[1].matches(" resumes at ping ").count(),
             2,
             "seed {seed}"
         );
-        assert!(r.stdout[1].ends_with("client life 3 done: 120 pongs, 0 reconnects\n"));
         assert_eq!(r.u64("run.crashes_injected"), 2);
         assert_eq!(r.u64("run.restarts"), 2);
-        // The run's verdict is the last life's: it succeeded
+        // The run's verdict is the last life's: stopped, not failed
         assert_eq!(r.fields["p1.status"], "signal 9");
-        assert_eq!(r.fields["p3.status"], "exit 0");
+        assert_eq!(r.fields["p3.status"], "stopped");
         let again = run_manifest(&manifest, &scratch, seed, 2);
         assert_eq!(again.stdout, r.stdout, "seed {seed} not repeatable");
         assert_eq!(
@@ -1384,7 +1397,7 @@ fn restarts_stop_where_the_run_file_says() {
             &manifest,
             format!(
                 "hosts:\n  - name: server\n    processes:\n      - argv: [ping_pong, pong, 7000]\n        daemon: true\n\
-                 \x20 - name: client\n    processes:\n      - argv: [ping_pong, ping, server, 7000, 100000]\n\
+                 \x20 - name: client\n    processes:\n      - argv: [ping_pong, ping, server, 7000, 0]\n\
                  \x20       {policy}\n        crash: {{ every: 100ms }}\n"
             ),
         )
@@ -1397,7 +1410,7 @@ fn restarts_stop_where_the_run_file_says() {
             .output()
             .unwrap();
         let err = String::from_utf8_lossy(&out.stderr);
-        // The client never finishes its 100,000 pings: its last life crashed
+        // The client pings forever: its last life crashed
         assert!(!out.status.success(), "{policy}: {err}");
         assert!(
             err.contains(&format!("run.crashes_injected={crashes}\n")),
@@ -1722,9 +1735,9 @@ fn the_switch_cost_is_what_a_hand_off_adds_to_the_clock() {
     };
     let scratch = dir.join("scratch");
     write("");
-    let slow = run_manifest(&manifest, &scratch, 1, 1);
-    let fast = run_manifest_with(&manifest, &scratch, 1, 1, &["--switch-cost", "10us"]);
-    write("switch-cost: 10us\n");
+    let fast = run_manifest(&manifest, &scratch, 1, 1);
+    let slow = run_manifest_with(&manifest, &scratch, 1, 1, &["--switch-cost", "1ms"]);
+    write("switch-cost: 1ms\n");
     let from_file = run_manifest(&manifest, &scratch, 1, 1);
     assert_eq!(slow.stdout, fast.stdout);
     assert_eq!(slow.u64("run.switches"), fast.u64("run.switches"));
@@ -1742,7 +1755,7 @@ fn the_switch_cost_is_what_a_hand_off_adds_to_the_clock() {
     );
     assert_eq!(
         from_file.fields["run.schedule_hash"],
-        fast.fields["run.schedule_hash"]
+        slow.fields["run.schedule_hash"]
     );
 }
 

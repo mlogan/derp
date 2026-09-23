@@ -1,7 +1,7 @@
 // A client and a server that survive each other's crashes.
 //
 //   ping_pong pong <port>
-//   ping_pong ping <host> <port> <count>
+//   ping_pong ping <host> <port> <count>    (0: until the run is stopped)
 //
 // The server counts its lives in a file in its host directory and says
 // which life answered. The client keeps its progress in a file, so a
@@ -103,7 +103,7 @@ static int ping(const char *host, const char *port, long count) {
     long life = bump("client_lives", 1);
     if (life > 1) printf("client life %ld resumes at ping %ld\n", life, next);
     int fd = dial(host, port), reconnects = 0;
-    while (next < count) {
+    while (count == 0 || next < count) {
         char line[96];
         int len = snprintf(line, sizeof line, "ping %ld\n", next);
         if (write(fd, line, (size_t)len) != len || read_line(fd, line, sizeof line) < 0) {
@@ -112,6 +112,7 @@ static int ping(const char *host, const char *port, long count) {
             fd = dial(host, port);
             reconnects++;
             printf("server was out of reach for %lld ms\n", now_ms() - lost);
+            fflush(stdout);
             continue;  // the same ping again
         }
         fputs(line, stdout);

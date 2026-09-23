@@ -21,22 +21,21 @@ as are eight runs stopped at 2 s.
 1. **The gas key's address.** `sui keytool --keystore-path X list`
    listed a key from `~/.sui`, not X; the address in the genesis was
    that key's. The committed `sui.keystore` belongs to `0x9b1b…3481`.
-2. **Long quanta.** At the default quantum each 1000..10000 hooks cost a
-   millisecond of virtual time: four validators in one `sui start`
-   executed 38 checkpoints in 200 virtual seconds, stalled on a
-   settlement transaction's effects, against 438 in 100 s natively.
-   `quantum: 100000..1000000` gave 758, no stalls.
-3. **`switch-cost`.** With long quanta alone the fullnodes ran at half
-   the validators' pace (checkpoint 450 against 1050) with a sixth of
-   their hooks: waiting, not computing. Every hand-off cost 1 ms and
-   state sync is a chain of round trips; stress's transactions timed
-   out waiting for checkpoints. `switch-cost: 50us` (new; default 1 ms)
-   keeps every node together.
-4. **Relative `allow:` entries.** stress builds Move packages from the
+2. **Cheap hand-offs.** Every hand-off, quantum expiries included, cost
+   a millisecond of virtual time, and all threads share one clock: four
+   validators in one `sui start` executed 38 checkpoints in 200 virtual
+   seconds, stalled on a settlement transaction's effects, against 438
+   in 100 s natively. Longer quanta helped the validators, but the
+   fullnodes, waiting on chains of round trips, ran at half their pace
+   and stress's transactions timed out. A hand-off now costs 10 µs by
+   default (`switch-cost` changes it); the run file sets no timing and
+   every node keeps together. Code timing its own work finds it very
+   fast: this is not a simulation of real-time bounds.
+3. **Relative `allow:` entries.** stress builds Move packages from the
    checkout at paths compiled in; `allow: [sui-src]` with run.sh's link
    to the checkout lets it (relative entries are resolved next to the
    run file, through symlinks).
-5. **The system allocator's clock reads.** Runs parted within two
+4. **The system allocator's clock reads.** Runs parted within two
    virtual seconds on five in six, a thread's clock one or two
    microseconds apart at the same hook count. Logging each clock read's
    callers showed `_xzm_free` in libsystem_malloc, under CoreFoundation's

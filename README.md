@@ -31,11 +31,13 @@ Options worth knowing:
   upward in the order listed and are reachable by name. `--net-latency 5ms`
   delays traffic between different hosts in virtual time.
 - `--switch-cost 50us` (`switch-cost:` in the run file) is how far each
-  baton hand-off moves the virtual clock; the default is 1ms, and a clock
-  read moves it 1µs. In a run of many threaded servers (the Sui cluster in
-  `examples/sui`) hand-offs are most of the clock: at 1ms a fullnode
-  that waits on a chain of messages falls behind the validators and the
-  programs' own timeouts fire; at 50µs it keeps up. Run-file runs only.
+  baton hand-off moves the virtual clock, quantum expiries included; the
+  default is 10µs, and a clock read moves it 1µs. Threads run one at a
+  time on one clock, so the cost is kept low: at 1ms, the old default, a
+  Sui cluster of seven processes and hundreds of threads (`examples/sui`)
+  got so little done per virtual second that its own timeouts fired. The
+  price is that code timing its own work finds it very fast. Only a
+  run-file run can change it.
 - `--stop-after 30s` ends the run at that virtual time: whatever still
   runs is killed at that point of the schedule, reported as `stopped`,
   and does not fail the run. For servers that never exit by themselves,
@@ -65,7 +67,7 @@ quantum: 1000..10000
 heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
-switch-cost: 1ms         # virtual time a baton hand-off costs (the default)
+switch-cost: 10us        # virtual time a baton hand-off costs (the default)
 stop-after: 30s          # the run is over at this virtual time (default: never)
 wall-limit: 60s          # or at this real time, native runs included
 outside-network: refuse  # or allow: connections and name lookups beyond the
@@ -416,7 +418,7 @@ closes a source of nondeterminism adds an item here.
 - *Clock reads return real time*: `clock_gettime`, `gettimeofday`, `time`,
   `mach_absolute_time`, `mach_continuous_time` and
   `clock_gettime_nsec_np` return a virtual clock that advances 1 µs per
-  read and 1 ms per baton switch, and jumps to the next deadline when
+  read and 10 µs per baton switch, and jumps to the next deadline when
   nothing can run.
 - *Threads outside the schedule advanced the virtual clock when they read
   it*: they see the clock but do not move it.

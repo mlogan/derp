@@ -54,7 +54,7 @@ options:
                                        messages about it
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
-  --switch-cost T                      virtual time each baton hand-off costs (default 1ms)
+  --switch-cost T                      virtual time each baton hand-off costs (default 10us)
   --stop-after T                       the run is over at this virtual time: what still runs
                                        is killed there, reported as stopped, and does not
                                        fail the run (for servers that never exit)
@@ -66,7 +66,7 @@ run file:
   quantum: 1000..10000
   mem-hook-rate: 1/16
   net-latency: 5ms
-  switch-cost: 1ms
+  switch-cost: 10us
   heap-size: 32G
   stop-after: 30s
   wall-limit: 60s

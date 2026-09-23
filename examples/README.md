@@ -60,9 +60,7 @@ directory and point `PYTHONPATH` at it.
   `rewrite cargo`, makes the genesis natively once (`sui/genesis.py`,
   into `sui/cluster/`), and runs `sui/run.yaml`; extra arguments go to
   `rewrite run`. The run ends when stress has run its minute of
-  workload. Hand-offs are cheap in this run file (`switch-cost: 50us`)
-  and quanta long: at the defaults the nodes' own timeouts fire before
-  work completes. `tracking/TASKS_SUI_CLUSTER.md` has the numbers.
+  workload. `tracking/TASKS_SUI_CLUSTER.md` has the numbers.
 
 ## Limits worth knowing
 

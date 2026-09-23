@@ -1,3 +1,6 @@
 .venv/
 postgres/data/
 postgres/initdb.log
+sui/bin/
+sui/cluster/
+sui/scratch/

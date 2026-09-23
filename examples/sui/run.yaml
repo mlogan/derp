@@ -1,0 +1,95 @@
+# A Sui cluster after sui-operations' Antithesis test
+# (docker/sui-antithesis/docker-compose-antithesis.yaml): four validators,
+# a fullnode, an observer fullnode following validator1's consensus, and
+# the stress client sending transactions through the fullnode. Each node
+# is a host of its own, reachable by its compose name. Start it with
+# ./run.sh, which builds the binaries, makes the genesis (cluster/) and
+# links them into bin/.
+seed: 1
+stop-after: 10m          # the stress client normally ends the run first
+env:
+  RUST_BACKTRACE: 1
+  RUST_LOG: info
+  TH_FRAG_SIZE: 8388608
+  RPC_WORKER_THREAD: 12
+  NEW_CHECKPOINT_WARNING_TIMEOUT_MS: 30000
+  NEW_CHECKPOINT_PANIC_TIMEOUT_MS: 300000
+  TOKIO_WORKER_THREADS: 4
+hosts:
+  - name: validator1
+    files: [cluster/validator1/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        env: { ENABLE_WRITEBACK_CACHE: 1, SUI_DB_SYNC_TO_DISK: true }
+        daemon: true
+        restart: on-failure
+  - name: validator2
+    files: [cluster/validator2/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        env: { ENABLE_WRITEBACK_CACHE: 1, SUI_DB_SYNC_TO_DISK: true }
+        daemon: true
+        restart: on-failure
+  - name: validator3
+    files: [cluster/validator3/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        env: { DISABLE_WRITEBACK_CACHE: 1, SUI_DB_SYNC_TO_DISK: true }
+        daemon: true
+        restart: on-failure
+  - name: validator4
+    files: [cluster/validator4/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        env: { DISABLE_WRITEBACK_CACHE: 1, SUI_DB_SYNC_TO_DISK: true }
+        daemon: true
+        restart: on-failure
+  - name: fullnode1
+    files: [cluster/fullnode1/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        env: { ENABLE_WRITEBACK_CACHE: 1 }
+        daemon: true
+        restart: on-failure
+  - name: observer-fullnode1
+    files: [cluster/observer-fullnode1/node.yaml, cluster/genesis.blob]
+    processes:
+      - argv: [bin/sui-node, --config-path, node.yaml]
+        env: { ENABLE_WRITEBACK_CACHE: 1 }
+        daemon: true
+        restart: on-failure
+  # The compose file's entrypoint polls the fullnode with curl before
+  # starting stress; here stress fails until the fullnode answers and is
+  # restarted, and it ends after a minute of its workload.
+  - name: stress
+    files: [cluster/genesis.blob, sui.keystore]
+    processes:
+      - argv: [bin/stress,
+               --staggered-start-max-multiplier, 0,
+               --fullnode-rpc-addresses, "fullnode1:9000",
+               --use-fullnode-for-execution, true,
+               --num-client-threads, 24,
+               --num-server-threads, 1,
+               --num-transfer-accounts, 2,
+               --primary-gas-owner-id, "0xb31eb4047829179fd9938b05622c197d01e4ea03ab822773a6ced0a541795d44",
+               --genesis-blob-path, genesis.blob,
+               --keystore-path, sui.keystore,
+               --benchmark-stats-path, bench_result.json,
+               --run-duration, 60s,
+               bench,
+               --target-qps, 15,
+               --in-flight-ratio, 30,
+               --shared-counter, 2,
+               --transfer-object, 2,
+               --randomness, 5,
+               --delegation, 0,
+               --randomized-transaction, 5,
+               --batch-payment, 1,
+               --batch-payment-size, 15,
+               --adversarial, 0,
+               --composite, 5,
+               --client-metric-host, 0.0.0.0,
+               --num-workers, 24]
+        restart: on-failure
+        restart-delay: 10s
+        max-restarts: 30

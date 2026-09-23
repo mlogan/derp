@@ -8,6 +8,9 @@
 # directory (default examples/sui/scratch: host directories, stdout.N and
 # stderr.N per process), SUI_CARGO_FLAGS extra flags for the build (such
 # as --no-default-features, for the system allocator and a seeded heap).
+# TIDEHUNTER=1 builds the nodes on tidehunter instead of RocksDB, into a
+# target directory of their own: the two stores' databases are not
+# compatible.
 set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -23,15 +26,22 @@ if [[ ${1:-} == --regenesis ]]; then
     shift
 fi
 
-(cd "$derp" && cargo build --release)
+(cd "$derp" && cargo build --release --workspace)
 rewrite=$derp/target/release/rewrite
 
+target=$sui_dir/target
+flags=${SUI_CARGO_FLAGS:-}
+if [[ ${TIDEHUNTER:-} == 1 ]]; then
+    export USE_TIDEHUNTER=1
+    target=$sui_dir/target/tidehunter
+    flags="$flags --features typed-store/tidehunter"
+fi
 # shellcheck disable=SC2086
-(cd "$sui_dir" && "$rewrite" cargo build --release ${SUI_CARGO_FLAGS:-} \
+(cd "$sui_dir" && CARGO_TARGET_DIR=$target "$rewrite" cargo build --release $flags \
     --bin sui-node --bin stress --bin sui)
 mkdir -p "$here/bin"
 for prog in sui-node stress sui; do
-    ln -sf "$sui_dir/target/release/$prog" "$here/bin/$prog"
+    ln -sf "$target/release/$prog" "$here/bin/$prog"
 done
 ln -sfn "$sui_dir" "$here/sui-src"
 

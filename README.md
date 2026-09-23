@@ -151,7 +151,10 @@ under the host's directory, under a system location (`/usr`, `/etc`, `/dev`,
 `/opt/homebrew`, ...), or under one of the run file's top-level `allow:`
 entries; anything else fails with `EACCES` and is logged with the host, the
 call and the path. Asking about the directories above the host's (`stat`,
-`access`) is allowed; opening them is not.
+`access`) is allowed; opening them is not. A relative `allow:` entry is
+next to the run file, like a program, and is followed through symlinks:
+`allow: [src]`, with `src` a link to a checkout whose path a program has
+built in, lets every host read that checkout wherever it is.
 
 This guards against configurations that would let hosts share files by
 accident, such as an absolute path into another host's directory or a

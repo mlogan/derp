@@ -1706,6 +1706,38 @@ fn a_wall_limit_ends_a_native_run_and_cpu_time_is_reported() {
     assert!(err.contains("cpu_system_ns="), "{err}");
 }
 
+/// A relative `allow:` entry names a path next to the run file, resolved
+/// through symlinks: guests name the target, not the link.
+#[test]
+fn a_relative_allow_entry_is_resolved_from_the_run_file() {
+    let dir = common::scratch_dir("multiproc_allow");
+    common::build_c("readfile", &dir, &[]);
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("data.txt"), "from outside\n").unwrap();
+    let link = dir.join("link");
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    let target = std::fs::canonicalize(outside.join("data.txt")).unwrap();
+    let manifest = dir.join("allow.yaml");
+    let write = |allow: &str| {
+        std::fs::write(
+            &manifest,
+            format!(
+                "{allow}hosts:\n  - name: a\n    processes:\n      - [readfile, {}]\n",
+                target.display()
+            ),
+        )
+        .unwrap();
+    };
+    write("");
+    let r = run_manifest(&manifest, &dir.join("scratch"), 1, 1);
+    assert_eq!(r.stdout[0], "refused\n");
+    write("allow: [link]\n");
+    let r = run_manifest(&manifest, &dir.join("scratch"), 1, 1);
+    assert_eq!(r.stdout[0], "read from outside\n");
+}
+
 /// Unless the run file says `outside-network: allow`, a name the run does
 /// not know and an address beyond the virtual network are unreachable, the
 /// same way every run; a numeric address needs no lookup.

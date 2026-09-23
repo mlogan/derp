@@ -6,7 +6,16 @@
 # ./run.sh, which builds the binaries, makes the genesis (cluster/) and
 # links them into bin/.
 seed: 1
-stop-after: 10m          # the stress client normally ends the run first
+# Hand-offs are most of the virtual clock here. At the defaults (a quantum
+# of 1000..10000 hooks, 1ms per hand-off) the cluster gets so little done
+# per virtual second that sui's timeouts fire and execution stalls; with
+# only the larger quantum the fullnodes still fall behind the validators.
+quantum: 100000..1000000
+switch-cost: 50us
+stop-after: 600s         # the stress client normally ends the run first
+# stress builds Move packages from the sui checkout, at paths fixed when it
+# was compiled; sui-src is run.sh's link to the checkout.
+allow: [sui-src]
 env:
   RUST_BACKTRACE: 1
   RUST_LOG: info
@@ -71,7 +80,7 @@ hosts:
                --num-client-threads, 24,
                --num-server-threads, 1,
                --num-transfer-accounts, 2,
-               --primary-gas-owner-id, "0xb31eb4047829179fd9938b05622c197d01e4ea03ab822773a6ced0a541795d44",
+               --primary-gas-owner-id, "0x9b1b191f7df4f55c0f73e7638606ca4029fd52a2735b98f2d5674038affe3481",
                --genesis-blob-path, genesis.blob,
                --keystore-path, sui.keystore,
                --benchmark-stats-path, bench_result.json,

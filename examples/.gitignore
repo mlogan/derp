@@ -4,3 +4,4 @@ postgres/initdb.log
 sui/bin/
 sui/cluster/
 sui/scratch/
+sui/sui-src

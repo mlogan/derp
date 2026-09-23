@@ -53,6 +53,17 @@ directory and point `PYTHONPATH` at it.
   ends one hook apart), which `tracking/TASKS_EXAMPLES.md` records with the next
   steps; set aside for now.
 
+- `sui/`: a Sui cluster after sui-operations' Antithesis compose file:
+  four validators, a fullnode, an observer fullnode and the `stress`
+  client, each on its own host. `sui/run.sh` builds `sui-node`, `stress`
+  and `sui` from a sui checkout (`SUI_DIR`, default `~/repos/sui`) with
+  `rewrite cargo`, makes the genesis natively once (`sui/genesis.py`,
+  into `sui/cluster/`), and runs `sui/run.yaml`; extra arguments go to
+  `rewrite run`. The run ends when stress has run its minute of
+  workload. Hand-offs are cheap in this run file (`switch-cost: 50us`)
+  and quanta long: at the defaults the nodes' own timeouts fire before
+  work completes. `tracking/TASKS_SUI_CLUSTER.md` has the numbers.
+
 ## Limits worth knowing
 
 Only executables are rewritten, not the dylibs they load: Python's

@@ -3,7 +3,7 @@
 # of equal stake, two-minute epochs. The gas account is sui.keystore's
 # key, made for this example.
 accounts:
-  - address: '0xb31eb4047829179fd9938b05622c197d01e4ea03ab822773a6ced0a541795d44'
+  - address: '0x9b1b191f7df4f55c0f73e7638606ca4029fd52a2735b98f2d5674038affe3481'
     gas_amounts:
       - 750000000000000000
       - 750000000000000000

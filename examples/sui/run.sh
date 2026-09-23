@@ -33,6 +33,7 @@ mkdir -p "$here/bin"
 for prog in sui-node stress sui; do
     ln -sf "$sui_dir/target/release/$prog" "$here/bin/$prog"
 done
+ln -sfn "$sui_dir" "$here/sui-src"
 
 # The genesis is made natively and kept: its keys are random, and a run
 # is only repeatable with the same ones. Make it again after rebuilding

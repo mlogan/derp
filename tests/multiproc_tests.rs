@@ -1759,6 +1759,29 @@ fn the_switch_cost_is_what_a_hand_off_adds_to_the_clock() {
     );
 }
 
+/// The Mach clock services show the run's clock: `RocksDB` mixed the real
+/// calendar clock into its DB ids this way.
+#[test]
+fn the_mach_clock_services_are_the_runs_clock() {
+    let dir = common::scratch_dir("multiproc_mach_clock");
+    common::build_c("mach_clock", &dir, &[]);
+    let manifest = dir.join("mach_clock.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts:\n  - name: a\n    processes:\n      - mach_clock\n",
+    )
+    .unwrap();
+    let r = run_manifest(&manifest, &dir.join("scratch"), 1, 1);
+    let again = run_manifest(&manifest, &dir.join("scratch"), 1, 1);
+    assert_eq!(r.stdout, again.stdout);
+    let secs = |name: &str| -> u64 {
+        let line = r.stdout[0].lines().find(|l| l.starts_with(name)).unwrap();
+        line.split([' ', '.']).nth(1).unwrap().parse().unwrap()
+    };
+    assert_eq!(secs("calendar"), 1_800_000_000, "{}", r.stdout[0]);
+    assert_eq!(secs("system"), 1, "{}", r.stdout[0]);
+}
+
 /// A relative `allow:` entry names a path next to the run file, resolved
 /// through symlinks: guests name the target, not the link.
 #[test]

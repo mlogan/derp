@@ -422,6 +422,14 @@ closes a source of nondeterminism adds an item here.
   nothing can run.
 - *Threads outside the schedule advanced the virtual clock when they read
   it*: they see the clock but do not move it.
+- *The Mach clock services returned real time*: RocksDB's `NowNanos`
+  on macOS asks `host_get_clock_service` for the calendar clock and reads
+  it with `clock_get_time`, a call to the kernel. It mixes that time into
+  the entropy for its DB ids and session ids, which key its block cache:
+  a Sui fullnode walked its cache in another order from run to run, and
+  one quantum in two million ended elsewhere. The two calls are
+  interposed; the calendar clock is the run's real time and the system
+  clock its monotonic time.
 - *The system allocator's own time reads moved the clock*: libsystem_malloc
   reads `mach_absolute_time` in `free` as often as its heap's state says,
   and GCD workers shape that state in real time. CoreFoundation freeing

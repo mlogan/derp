@@ -7,7 +7,7 @@
 //! heap-size: 32G           # address space of each guest's heap
 //! mem-hook-rate: 1/16
 //! net-latency: 5ms
-//! switch-cost: 1ms         # virtual time a baton hand-off costs
+//! switch-cost: 10us        # virtual time a baton hand-off costs
 //! allow:                   # extra paths every host may touch
 //!   - /opt/site-content
 //! env: { LOG_LEVEL: debug } # for every process; guests start from a fixed

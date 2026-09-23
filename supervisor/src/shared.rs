@@ -171,8 +171,11 @@ pub fn is_virtual_pid(pid: i32) -> bool {
 
 pub const PER_READ_NS: u64 = 1_000;
 /// What a baton hand-off costs in virtual time, unless the run says
-/// otherwise (`switch-cost`)
-pub const DEFAULT_SWITCH_NS: u64 = 1_000_000;
+/// otherwise (`switch-cost`). Threads run one at a time, so a run of
+/// hundreds of threads shares one clock: a costly hand-off makes their
+/// work slow in virtual time and fires the programs' own timeouts. Kept
+/// low, a program that times its own work finds it very fast instead.
+pub const DEFAULT_SWITCH_NS: u64 = 10_000;
 /// Key of sleeping threads: nothing wakes it but the deadline
 pub const SLEEP_KEY: u64 = 0x7FFF_FFFF_0002;
 

@@ -18,6 +18,12 @@ env:
   NEW_CHECKPOINT_WARNING_TIMEOUT_MS: 30000
   NEW_CHECKPOINT_PANIC_TIMEOUT_MS: 300000
   TOKIO_WORKER_THREADS: 4
+  # Tidehunter builds only (RocksDB ignores them): every cell of a keyspace
+  # gets a bloom filter and a value cache sized up front, and release builds
+  # give a keyspace up to 32k cells. Sui's debug builds use 16 mutexes; at
+  # the release default a tidehunter cluster held twice the memory.
+  TH_DEFAULT_MUTEX_COUNT: 16
+  TH_DEFAULT_VALUE_CACHE_SIZE: 100
 hosts:
   - name: validator1
     files: [cluster/validator1/node.yaml, cluster/genesis.blob]

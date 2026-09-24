@@ -22,7 +22,13 @@ p50 about 460 ms) and the run ends at about 143 virtual seconds.
 - Tidehunter (`TIDEHUNTER=1 run.sh`, its own target directory, 9.5 min
   to build): consensus, checkpoints and the authority tables report
   tidehunter; 60 virtual seconds take 3 min 27 s and reach checkpoint
-  237; three runs are identical.
+  237; three runs are identical. At sui's release defaults a
+  tidehunter node allocates a bloom filter (32,000 items, about 57 KB)
+  and a value cache per cell up front, with up to 32k cells a keyspace:
+  the cluster's peaks summed to 37.6 GB, fullnodes 5.8 GB each. With
+  `TH_DEFAULT_MUTEX_COUNT: 16` (sui's debug-build value) and
+  `TH_DEFAULT_VALUE_CACHE_SIZE: 100` in the run file, 18.5 GB, the same
+  as RocksDB, and 60 virtual seconds take 191 s.
 - Memory: after 60 virtual seconds validators hold about 3.3 GB each
   (validator1, which the observer follows, 6 GB), fullnodes 0.85 GB,
   and they grow with virtual time. Not RocksDB: shrinking write

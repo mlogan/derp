@@ -53,14 +53,11 @@ directory and point `PYTHONPATH` at it.
   ends one hook apart), which `tracking/TASKS_EXAMPLES.md` records with the next
   steps; set aside for now.
 
-- `sui/`: a Sui cluster after sui-operations' Antithesis compose file:
-  four validators, a fullnode, an observer fullnode and the `stress`
-  client, each on its own host. `sui/run.sh` builds `sui-node`, `stress`
-  and `sui` from a sui checkout (`SUI_DIR`, default `~/repos/sui`) with
-  `rewrite cargo`, makes the genesis natively once (`sui/genesis.py`,
-  into `sui/cluster/`), and runs `sui/run.yaml`; extra arguments go to
-  `rewrite run`. The run ends when stress has run its minute of
-  workload. `tracking/TASKS_SUI_CLUSTER.md` has the numbers.
+A Sui cluster after sui-operations' Antithesis compose file (four
+validators, two fullnodes and the `stress` client) lives in the sui
+repository, `scripts/derp/`: its `run.sh` builds the binaries with
+`rewrite cargo` from that checkout (`DERP_DIR` names this one) and runs
+its run file. `tracking/TASKS_SUI_CLUSTER.md` has the numbers.
 
 ## Limits worth knowing
 

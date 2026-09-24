@@ -8,8 +8,10 @@ sui checkout `~/repos/sui` (main, 1.74.0, release build).
 
 ## Result (2026-09-24)
 
-`examples/sui/run.sh` builds the binaries (release) with `rewrite cargo`,
-makes the genesis natively once and runs `examples/sui/run.yaml`, which
+The sui repository's `scripts/derp/run.sh` (moved there from
+`examples/sui`: too special for an example here) builds the binaries
+(release) with `rewrite cargo`, makes the genesis natively once and runs
+`scripts/derp/run.yaml`, which
 sets no timing: the defaults (quantum 1000..10000, 10 µs per hand-off).
 Stress's first life fails to reach the fullnode and is restarted; the
 second runs its minute of workload (11 tps of the 15 asked, 0% errors,
@@ -54,9 +56,9 @@ p50 about 460 ms) and the run ends at about 143 virtual seconds.
    every node keeps together. Code timing its own work finds it very
    fast: this is not a simulation of real-time bounds.
 3. **Relative `allow:` entries.** stress builds Move packages from the
-   checkout at paths compiled in; `allow: [sui-src]` with run.sh's link
-   to the checkout lets it (relative entries are resolved next to the
-   run file, through symlinks).
+   checkout at paths compiled in; `allow: [../..]`, the checkout the run
+   file sits in, lets it (relative entries are resolved next to the run
+   file, through symlinks).
 4. **The system allocator's clock reads.** Runs parted within two
    virtual seconds on five in six, a thread's clock one or two
    microseconds apart at the same hook count. Logging each clock read's

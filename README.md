@@ -1,66 +1,127 @@
 # DERP: Deterministic Execution and Replay Platform
 
-Runs native arm64 programs, several processes on virtual hosts if wanted,
-so that a run is a function of its seed: the same seed gives the same
-thread interleaving, clock, entropy, heap layout and network traffic
-every time, and a failing run replays, bisects to the moment it was
-decided, and names the lines it needs. The tool is `derp`: `derp rewrite`
-only rewrites a binary, and `derp run` rewrites what it runs (cached)
-before running it.
+Derp is a tool for running one or more processes deterministically, without containerization, hypervisors, or emulation.
+It works on whatever binaries your build system produces, or whatever you installed from homebrew.
+Thread scheduling, syscalls, hardware counters, heap layout, network traffic, and more are all deterministic.
 
-Rewrites arm64 Mach-O executables so that branches (and a sparse set of
-memory accesses) pass through stubs, and runs them under a supervisor
-dylib that owns the thread and process schedule. Given a seed, the
-interleaving of every thread in every process of a run repeats exactly.
+The main advantage of Derp over other similar tools is that you can use it locally on your Mac, and benefit from fast iteration speed.
 
-```
-derp run    --seed S [--mem-hook-rate R] prog args…
-derp run    --seed S --manifest FILE        # several processes on virtual hosts
-derp repeat --seed S --runs N …             # status, stdout and schedule hash must agree
-derp bench  prog args…                      # native vs rewritten, no scheduling
-```
+Derp **is not a secure sandbox! Do not use it to run anything that you would not run directly**. It has some limited isolation features for convenience only.
 
-Options worth knowing:
+Currently Derp only supports arm64 Mach-O executables on macOS.
 
-- `--mem-hook-rate 1/16` hooks a sparse, seeded set of memory accesses;
-  races on plain memory need it, races through files and sockets do not.
-- `--quantum LO..HI` is hook events per scheduling quantum. The default
-  `1000..10000` finds races in short programs and costs about 57% on two
-  compute-bound processes; `10000..100000` costs about 10% and misses races
-  in short programs.
-- `--manifest FILE` is the run file, in YAML (below). Hosts get `10.0.0.1`
-  upward in the order listed and are reachable by name. `--net-latency 5ms`
-  delays traffic between different hosts in virtual time.
-- `--switch-cost 50us` (`switch-cost:` in the run file) is how far each
-  baton hand-off moves the virtual clock, quantum expiries included; the
-  default is 10µs, and a clock read moves it 1µs. Threads run one at a
-  time on one clock, so the cost is kept low: at 1ms, the old default, a
-  run of several threaded servers with hundreds of threads between them
-  got so little done per virtual second that their own timeouts fired.
-  The price is that code timing its own work finds it very fast. Only a
-  run-file run can change it.
-- `--stop-after 30s` ends the run at that virtual time: whatever still
-  runs is killed at that point of the schedule, reported as `stopped`,
-  and does not fail the run. For servers that never exit by themselves,
-  and for comparing what a program did in a fixed span of virtual time.
-  Also `stop-after:` in the run file; it needs the supervisor.
-- `--wall-limit 60s` (`wall-limit:` in the run file) does the same at a
-  real time, and works for `--native` runs too, which have no virtual
-  clock. Every process reports `cpu_user_ns` and `cpu_system_ns`, the CPU
-  time it used, and `run.cpu_*` sum them: what a program cost natively
-  and under the supervisor in the same span.
-- `--capture` writes each guest's stdout to `stdout.<index>` in the
-  `--scratch` directory, and `--capture-stderr` its stderr to
-  `stderr.<index>` (the supervisor's messages about that guest included;
-  without it they come out on ours). The report goes to stderr: `run.*`
-  totals, then `p<index>.*` per process.
-- `REWRITE_TRACE=file` appends one line per baton switch (from, to, hook
-  events issued, site, virtual clock). Diff two of them to find where two
-  runs part ways; the schedule hash covers the same values.
-- `REWRITE_PARK_SPINS=N` makes a parking thread spin first. It only helps
-  when the baton bounces back within microseconds; off by default.
+The approach it uses is binary rewriting.
+This is easy on arm64 because instructions are fixed-size.
+Branches, syscalls, loads/stores, hardware randomness, etc are all replaced with a unconditional branch to a small generated stub.
+This stub decrements a quantum counter, enters the scheduler if it reaches 0, and performs the task(s) of the original instruction, before jumping back to the original code.
+All threads (in all processes) contend on a single lock (Claude calls it a "baton"), and the scheduler deterministically decides which thread will acquire the lock next.
+
+Execution is pseudo-randomly deterministic according to the seed supplied when starting the process(es).
+This allows us to do *Deterministic Simulation Testing* by repeating execution many times with different seeds.
+When a bug is found, it can be reproduced by re-running with the same seed.
+
+Derp can automatically search for the point in (virtual) time at which the bug occurred, in cases where the incorrect execution precedes its detection by a substantial amount of time.
+
+## Capabilities and Limitations
+
+Derp can be used to search for and reproduce race conditions and other timing-related bugs, errors in distributed systems, crashes, bugs in crash/restart recovery, and any other sort of application logic bug.
+
+It cannot reproduce data races or memory ordering bugs: All threads are serialized, so neither can ever occur while running in Derp.
+
+It uses a network simulator (currently very bare bones) for deterministic delivery of TCP and UDP traffic between processes.
+It can also inject process faults (i.e. killing processes randomly) to test crash recovery and fault tolerance.
+
+Several large systems including Postgres, SQLite, RocksDB, and Redis have been verified to run deterministically under Derp. See the examples directory.
+
+Derp generally has a slow-down factor of 2x or less for sequential code.
+Multi-threaded or multi-process systems are fully serialized, lose all parallelism, and slow down accordingly.
+
+Processes observe a virtual clock, which is necessary for determinism. The virtual clock is not very well tuned to give realistic CPU timings. Any system that measures its own performance may believe it is running either ludicrously fast or slow.
+However, timers should be predictable: A process that sleeps for 100ms should observe that roughly 100ms of time has elapsed.
+
+Derp can use debug or optimized binaries equally well.  Debuggers will probably mostly work on a binary that Derp has rewritten, but I haven't tested this.
+
+## Development
+
+Derp was written entirely by Claude Fable and Opus 5.5. The idea behind it was mine. (I don't claim to have invented the binary rewriting technique I used, I just mean that I directed Claude on the high level design).
+
+I built it mainly because I have always been frustrated by how few tools of this sort offer macOS support, and since I do most of my work on macOS I don't get to take advantage of them.
+Also, I'm obsessed with Deterministic Simulation Testing, and wanted to explore a new approach.
+
+Behind the high-level idea lies a mountain of small hacks. It would have taken years to write this manually, mainly because of the amount of debugging required.
+
+The approach was to get "hello world" working, and then throw an escalating series of bigger challenges at Claude.
+Each time, the goal was the same: No matter how many times the program is run, it must execute identically (and produce plausible output - crashing immediately would always produce identical output, but Claude isn't that dumb.)
+Since this is a mechanically verifiable goal, Claude is able to churn away mostly autonomously, finding and patching one source of nondeterminism after another.
+Several times I had to stop it from trying to solve things in a stupid way, but for the most part it simply found bugs, fixed them, and kept going.
+
+## Known issues
+
+Although I've tested this on large, non-trivial systems (like Postgres and SQLite) there are certainly still nondeterministic executions waiting to be found. Feel free to file an issue if you find one.
+
+Only arm64 Mach-O on macOS is supported. Other operating systems or executable formats would probably be easy to support. Supporting x86_64 is more difficult because it doesn't have fixed-size instructions, but support would probably just be a matter of burning enough tokens.
+
+# Everything below this point is AI written, reader discretion advised.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `derp run [opts] prog args…` | Rewrite (cached), then launch under the supervisor. |
+| `derp run [opts] --manifest FILE` | Several processes on virtual hosts under one scheduler (see the run file, below). |
+| `derp repeat [opts] prog args…` | Run `--runs` times; exit status, stdout and schedule hash must agree. Also takes `--manifest`. |
+| `derp bench [opts] prog args…` | Time native against rewritten, without scheduling. |
+| `derp bisect [opts] --manifest FILE` | When was the failing seed's failure decided? See "When did a failing run go wrong?". |
+| `derp suspects [opts] --manifest FILE` | Which loads and stores does the failing seed need? See "Which lines does a failing run need?". |
+| `derp scan [opts] prog` | Print what the rewriter would hook. |
+| `derp rewrite [opts] in out` | Rewrite and sign, without running. |
+| `derp copy in out` | Round-trip a binary through the writer and re-sign it. |
+| `derp cargo cargo-args…` | Cargo, with `derp cc` as the linker, for programs too big for their sites to reach the stubs (see "Big programs"). |
+| `derp cc linker-args…` | The linker driver `derp cargo` installs. |
+| `derp rooms prog` | The rooms `derp cc` would give a program, and why. |
+
+## Options
+
+Options come before the program. Those marked "run file" can also be set
+there; the command line wins.
+
+| Option | Default | Run file | What it does |
+| --- | --- | --- | --- |
+| `--seed S` | `0` | `seed:` | The run's seed. Everything the run decides is drawn from it. |
+| `--quantum LO..HI` | `1000..10000` | `quantum:` | Hook events per scheduling quantum, drawn from this range. The default finds races in short programs and costs about 57% on two compute-bound processes; `10000..100000` costs about 10% and misses races in short programs. |
+| `--mem-hook-rate R` | `0` | `mem-hook-rate:` | `0`, `1` or a fraction like `1/16`: hooks a sparse, seeded set of memory accesses. Races on plain memory need it; races through files and sockets do not. |
+| `--heap-size N` | `32G` | `heap-size:` | Address space of each guest's heap, such as `512M` or `4T`. Only touched pages cost memory. |
+| `--manifest FILE` | | | The run file, in YAML (below). Hosts get `10.0.0.1` upward in the order listed and are reachable by name. |
+| `--net-latency T` | `0` | `net-latency:` | Virtual-time delay of traffic between different hosts, such as `5ms`, `250us` or `1s`. |
+| `--switch-cost T` | `10us` | `switch-cost:` | How far each baton hand-off moves the virtual clock, quantum expiries included; a clock read moves it 1µs. Threads run one at a time on one clock, so the cost is kept low: at 1ms, the old default, a run of several threaded servers with hundreds of threads between them got so little done per virtual second that their own timeouts fired. The price is that code timing its own work finds it very fast. Only a run-file run can change it. |
+| `--stop-after T` | | `stop-after:` | End the run at this virtual time: whatever still runs is killed at that point of the schedule, reported as `stopped`, and does not fail the run. For servers that never exit by themselves, and for comparing what a program did in a fixed span of virtual time. Needs the supervisor. |
+| `--wall-limit T` | | `wall-limit:` | The same at a real time. Works for `--native` runs too, which have no virtual clock: every process reports `cpu_user_ns` and `cpu_system_ns`, and `run.cpu_*` sum them, so a program's cost natively and under the supervisor can be compared over the same span. |
+| `--scratch DIR` | under the system temp dir | | Where a run file's host directories are made, fresh. An existing directory is only cleared if an earlier run made it. |
+| `--capture` | off | | Run-file runs: each guest's stdout goes to `stdout.<index>` in the scratch directory instead of ours. |
+| `--capture-stderr` | off | | And its stderr to `stderr.<index>`, the supervisor's messages about that guest included; without it they come out on ours. |
+| `--runs N` | `100` (`repeat`), `20` (`bisect`) | | Repetitions for `repeat`; futures per probe for `bisect`. |
+| `--jobs J` | `4` | | `bisect`, `suspects`: runs at a time. |
+| `--resolution T` | `2ms` | | `bisect`: stop at an interval this short. |
+| `--reseed-at T --reseed N` | | | From virtual time `T` on, every random stream (schedule, faults, heap layout, entropy) starts over from `N`. This is what `bisect` does at each probe. `--reseed` needs `--reseed-at`. |
+| `--no-supervisor` | | | No scheduling: the dylib only provides the stubs' counter. |
+| `--native` | | | Run the original binary, without the rewriter or the dylib. |
+| `--aslr` | off | | Leave ASLR on. |
+
+The report goes to stderr: `run.*` totals, then `p<index>.*` per process.
+
+Two environment variables help with debugging:
+
+| Variable | What it does |
+| --- | --- |
+| `REWRITE_TRACE=file` | Appends one line per baton switch (from, to, hook events issued, site, virtual clock). Diff two of them to find where two runs part ways; the schedule hash covers the same values. |
+| `REWRITE_PARK_SPINS=N` | Makes a parking thread spin first. It only helps when the baton bounces back within microseconds; off by default. |
 
 ## The run file
+
+The run file allows you to configure a "cluster" that is split among several "hosts".
+For instance, you can start up a server as well as one or more clients that send load to it.
+Host isolation is extremely primitive, and does little besides telling hosts on different processes that they have different IPs.
+
 
 ```yaml
 seed: 7                  # optional; the command line overrides these
@@ -291,280 +352,131 @@ Results: `docs/REWRITE_RESULTS.md` (single process) and
   and `mappings_hinted`. An exited thread's stack is not reused; the
   region has room for about 30,000 threads of 2 MB.
 
-## Nondeterminism found and fixed
+## Sources of nondeterminism found and fixed
 
-Every item names an input the run took from outside itself, or a bug in
-the supervisor, and what was done. Keep this list current: a change that
-closes a source of nondeterminism adds an item here.
+Every row names an input the run took from outside itself, or a bug in
+the supervisor, and what was done. Keep these tables current: a change
+that closes a source of nondeterminism adds a row here.
 
 ### Scheduling
 
-- *Thread interleaving is decided by the kernel*: one thread of the run
-  holds a baton and runs; the others are parked. The baton changes hands
-  at quantum expiries, counted in hooked branches and calls, and at every
-  interposed blocking call. The quantum length is drawn from the seed.
-- *Blocking calls sleep in the kernel while the thread holds the baton*:
-  mutexes, condition variables (also `pthread_cond_timedwait_relative_np`),
-  rwlocks, `os_unfair_lock` and the ulock calls, dispatch semaphores,
-  sleeps, `poll`, `select`, `kevent`, pipe and socket I/O, `waitpid`,
-  `semop` and `pthread_join` are interposed and become scheduler waits.
-- *Several processes schedule independently*: the scheduler's state is in
-  shared memory and the baton passes between processes; `fork`, `execve`,
-  `posix_spawn`, exit and `waitpid` are points of the schedule.
-- *`POSIX_SPAWN_SETEXEC` was treated as a spawn*: the old process record
-  kept the baton. It is treated as an exec.
-- *GCD worker threads are created by the kernel and run outside the
-  scheduler*: a guest that submits work to Grand Central Dispatch ends
-  the run with exit 69. System libraries use GCD internally: their wakes
-  go to the scheduler and the kernel, an unfair-lock wait whose owner is
-  such a thread is a real wait, and an idle scheduler looks again in real
-  time for up to 30 s before declaring a deadlock.
-- *A wait a system library makes for itself (an XPC reply, a block on a
-  GCD worker) yielded the baton and let real time in*: such a wait is made
-  in the kernel with the baton held, so nothing else moves meanwhile.
-- *libdispatch's ulock waits pass `ULF_NO_ERRNO` and got positive errors*:
-  the interposer answers those callers with negative errno values.
-- *The thread-exit hook's join wake counted as a wake from outside the
-  schedule* (libpthread clears the key before the hook runs): the hook
-  sets the identity back for the wake.
-- *Key destructors of the guest ran after the exiting thread had handed
-  the baton on*: the supervisor's key destructor re-arms itself for every
-  destructor round but the last, so the guest's run with the baton.
-- *Destructors of keys younger than the supervisor's (jemalloc's thread
-  cache) still ran in the last round, off the baton*: the exiting thread
-  leaves its Mach port behind and the next baton holder in that process
-  waits until the port is dead.
-- *An exiting thread's last hooks raced the next holder's quantum*: the
-  wait for the port happens before the holder touches the hook counter.
-- *A signal handler on a thread that is inside the scheduler lock
-  deadlocked on the lock*: the lock word names the holding thread; a
-  handler on the holder makes no wake itself and leaves it for the holder
-  to make on leaving the lock.
-- *A process that died holding the scheduler lock hung the run*: the lock
-  is taken over from a dead owner, whose death is checked with
-  `proc_pidinfo` (a zombie that is nobody's child still answers `kill`).
-- *A new image after `execve` spun on a lock word naming its own pid*:
-  the word is reset before the new image's first lock.
-- *Threads outside the schedule ran hooked code and ate the holder's
-  quantum*: the report counts expiries taken without the baton
-  (`outside_expiries`, `stray_expiries`) and the trace names them.
-- *Real-time collisions on libmalloc's lock inside the supervisor showed
-  in the guest's schedule*: the supervisor allocates from its own heap
-  with its own lock, and only the baton holder's unfair-lock waits count.
-- *A daemon was killed at the end of a run, unheard*: when every other
-  process is done the launcher arms a stop at the virtual time reached;
-  every thread of a stopped process is made runnable and the first to
-  take the baton up writes the report and ends the process.
-- *The run started as soon as every guest had attached, so a guest's
-  remaining start-up ran in real time while the first guest already ran
-  guest code*: two Go processes fell into one of two schedules from the
-  first quantum. The launcher hands the baton out only once every
-  guest's main thread is parked.
-- *A thread-directed signal (`pthread_kill`) from one scheduled thread to
-  another landed on a parked thread at a real moment*: Go preempts
-  goroutines and stops the world with SIGURG this way. The signal is
-  pending against the target thread and raised when it next takes the
-  baton up.
-- *A process that leaves through `_exit` skipped the exit hooks and never
-  reported*: Go does. `_exit` writes the report first.
-- *The supervisor timed its own wait with `Instant::now()`*: libSystem's
-  clock call is routed to the interposer by dyld, so every spin moved the
-  virtual clock. The supervisor reads real time only with
-  `mach_absolute_time` directly.
+| Problem | Fix |
+| --- | --- |
+| Thread interleaving is decided by the kernel | One thread of the run holds a baton and runs; the others are parked. The baton changes hands at quantum expiries, counted in hooked branches and calls, and at every interposed blocking call. The quantum length is drawn from the seed. |
+| Blocking calls sleep in the kernel while the thread holds the baton | Mutexes, condition variables (also `pthread_cond_timedwait_relative_np`), rwlocks, `os_unfair_lock` and the ulock calls, dispatch semaphores, sleeps, `poll`, `select`, `kevent`, pipe and socket I/O, `waitpid`, `semop` and `pthread_join` are interposed and become scheduler waits. |
+| Several processes schedule independently | The scheduler's state is in shared memory and the baton passes between processes; `fork`, `execve`, `posix_spawn`, exit and `waitpid` are points of the schedule. |
+| `POSIX_SPAWN_SETEXEC` was treated as a spawn: the old process record kept the baton | It is treated as an exec. |
+| GCD worker threads are created by the kernel and run outside the scheduler | A guest that submits work to Grand Central Dispatch ends the run with exit 69. System libraries use GCD internally: their wakes go to the scheduler and the kernel, an unfair-lock wait whose owner is such a thread is a real wait, and an idle scheduler looks again in real time for up to 30 s before declaring a deadlock. |
+| A wait a system library makes for itself (an XPC reply, a block on a GCD worker) yielded the baton and let real time in | Such a wait is made in the kernel with the baton held, so nothing else moves meanwhile. |
+| libdispatch's ulock waits pass `ULF_NO_ERRNO` and got positive errors | The interposer answers those callers with negative errno values. |
+| The thread-exit hook's join wake counted as a wake from outside the schedule (libpthread clears the key before the hook runs) | The hook sets the identity back for the wake. |
+| Key destructors of the guest ran after the exiting thread had handed the baton on | The supervisor's key destructor re-arms itself for every destructor round but the last, so the guest's run with the baton. |
+| Destructors of keys younger than the supervisor's (jemalloc's thread cache) still ran in the last round, off the baton | The exiting thread leaves its Mach port behind and the next baton holder in that process waits until the port is dead. |
+| An exiting thread's last hooks raced the next holder's quantum | The wait for the port happens before the holder touches the hook counter. |
+| A signal handler on a thread that is inside the scheduler lock deadlocked on the lock | The lock word names the holding thread; a handler on the holder makes no wake itself and leaves it for the holder to make on leaving the lock. |
+| A process that died holding the scheduler lock hung the run | The lock is taken over from a dead owner, whose death is checked with `proc_pidinfo` (a zombie that is nobody's child still answers `kill`). |
+| A new image after `execve` spun on a lock word naming its own pid | The word is reset before the new image's first lock. |
+| Threads outside the schedule ran hooked code and ate the holder's quantum | The report counts expiries taken without the baton (`outside_expiries`, `stray_expiries`) and the trace names them. |
+| Real-time collisions on libmalloc's lock inside the supervisor showed in the guest's schedule | The supervisor allocates from its own heap with its own lock, and only the baton holder's unfair-lock waits count. |
+| A daemon was killed at the end of a run, unheard | When every other process is done the launcher arms a stop at the virtual time reached; every thread of a stopped process is made runnable and the first to take the baton up writes the report and ends the process. |
+| The run started as soon as every guest had attached, so a guest's remaining start-up ran in real time while the first guest already ran guest code. Two Go processes fell into one of two schedules from the first quantum | The launcher hands the baton out only once every guest's main thread is parked. |
+| A thread-directed signal (`pthread_kill`) from one scheduled thread to another landed on a parked thread at a real moment. Go preempts goroutines and stops the world with SIGURG this way | The signal is pending against the target thread and raised when it next takes the baton up. |
+| A process that leaves through `_exit` skipped the exit hooks and never reported. Go does | `_exit` writes the report first. |
+| The supervisor timed its own wait with `Instant::now()`. libSystem's clock call is routed to the interposer by dyld, so every spin moved the virtual clock | The supervisor reads real time only with `mach_absolute_time` directly. |
 
 ### Memory
 
-- *`malloc` addresses vary between runs*: the malloc family is interposed
-  and served from a heap in a fixed region.
-- *The heap layout was the same for every seed, so pointer-order bugs
-  never showed*: where blocks land and whether a freed block is reused at
-  once are drawn from the seed and the process index.
-- *A fixed 4 GB heap ran out under a scattered layout*: the heap is 32 GB
-  of address space by default and the run file sets it.
-- *`mmap` hints for the supervisor's regions were not honoured*: the kernel
-  ignores hints in some ranges and low addresses vary between launches.
-  The regions are reserved with `mach_vm_allocate` at fixed addresses and
-  mapped over with `MAP_FIXED`.
-- *Threads outside the schedule allocated from the deterministic heap*:
-  their allocations go to libmalloc, and a block they free is counted as
-  leaked rather than reused.
-- *The kernel placed thread stacks first-fit around GCD workers' stacks,
-  and `pthread_self` is a stack address that RocksDB hashes*: scheduled
-  threads' `mach_vm_map`, `mach_vm_allocate` and `mmap` requests without
-  an address are placed in a reserved region in schedule order.
-- *An `mmap` with an address hint was granted or refused by the kernel
-  depending on whether an exited thread's stack had been freed yet*:
-  hinted requests are placed like the others.
-- *`shmat` attached a segment where the kernel chose*: it attaches in the
-  reserved region.
-- *A guest's own allocator (jemalloc) keeps its heap out of the seeded
-  one*: its memory still comes from `mmap`, which the run places, so it
-  runs repeatably, with the compact layout.
-- *The yield and counter entries pushed several hundred bytes of
-  registers onto whatever stack the hooked code ran on*: a goroutine's
-  stack has a guard of under a kilobyte, and the pushes landed on the
-  heap object below it (Go's collector found a corrupted heap). Each
-  scheduled thread has a supervisor stack for those entries, which leave
-  at most 48 bytes on the guest's stack.
-- *The environment's length decides where a guest's stack starts*: the
-  supervisor's own variables are fixed-width, run-file guests start from
-  a fixed environment (`pass-env:` names what is inherited), and the trace
-  and mask paths reach guests through the shared state rather than their
-  environment.
+| Problem | Fix |
+| --- | --- |
+| `malloc` addresses vary between runs | The malloc family is interposed and served from a heap in a fixed region. |
+| The heap layout was the same for every seed, so pointer-order bugs never showed | Where blocks land and whether a freed block is reused at once are drawn from the seed and the process index. |
+| A fixed 4 GB heap ran out under a scattered layout | The heap is 32 GB of address space by default and the run file sets it. |
+| `mmap` hints for the supervisor's regions were not honoured. The kernel ignores hints in some ranges and low addresses vary between launches | The regions are reserved with `mach_vm_allocate` at fixed addresses and mapped over with `MAP_FIXED`. |
+| Threads outside the schedule allocated from the deterministic heap | Their allocations go to libmalloc, and a block they free is counted as leaked rather than reused. |
+| The kernel placed thread stacks first-fit around GCD workers' stacks, and `pthread_self` is a stack address that RocksDB hashes | Scheduled threads' `mach_vm_map`, `mach_vm_allocate` and `mmap` requests without an address are placed in a reserved region in schedule order. |
+| An `mmap` with an address hint was granted or refused by the kernel depending on whether an exited thread's stack had been freed yet | Hinted requests are placed like the others. |
+| `shmat` attached a segment where the kernel chose | It attaches in the reserved region. |
+| A guest's own allocator (jemalloc) keeps its heap out of the seeded one | Its memory still comes from `mmap`, which the run places, so it runs repeatably, with the compact layout. |
+| The yield and counter entries pushed several hundred bytes of registers onto whatever stack the hooked code ran on. A goroutine's stack has a guard of under a kilobyte, and the pushes landed on the heap object below it (Go's collector found a corrupted heap) | Each scheduled thread has a supervisor stack for those entries, which leave at most 48 bytes on the guest's stack. |
+| The environment's length decides where a guest's stack starts | The supervisor's own variables are fixed-width, run-file guests start from a fixed environment (`pass-env:` names what is inherited), and the trace and mask paths reach guests through the shared state rather than their environment. |
 
 ### Time
 
-- *Clock reads return real time*: `clock_gettime`, `gettimeofday`, `time`,
-  `mach_absolute_time`, `mach_continuous_time` and
-  `clock_gettime_nsec_np` return a virtual clock that advances 1 µs per
-  read and 10 µs per baton switch, and jumps to the next deadline when
-  nothing can run.
-- *Threads outside the schedule advanced the virtual clock when they read
-  it*: they see the clock but do not move it.
-- *The Mach clock services returned real time*: RocksDB's `NowNanos`
-  on macOS asks `host_get_clock_service` for the calendar clock and reads
-  it with `clock_get_time`, a call to the kernel. It mixes that time into
-  the entropy for its DB ids and session ids, which key its block cache:
-  a Sui fullnode walked its cache in another order from run to run, and
-  one quantum in two million ended elsewhere. The two calls are
-  interposed; the calendar clock is the run's real time and the system
-  clock its monotonic time.
-- *The system allocator's own time reads moved the clock*: libsystem_malloc
-  reads `mach_absolute_time` in `free` as often as its heap's state says,
-  and GCD workers shape that state in real time. CoreFoundation freeing
-  on a scheduled thread (the Security framework loading certificates in
-  sui-node) ticked the clock once more or less, and a Sui cluster parted
-  within two virtual seconds on five runs in six. A read whose caller is
-  in libsystem_malloc sees the clock and does not move it.
-- *`gettimeofday` left its time-zone argument unfilled*: Redis takes its
-  zone from it and logged dates in 1970. It is filled with UTC.
-- *Reading `CNTVCT_EL0` returns the CPU's real-time counter*: the `mrs`
-  instruction is rewritten to jump to a stub that returns the virtual
-  clock in the counter's ticks.
-- *`setitimer` and `alarm` armed real kernel timers whose SIGALRM landed
-  on a parked thread at a real moment*: the timer is a virtual deadline of
-  the process; its SIGALRM becomes pending at that moment of the schedule
-  and wakes a blocked thread of the process.
-- *`getrusage` returns real CPU times*: it returns the virtual clock as
-  user time.
-- *Timed waits across processes used each process's own clock*: the run
-  has one clock in the shared state, and timed waits are ordered by
-  deadline on it.
+| Problem | Fix |
+| --- | --- |
+| Clock reads return real time | `clock_gettime`, `gettimeofday`, `time`, `mach_absolute_time`, `mach_continuous_time` and `clock_gettime_nsec_np` return a virtual clock that advances 1 µs per read and 10 µs per baton switch, and jumps to the next deadline when nothing can run. |
+| Threads outside the schedule advanced the virtual clock when they read it | They see the clock but do not move it. |
+| The Mach clock services returned real time. RocksDB's `NowNanos` on macOS asks `host_get_clock_service` for the calendar clock and reads it with `clock_get_time`, a call to the kernel. It mixes that time into the entropy for its DB ids and session ids, which key its block cache: a Sui fullnode walked its cache in another order from run to run, and one quantum in two million ended elsewhere | The two calls are interposed; the calendar clock is the run's real time and the system clock its monotonic time. |
+| The system allocator's own time reads moved the clock. libsystem_malloc reads `mach_absolute_time` in `free` as often as its heap's state says, and GCD workers shape that state in real time. CoreFoundation freeing on a scheduled thread (the Security framework loading certificates in sui-node) ticked the clock once more or less, and a Sui cluster parted within two virtual seconds on five runs in six | A read whose caller is in libsystem_malloc sees the clock and does not move it. |
+| `gettimeofday` left its time-zone argument unfilled. Redis takes its zone from it and logged dates in 1970 | It is filled with UTC. |
+| Reading `CNTVCT_EL0` returns the CPU's real-time counter | The `mrs` instruction is rewritten to jump to a stub that returns the virtual clock in the counter's ticks. |
+| `setitimer` and `alarm` armed real kernel timers whose SIGALRM landed on a parked thread at a real moment | The timer is a virtual deadline of the process; its SIGALRM becomes pending at that moment of the schedule and wakes a blocked thread of the process. |
+| `getrusage` returns real CPU times | It returns the virtual clock as user time. |
+| Timed waits across processes used each process's own clock | The run has one clock in the shared state, and timed waits are ordered by deadline on it. |
 
 ### Randomness
 
-- *`arc4random`, `getentropy` and `CCRandomGenerateBytes` return real
-  entropy*: they return bytes from a stream seeded by the run's seed and
-  the process index.
-- *Reads of `/dev/urandom` and `/dev/random` return real entropy* (Redis
-  seeds its hash tables there): descriptors open on those devices read
-  from the same stream.
+| Problem | Fix |
+| --- | --- |
+| `arc4random`, `getentropy` and `CCRandomGenerateBytes` return real entropy | They return bytes from a stream seeded by the run's seed and the process index. |
+| Reads of `/dev/urandom` and `/dev/random` return real entropy (Redis seeds its hash tables there) | Descriptors open on those devices read from the same stream. |
 
 ### Signals
 
-- *A signal a guest sends itself went to whichever thread the kernel
-  picked, at a real moment*: `kill(getpid(), sig)` is delivered with
-  `pthread_kill` to the calling thread, so the handler runs there with
-  the baton.
-- *`SIGCHLD` arrived from the kernel at a real moment*: the guest's
-  handler is kept by the supervisor, the kernel's delivery is dropped, and
-  the handler runs on the parent's next thread to take the baton up after
-  the death is recorded, with the child's pid and status in `siginfo`,
-  `SA_RESETHAND` honoured, and a blocked signal left for a thread that
-  takes it.
-- *Signals between guests were dropped* (Postgres's latches are SIGURG,
-  its procsignals SIGUSR1): a signal to another guest is recorded against
-  the target and raised on the target's next thread to take the baton up;
-  `kill(pid, 0)` answers whether the guest lives.
+| Problem | Fix |
+| --- | --- |
+| A signal a guest sends itself went to whichever thread the kernel picked, at a real moment | `kill(getpid(), sig)` is delivered with `pthread_kill` to the calling thread, so the handler runs there with the baton. |
+| `SIGCHLD` arrived from the kernel at a real moment | The guest's handler is kept by the supervisor, the kernel's delivery is dropped, and the handler runs on the parent's next thread to take the baton up after the death is recorded, with the child's pid and status in `siginfo`, `SA_RESETHAND` honoured, and a blocked signal left for a thread that takes it. |
+| Signals between guests were dropped (Postgres's latches are SIGURG, its procsignals SIGUSR1) | A signal to another guest is recorded against the target and raised on the target's next thread to take the baton up; `kill(pid, 0)` answers whether the guest lives. |
 
 ### Processes
 
-- *Virtual pids collided with real ones and reached system APIs*: virtual
-  pids start at 100,000, above any real pid; callers inside the dyld
-  shared cache get the real pid from `getpid` and `getppid`.
-- *Kernel thread ids differ from run to run* (RocksDB mixes one into its
-  session ids): `pthread_threadid_np` returns the thread's index in the
-  run plus a billion.
-- *A guest killed by another guest was dead to the run only when the
-  launcher noticed*: the whole death happens under the scheduler lock at
-  the moment of the `kill`; its peers see EOF from then.
-- *Guests outlived a dead launcher*: a guest whose launcher is gone exits
-  within a second.
-- *A guest's own children were invisible to the tools*: every process
-  reports its program once it first holds the baton, and the launcher
-  keeps the rewritten-to-original mapping.
+| Problem | Fix |
+| --- | --- |
+| Virtual pids collided with real ones and reached system APIs | Virtual pids start at 100,000, above any real pid; callers inside the dyld shared cache get the real pid from `getpid` and `getppid`. |
+| Kernel thread ids differ from run to run (RocksDB mixes one into its session ids) | `pthread_threadid_np` returns the thread's index in the run plus a billion. |
+| A guest killed by another guest was dead to the run only when the launcher noticed | The whole death happens under the scheduler lock at the moment of the `kill`; its peers see EOF from then. |
+| Guests outlived a dead launcher | A guest whose launcher is gone exits within a second. |
+| A guest's own children were invisible to the tools | Every process reports its program once it first holds the baton, and the launcher keeps the rewritten-to-original mapping. |
 
 ### Files and IPC
 
-- *Guests read and wrote wherever their paths pointed*: every host gets a
-  fresh directory per run, `files:` copies inputs in (with their modes),
-  and paths outside it and the system's directories are refused.
-- *System V keys are a namespace of the whole machine, and Postgres tries
-  keys in sequence until one is free*: a keyed `shmget` or `semget` makes
-  a private object, and the launcher removes the run's objects at the end.
-- *POSIX shared memory names collided with a killed run's objects*:
-  `shm_open` names carry the launcher's pid and are unlinked at the end.
+| Problem | Fix |
+| --- | --- |
+| Guests read and wrote wherever their paths pointed | Every host gets a fresh directory per run, `files:` copies inputs in (with their modes), and paths outside it and the system's directories are refused. |
+| System V keys are a namespace of the whole machine, and Postgres tries keys in sequence until one is free | A keyed `shmget` or `semget` makes a private object, and the launcher removes the run's objects at the end. |
+| POSIX shared memory names collided with a killed run's objects | `shm_open` names carry the launcher's pid and are unlinked at the end. |
 
 ### Network
 
-- *Sockets between guests went through the kernel*: guests live on virtual
-  hosts with virtual stream and datagram sockets, names, `poll`, `select`
-  and `kevent` over them, payloads delivered on the virtual clock with a
-  fixed latency.
-- *A guest could reach the real network, whose answers cannot be
-  repeated*: in run-file runs, connections outside the virtual network
-  fail with `ENETUNREACH` and unknown names with `EAI_NONAME` unless the
-  run file allows them; a connection that leaves is logged with its
-  destination.
-- *A lookup that needs no resolver (a null host for a port, `localhost`,
-  a numeric address) went to libSystem's resolver, whose threads and
-  sockets are outside the run*: Go's cgo resolver asks it for every
-  port. Such lookups are answered by the supervisor.
-- *An IPv6 socket was the kernel's, and a dual-stack listener (Go's,
-  Postgres's) lived outside the run while clients connected to the
-  virtual address*: in a run, `socket(AF_INET6)` fails with
-  `EAFNOSUPPORT`, and programs fall back to IPv4.
-- *`send` on a kernel socket pair woke nobody* (tokio's signal self-pipe):
-  `send`, `sendto` and `sendmsg` wake the scheduler's waiters, and `recv`
-  on such a socket waits in the scheduler.
-- *`recv(MSG_DONTWAIT)` on a blocking socket pair parked*: it does not.
+| Problem | Fix |
+| --- | --- |
+| Sockets between guests went through the kernel | Guests live on virtual hosts with virtual stream and datagram sockets, names, `poll`, `select` and `kevent` over them, payloads delivered on the virtual clock with a fixed latency. |
+| A guest could reach the real network, whose answers cannot be repeated | In run-file runs, connections outside the virtual network fail with `ENETUNREACH` and unknown names with `EAI_NONAME` unless the run file allows them; a connection that leaves is logged with its destination. |
+| A lookup that needs no resolver (a null host for a port, `localhost`, a numeric address) went to libSystem's resolver, whose threads and sockets are outside the run. Go's cgo resolver asks it for every port | Such lookups are answered by the supervisor. |
+| An IPv6 socket was the kernel's, and a dual-stack listener (Go's, Postgres's) lived outside the run while clients connected to the virtual address | In a run, `socket(AF_INET6)` fails with `EAFNOSUPPORT`, and programs fall back to IPv4. |
+| `send` on a kernel socket pair woke nobody (tokio's signal self-pipe) | `send`, `sendto` and `sendmsg` wake the scheduler's waiters, and `recv` on such a socket waits in the scheduler. |
+| `recv(MSG_DONTWAIT)` on a blocking socket pair parked | It does not. |
 
 ### kqueue
 
-- *A kqueue holding only a user event waited in the kernel with the
-  baton* (mio's waker): a `kevent` wait is the scheduler's unless every
-  registration belongs to the outside world; user events are modelled.
-- *`EV_RECEIPT`, `EV_DISPATCH`, `EV_CLEAR`, `EV_ONESHOT` and `EV_ENABLE`
-  re-firing were not modelled*: they are, checked against the kernel's
-  answers, with receipts in change order.
-- *mio registers through one duplicate of the kqueue and waits on
-  another*: duplicates share one registry entry, and closing a descriptor
-  purges its entries without touching timer or process registrations of
-  the same ident.
-- *`EVFILT_PROC` on a virtual pid was rejected by the kernel* (Postgres's
-  children decided the postmaster had died): watches on a guest's pid and
-  on signals (`EVFILT_SIGNAL`) are the run's, fed by the process table and
-  the signal counts.
-- *A wait mixing guest descriptors with ones from outside the run is not
-  repeatable*: it is logged once, and only the guests' side ends it.
+| Problem | Fix |
+| --- | --- |
+| A kqueue holding only a user event waited in the kernel with the baton (mio's waker) | A `kevent` wait is the scheduler's unless every registration belongs to the outside world; user events are modelled. |
+| `EV_RECEIPT`, `EV_DISPATCH`, `EV_CLEAR`, `EV_ONESHOT` and `EV_ENABLE` re-firing were not modelled | They are, checked against the kernel's answers, with receipts in change order. |
+| mio registers through one duplicate of the kqueue and waits on another | Duplicates share one registry entry, and closing a descriptor purges its entries without touching timer or process registrations of the same ident. |
+| `EVFILT_PROC` on a virtual pid was rejected by the kernel (Postgres's children decided the postmaster had died) | Watches on a guest's pid and on signals (`EVFILT_SIGNAL`) are the run's, fed by the process table and the signal counts. |
+| A wait mixing guest descriptors with ones from outside the run is not repeatable | It is logged once, and only the guests' side ends it. |
 
 ### Rewriting
 
-- *Sites more than 128 MB from the stub segment cannot reach it*: one
-  shared stub body with a four-to-six-word trampoline per site, far
-  callees through x16 islands at call sites, and rooms planted in the text
-  at link time by `derp cargo` for the sites still out of reach.
-- *A store-conditional fails when an interrupt lands between it and its
-  load, and the retry branch after it was hooked*: the retry happened at
-  the hardware's whim and counted a hook. The branch right after an
-  exclusive store is part of the untouched span.
-- *Constant tables in hand-written assembly decoded as branches* (blst's
-  SHA-256 constants): function-table entries without a symbol are left
-  alone when most entries have one.
-- *Tail calls through x16 clobbered a register hand-written assembly
-  keeps live*: islands are used at `bl` sites only.
-- *Rewritten images of installed programs were written next to the
-  program*: they go to a cache directory under `$TMPDIR`.
+| Problem | Fix |
+| --- | --- |
+| Sites more than 128 MB from the stub segment cannot reach it | One shared stub body with a four-to-six-word trampoline per site, far callees through x16 islands at call sites, and rooms planted in the text at link time by `derp cargo` for the sites still out of reach. |
+| A store-conditional fails when an interrupt lands between it and its load, and the retry branch after it was hooked: the retry happened at the hardware's whim and counted a hook | The branch right after an exclusive store is part of the untouched span. |
+| Constant tables in hand-written assembly decoded as branches (blst's SHA-256 constants) | Function-table entries without a symbol are left alone when most entries have one. |
+| Tail calls through x16 clobbered a register hand-written assembly keeps live | Islands are used at `bl` sites only. |
+| Rewritten images of installed programs were written next to the program | They go to a cache directory under `$TMPDIR`. |
 
 ## Big programs
 

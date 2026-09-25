@@ -1,8 +1,7 @@
 # Native Binary Rewriting: Results
 
-Outcome of the one-week experiment planned in `tracking/IMPLEMENTATION_PLAN_REWRITE.md`.
-Code lives in the repository (rewriter, launcher, CLI) and `supervisor/`
-(the injected dylib).
+Outcome of the one-week rewriting experiment. Code lives in the repository
+(rewriter, launcher, CLI) and `supervisor/` (the injected dylib).
 
 ## The three questions
 

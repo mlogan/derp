@@ -120,7 +120,7 @@ At the end of each implementation session, **create a permanent task tracking fi
 - Before taking a break from the project
 - When significant milestones are reached
 
-**Naming Convention**: `TASKS_PHASE{N}.md` corresponds to `IMPLEMENTATION_PLAN_PHASE{N}.md`; both live in `tracking/`
+**Naming Convention**: `TASKS_PHASE{N}.md` corresponds to `IMPLEMENTATION_PLAN_PHASE{N}.md`; both live in `tracking/`, which git ignores: the files are local, not part of the repository
 
 ---
 
@@ -431,9 +431,6 @@ repository's history starts there.
 - Examples of real systems (`EXAMPLES`): `examples/` holds Redis,
   Postgres, SQLite, memcached and Go, with `tests/examples_tests.rs`. Go
   is set aside with a residual recorded in `tracking/TASKS_EXAMPLES.md`.
-- Sui cluster (`SUI_CLUSTER`): the sui repository's `scripts/derp/` runs sui-operations'
-  Antithesis cluster (four validators, two fullnodes, stress) repeatably;
-  `switch-cost`, relative `allow:` entries.
 
 **Nondeterminism list**: `README.md` has a section "Nondeterminism found
 and fixed": one item per source of nondeterminism (or supervisor bug)

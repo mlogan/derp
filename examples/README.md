@@ -50,14 +50,7 @@ directory and point `PYTHONPATH` at it.
   runtime's goroutine stacks, signal-based preemption, kqueue polling
   and counter-based spin waits are all covered. Support is partial: the
   output repeats, the schedule hash takes one of two values (one quantum
-  ends one hook apart), which `tracking/TASKS_EXAMPLES.md` records with the next
-  steps; set aside for now.
-
-A Sui cluster after sui-operations' Antithesis compose file (four
-validators, two fullnodes and the `stress` client) lives in the sui
-repository, `scripts/derp/`: its `run.sh` builds the binaries with
-`derp cargo` from that checkout (`DERP_DIR` names this one) and runs
-its run file. `tracking/TASKS_SUI_CLUSTER.md` has the numbers.
+  ends one hook apart); set aside for now.
 
 ## Limits worth knowing
 

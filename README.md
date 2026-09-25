@@ -35,10 +35,10 @@ Options worth knowing:
   baton hand-off moves the virtual clock, quantum expiries included; the
   default is 10µs, and a clock read moves it 1µs. Threads run one at a
   time on one clock, so the cost is kept low: at 1ms, the old default, a
-  Sui cluster of seven processes and hundreds of threads (the sui
-  repository's `scripts/derp`) got so little done per virtual second
-  that its own timeouts fired. The price is that code timing its own work
-  finds it very fast. Only a run-file run can change it.
+  run of several threaded servers with hundreds of threads between them
+  got so little done per virtual second that their own timeouts fired.
+  The price is that code timing its own work finds it very fast. Only a
+  run-file run can change it.
 - `--stop-after 30s` ends the run at that virtual time: whatever still
   runs is killed at that point of the schedule, reported as `stopped`,
   and does not fail the run. For servers that never exit by themselves,
@@ -171,9 +171,8 @@ accident, such as an absolute path into another host's directory or a
 `../other/data`. It is not a sandbox: paths are checked as text, so a
 symlink gets out. Program images are not checked.
 
-Plans and progress: `tracking/` (`IMPLEMENTATION_PLAN_X.md` and
-`TASKS_X.md` per phase). Results: `docs/REWRITE_RESULTS.md` (single process)
-and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
+Results: `docs/REWRITE_RESULTS.md` (single process) and
+`docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
 
 ## What a guest must be
 
@@ -184,8 +183,8 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   rewritten on demand. Apple's own binaries (`/bin/sh`, `/usr/bin/curl`,
   `/usr/bin/python3`) ignore `DYLD_INSERT_LIBRARIES` and cannot be guests.
   Homebrew's can: its `curl` and `python3.13 -m http.server` run
-  repeatably (see `tracking/TASKS_RUNFILE.md`). Rewritten copies of installed
-  programs go to `$TMPDIR/rewrite-cache/`, not next to the program.
+  repeatably. Rewritten copies of installed programs go to
+  `$TMPDIR/rewrite-cache/`, not next to the program.
 - Threads the guest makes with `pthread_create` are scheduled. GCD worker
   threads are not, so **a guest may not submit work to Grand Central
   Dispatch**: `dispatch_async`, `dispatch_after`, `dispatch_apply`, dispatch
@@ -233,9 +232,8 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   that Go resolves the run's host names through the system resolver. A
   Go server and client (`examples/go`) run and their output repeats; the
   schedule hash of that pair takes one of two values, one quantum ending
-  one hook apart in the runtime's stack copying, which
-  `tracking/TASKS_EXAMPLES.md` records with what was ruled out and what to try
-  next. A Go program alone repeats fully.
+  one hook apart in the runtime's stack copying. A Go program alone
+  repeats fully.
 - A guest with an allocator of its own (jemalloc, sui-node's default)
   keeps its heap out of the seeded one, so its layout is not the seed's
   to vary, and a bug that depends on pointer order shows on fewer seeds.

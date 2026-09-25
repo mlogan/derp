@@ -53,12 +53,6 @@ directory and point `PYTHONPATH` at it.
   ends one hook apart), which `tracking/TASKS_EXAMPLES.md` records with the next
   steps; set aside for now.
 
-A Sui cluster after sui-operations' Antithesis compose file (four
-validators, two fullnodes and the `stress` client) lives in the sui
-repository, `scripts/derp/`: its `run.sh` builds the binaries with
-`derp cargo` from that checkout (`DERP_DIR` names this one) and runs
-its run file. `tracking/TASKS_SUI_CLUSTER.md` has the numbers.
-
 ## Limits worth knowing
 
 Only executables are rewritten, not the dylibs they load: Python's

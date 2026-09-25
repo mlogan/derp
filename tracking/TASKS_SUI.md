@@ -200,10 +200,10 @@ comes from an entropy struct RocksDB hashes whole, which holds a 64-byte
 hostname buffer of which only the name is written; the rest is whatever
 the stack held. Not chased further: identifiers only.
 
-*Later (2026-09-24, `TASKS_SUI_CLUSTER.md`):* not the hostname buffer,
-which RocksDB zeroes first, but `NowNanos` reading the Mach calendar
-clock through `clock_get_time`, a call the supervisor did not
-interpose. Fixed.
+*Later (2026-09-24; README, "The Mach clock services returned real
+time"):* not the hostname buffer, which RocksDB zeroes first, but
+`NowNanos` reading the Mach calendar clock through `clock_get_time`, a
+call the supervisor did not interpose. Fixed.
 
 ## What is input, still
 

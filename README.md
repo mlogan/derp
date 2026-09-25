@@ -35,10 +35,10 @@ Options worth knowing:
   baton hand-off moves the virtual clock, quantum expiries included; the
   default is 10µs, and a clock read moves it 1µs. Threads run one at a
   time on one clock, so the cost is kept low: at 1ms, the old default, a
-  Sui cluster of seven processes and hundreds of threads (the sui
-  repository's `scripts/derp`) got so little done per virtual second
-  that its own timeouts fired. The price is that code timing its own work
-  finds it very fast. Only a run-file run can change it.
+  run of several threaded servers with hundreds of threads between them
+  got so little done per virtual second that their own timeouts fired.
+  The price is that code timing its own work finds it very fast. Only a
+  run-file run can change it.
 - `--stop-after 30s` ends the run at that virtual time: whatever still
   runs is killed at that point of the schedule, reported as `stopped`,
   and does not fail the run. For servers that never exit by themselves,

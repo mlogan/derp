@@ -431,9 +431,6 @@ repository's history starts there.
 - Examples of real systems (`EXAMPLES`): `examples/` holds Redis,
   Postgres, SQLite, memcached and Go, with `tests/examples_tests.rs`. Go
   is set aside with a residual recorded in `tracking/TASKS_EXAMPLES.md`.
-- Sui cluster (`SUI_CLUSTER`): the sui repository's `scripts/derp/` runs sui-operations'
-  Antithesis cluster (four validators, two fullnodes, stress) repeatably;
-  `switch-cost`, relative `allow:` entries.
 
 **Nondeterminism list**: `README.md` has a section "Nondeterminism found
 and fixed": one item per source of nondeterminism (or supervisor bug)

@@ -39,7 +39,7 @@ fn a_reseeded_run_is_the_plain_run_until_the_reseed() {
     let traced = |extra: &[&str], name: &str| {
         let trace = dir.join(name);
         let _ = std::fs::remove_file(&trace);
-        let out = Command::new(common::rewrite_bin())
+        let out = Command::new(common::derp_bin())
             .args(["run", "--capture", "--seed", "3"])
             .args(extra)
             .arg("--scratch")
@@ -164,7 +164,7 @@ fn a_seed_that_passes_has_nothing_to_bisect() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("needs futures"));
 }
 
-/// The run bisected is the run `rewrite run` makes of the same file: the
+/// The run bisected is the run `derp run` makes of the same file: the
 /// file's own `seed:` counts, and a daemon that outlives the failing entry
 /// does not hide when that entry died.
 #[test]

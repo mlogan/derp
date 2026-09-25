@@ -15,8 +15,9 @@ use crate::alloc::{
 };
 use crate::determinism::{
     my_alarm, my_arc4random, my_arc4random_buf, my_arc4random_uniform, my_cc_random_generate_bytes,
-    my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_getitimer, my_getrusage,
-    my_gettimeofday, my_mach_absolute_time, my_mach_continuous_time, my_setitimer, my_time,
+    my_clock_get_time, my_clock_gettime, my_clock_gettime_nsec_np, my_getentropy, my_getitimer,
+    my_getrusage, my_gettimeofday, my_host_get_clock_service, my_mach_continuous_time,
+    my_setitimer, my_time, rewrite_mach_absolute_time_shim,
 };
 use crate::files::{
     my_flock, my_fsync, my_lseek, my_pread, my_pwrite, my_shm_unlink, open_nocancel,
@@ -118,6 +119,8 @@ extern "C" {
     fn clock_gettime_nsec_np(clk: libc::clockid_t) -> u64;
     fn mach_absolute_time() -> u64;
     fn mach_continuous_time() -> u64;
+    fn host_get_clock_service(host: u32, clock_id: c_int, clock: *mut u32) -> c_int;
+    fn clock_get_time(clock: u32, time: *mut [u32; 2]) -> c_int;
 }
 
 const DISPATCH_TIME_NOW: u64 = 0;
@@ -1054,6 +1057,8 @@ interposers! {
     my_clock_gettime_nsec_np => clock_gettime_nsec_np,
     my_gettimeofday => libc::gettimeofday,
     my_time => libc::time,
-    my_mach_absolute_time => mach_absolute_time,
+    rewrite_mach_absolute_time_shim => mach_absolute_time,
     my_mach_continuous_time => mach_continuous_time,
+    my_host_get_clock_service => host_get_clock_service,
+    my_clock_get_time => clock_get_time,
 }

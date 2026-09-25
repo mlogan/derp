@@ -7,7 +7,8 @@
 //!                                     put a block of each size at every step
 //!   kv server PORT CLIENTS [LOG]      key-value server; exits after CLIENTS
 //!                                     clients have said DONE
-//!   kv client HOST PORT ID N          three connections doing N rounds each
+//!   kv client HOST PORT ID N          three connections doing N rounds each,
+//!                                     or rounds for N of (virtual) time: `2000ms`
 //!
 //! Protocol, one line each way: `SET k v`, `GET k`, `DEL k`, `INCR k id`
 //! (`id` makes a resent request harmless), `HASH k`, `STATS`, `SUBSCRIBE`
@@ -40,7 +41,7 @@ fn main() {
         Some("client") => {
             let (host, port) = (arg(2).expect("HOST"), arg(3).expect("PORT"));
             let id: u32 = arg(4).and_then(|v| v.parse().ok()).expect("ID");
-            let rounds: u32 = arg(5).and_then(|v| v.parse().ok()).expect("N");
+            let rounds = arg(5).and_then(Rounds::parse).expect("N");
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -97,7 +98,25 @@ impl Conn {
     }
 }
 
-async fn client(addr: String, id: u32, rounds: u32) {
+/// How long each of a client's connections works.
+#[derive(Clone, Copy)]
+enum Rounds {
+    Count(u32),
+    /// Until this much time has passed: the work then spans the same span
+    /// of the clock however fast it goes
+    For(Duration),
+}
+
+impl Rounds {
+    fn parse(s: &str) -> Option<Rounds> {
+        match s.strip_suffix("ms") {
+            Some(ms) => Some(Rounds::For(Duration::from_millis(ms.parse().ok()?))),
+            None => Some(Rounds::Count(s.parse().ok()?)),
+        }
+    }
+}
+
+async fn client(addr: String, id: u32, rounds: Rounds) {
     const TASKS: u32 = 3;
     let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(TASKS as usize));
     let mut tasks = tokio::task::JoinSet::new();
@@ -112,7 +131,12 @@ async fn client(addr: String, id: u32, rounds: u32) {
             // Connected before the start, so that all three race
             assert!(c.request("STATS").await.starts_with("STATS"));
             barrier.wait().await;
-            for i in 0..rounds {
+            let start = tokio::time::Instant::now();
+            let mut i = 0;
+            while match rounds {
+                Rounds::Count(n) => i < n,
+                Rounds::For(d) => start.elapsed() < d,
+            } {
                 let (key, value) = (format!("c{id}t{t}k{}", i % 5), format!("v{i}"));
                 assert_eq!(c.request(&format!("SET {key} {value}")).await, "OK");
                 assert_eq!(
@@ -130,8 +154,9 @@ async fn client(addr: String, id: u32, rounds: u32) {
                     assert_eq!(c.request(&format!("DEL {key}")).await, "OK");
                     assert_eq!(c.request(&format!("GET {key}")).await, "NONE");
                 }
+                i += 1;
             }
-            c.reconnects
+            (c.reconnects, i)
         });
     }
     // Watches the changes go by until the server ends the stream. A server
@@ -170,9 +195,11 @@ async fn client(addr: String, id: u32, rounds: u32) {
             }
         })
     };
-    let mut reconnects = 0;
+    let (mut reconnects, mut done) = (0, 0);
     while let Some(r) = tasks.join_next().await {
-        reconnects += r.expect("client task");
+        let (r, n) = r.expect("client task");
+        reconnects += r;
+        done += n;
     }
     let mut c = Conn {
         addr,
@@ -180,7 +207,7 @@ async fn client(addr: String, id: u32, rounds: u32) {
         reconnects: 0,
     };
     let counter = c.request(&format!("GET counter{id}")).await;
-    assert_eq!(counter, format!("VALUE {}", TASKS * rounds));
+    assert_eq!(counter, format!("VALUE {done}"));
     assert_eq!(c.request(&format!("DONE {id}")).await, "OK");
     finished.send_replace(true);
     let changes = watcher.await.expect("watcher");

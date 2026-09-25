@@ -130,16 +130,16 @@ thread from any process, bump its `park_word`, wake it with
 - Reaps children with `waitpid`, keeps the (vpid, real pid) map, and prints
   one aggregated report: per-process hooks, switches, and the single
   run-wide schedule hash.
-- `rewrite run --seed S [--mem-hook-rate R] prog args…` stays as it is: one
+- `derp run --seed S [--mem-hook-rate R] prog args…` stays as it is: one
   initial process on host `h0`. Multi-process runs use
-  `rewrite run --seed S --manifest FILE`. The manifest is plain text: a
+  `derp run --seed S --manifest FILE`. The manifest is plain text: a
   `host NAME` line opens a host, and each indented line under it is one
   initial process, split into tokens (double quotes group an argument) that
   become the guest's `argv` verbatim. No launcher option is ever mixed into
   a guest's arguments, and a guest argument of `--` means nothing to us.
   Processes start in manifest order. The host table (names and addresses)
   is written into the shared state before any guest starts; it is also
-  exported as `REWRITE_HOSTS`, which only our own test programs read; `rewrite repeat` compares the
+  exported as `REWRITE_HOSTS`, which only our own test programs read; `derp repeat` compares the
   aggregated report and every process's stdout (each redirected to a file
   in the scratch directory).
 

@@ -22,7 +22,7 @@ fn python_ready() -> bool {
 fn run_example(name: &str, seed: u64, scratch: &Path) -> (String, String) {
     common::supervisor_dylib();
     let manifest = examples_dir().join(name).join("run.yaml");
-    let out = Command::new(common::rewrite_bin())
+    let out = Command::new(common::derp_bin())
         .args([
             "run",
             "--capture",

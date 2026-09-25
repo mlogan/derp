@@ -1,7 +1,7 @@
 # A PostgreSQL server on one host and a Python client on another, running
 # a CRUD workload from several threads. First `./setup.sh` (initdb, once)
 # and a venv with pg8000 (see ../README.md), then
-#   rewrite run --manifest examples/postgres/run.yaml --capture
+#   derp run --manifest examples/postgres/run.yaml --capture
 seed: 1
 env: { PYTHONPATH: site-packages }   # the venv's, copied into the client's host directory
 hosts:

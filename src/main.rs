@@ -10,26 +10,26 @@ use rewrite::rewrite::{self as rw, Options};
 
 const USAGE: &str = "\
 usage:
-  rewrite copy <in> <out>              round-trip a binary through the writer and re-sign it
-  rewrite scan [opts] <prog>           print what the rewriter would hook
-  rewrite rewrite [opts] <in> <out>    rewrite and sign
-  rewrite run [opts] <prog> [args…]    rewrite (cached), then launch under the supervisor
-  rewrite bench [opts] <prog> [args…]  time native vs rewritten (no supervisor)
-  rewrite repeat [opts] <prog> [args…] run N times; exit status, stdout and schedule hash must agree
-  rewrite bisect [opts] --manifest FILE  when was the failing seed's failure decided? Replays it
+  derp copy <in> <out>                 round-trip a binary through the writer and re-sign it
+  derp scan [opts] <prog>              print what the rewriter would hook
+  derp rewrite [opts] <in> <out>       rewrite and sign
+  derp run [opts] <prog> [args…]       rewrite (cached), then launch under the supervisor
+  derp bench [opts] <prog> [args…]     time native vs rewritten (no supervisor)
+  derp repeat [opts] <prog> [args…]    run N times; exit status, stdout and schedule hash must agree
+  derp bisect [opts] --manifest FILE   when was the failing seed's failure decided? Replays it
                                        with every stream reseeded at a virtual time, --runs
                                        futures per probe (default 20), --jobs at a time (4),
                                        down to --resolution (2ms)
-  rewrite suspects [opts] --manifest FILE  which loads and stores does the failing seed need?
+  derp suspects [opts] --manifest FILE  which loads and stores does the failing seed need?
                                        Masks switch points at hooked loads and stores until
                                        none can be dropped, and names their source lines
-  rewrite run|repeat [opts] --manifest FILE
+  derp run|repeat [opts] --manifest FILE
                                        several processes under one scheduler; see below
-  rewrite cargo <cargo args…>          cargo, with `rewrite cc` as the linker: a program too big
+  derp cargo <cargo args…>             cargo, with `derp cc` as the linker: a program too big
                                        for its sites to reach the stubs is linked again with
                                        rooms for them in its text (README, Big programs)
-  rewrite cc <linker args…>            the linker driver `rewrite cargo` installs
-  rewrite rooms <prog>                 the rooms `rewrite cc` would give <prog>, and why
+  derp cc <linker args…>               the linker driver `derp cargo` installs
+  derp rooms <prog>                    the rooms `derp cc` would give <prog>, and why
 options:
   --runs N                             repetitions for repeat (default 100)
   --seed S                             run seed (default 0)
@@ -54,6 +54,7 @@ options:
                                        messages about it
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
+  --switch-cost T                      virtual time each baton hand-off costs (default 10us)
   --stop-after T                       the run is over at this virtual time: what still runs
                                        is killed there, reported as stopped, and does not
                                        fail the run (for servers that never exit)
@@ -61,10 +62,11 @@ options:
                                        compare the CPU time (cpu_user_ns, cpu_system_ns) a
                                        program uses natively and under the supervisor
 run file:
-  seed: 7                              optional; the command line overrides these six
+  seed: 7                              optional; the command line overrides these
   quantum: 1000..10000
   mem-hook-rate: 1/16
   net-latency: 5ms
+  switch-cost: 10us
   heap-size: 32G
   stop-after: 30s
   wall-limit: 60s
@@ -82,7 +84,7 @@ run file:
 ";
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
-    eprintln!("rewrite: {msg}");
+    eprintln!("derp: {msg}");
     ExitCode::from(2)
 }
 
@@ -100,6 +102,7 @@ struct Cli {
     /// the supervisor's own messages about a guest are expected
     capture_stderr: bool,
     net_latency_ns: u64,
+    switch_ns: u64,
     heap_size: u64,
     /// Virtual time at which the run is over (0: when its processes are)
     stop_after_ns: u64,
@@ -122,6 +125,14 @@ fn parse_quantum(v: &str) -> Result<(u32, u32), String> {
         .ok_or(format!("bad quantum {v}"))
 }
 
+/// At least a microsecond: a lone thread that computes without reading the
+/// clock moves it only by its hand-offs, and a sleeper's deadline must pass.
+fn parse_switch_cost(v: &str) -> Result<u64, String> {
+    parse_duration_ns(v)
+        .filter(|&ns| ns >= 1_000)
+        .ok_or(format!("bad switch cost {v} (at least 1us)"))
+}
+
 /// The run's settings: the run file's, unless the command line gave them.
 fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, String> {
     let mut cli = cli.clone();
@@ -137,6 +148,9 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     }
     if let (Some(l), true) = (&m.net_latency, from_file("net-latency")) {
         cli.net_latency_ns = parse_duration_ns(l).ok_or(format!("bad duration {l}"))?;
+    }
+    if let (Some(c), true) = (&m.switch_cost, from_file("switch-cost")) {
+        cli.switch_ns = parse_switch_cost(c)?;
     }
     if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
         cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
@@ -168,6 +182,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         capture: false,
         capture_stderr: false,
         net_latency_ns: 0,
+        switch_ns: rewrite::shared::DEFAULT_SWITCH_NS,
         heap_size: launch::DEFAULT_HEAP,
         stop_after_ns: 0,
         wall_limit_ms: 0,
@@ -210,6 +225,10 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 let v = take_value(&mut args)?;
                 cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
                 cli.given.push("net-latency");
+            }
+            "--switch-cost" => {
+                cli.switch_ns = parse_switch_cost(&take_value(&mut args)?)?;
+                cli.given.push("switch-cost");
             }
             "--heap-size" => {
                 let v = take_value(&mut args)?;
@@ -273,7 +292,7 @@ fn dylib_for(cli: &Cli) -> Fallible<Option<PathBuf>> {
     }
     launch::default_dylib()
         .map(Some)
-        .ok_or_else(|| "supervisor dylib not found next to the rewrite binary".into())
+        .ok_or_else(|| "supervisor dylib not found next to the derp binary".into())
 }
 
 fn run_guest(
@@ -316,7 +335,7 @@ fn prepare_scratch(dir: &Path) -> Fallible<()> {
         let ours = dir.join(SCRATCH_MARKER).exists();
         if !ours && std::fs::read_dir(dir)?.next().is_some() {
             return Err(format!(
-                "{} exists, is not empty and was not created by rewrite",
+                "{} exists, is not empty and was not created by derp",
                 dir.display()
             )
             .into());
@@ -369,6 +388,31 @@ fn stderr_file(scratch: &Path, index: usize) -> PathBuf {
     scratch.join(format!("stderr.{index}"))
 }
 
+/// The run file's `allow:` entries as the supervisor compares them: as
+/// text, against paths with `/private` taken off `/tmp`, `/var` and
+/// `/etc`. A relative entry is next to the run file, like `argv[0]`, and
+/// is resolved through symlinks, since guests name the target.
+fn allowed_paths(base: &Path, allow: &[String]) -> Fallible<Vec<String>> {
+    allow
+        .iter()
+        .map(|entry| {
+            if entry.starts_with('/') {
+                return Ok(entry.clone());
+            }
+            let path = std::fs::canonicalize(base.join(entry))
+                .map_err(|e| format!("allow: {entry}: {e}"))?;
+            let text = path.to_string_lossy().into_owned();
+            let public = text.strip_prefix("/private").filter(|rest| {
+                ["/tmp", "/var", "/etc"].iter().any(|d| {
+                    rest.strip_prefix(d)
+                        .is_some_and(|r| r.is_empty() || r.starts_with('/'))
+                })
+            });
+            Ok(public.map_or(text.clone(), str::to_string))
+        })
+        .collect()
+}
+
 /// Start the manifest's processes under one scheduler. With `capture`,
 /// each guest's stdout goes to `stdout.<index>` in the scratch directory.
 fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallible<RunOutcome> {
@@ -387,6 +431,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
             cached_rewrite(&prog, &cli.opts)?
         });
     }
+    let allow = allowed_paths(base, &m.allow)?;
     prepare_scratch(scratch)?;
     let scratch = std::fs::canonicalize(scratch)?;
     let roots = rewrite::hostdir::prepare(&scratch, base, &m.hosts)?;
@@ -416,7 +461,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
             ];
             let policy = vec![
                 (rewrite::shared::HOST_ROOT_VAR.to_string(), text(root)),
-                (rewrite::shared::ALLOW_VAR.to_string(), m.allow.join(":")),
+                (rewrite::shared::ALLOW_VAR.to_string(), allow.join(":")),
             ];
             let env = layered(&[&fixed, &passed, &host_env, &m.env, &p.env, &policy]);
             Guest {
@@ -445,6 +490,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
+        switch_ns: cli.switch_ns,
         reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
         stop_at_ns: cli.stop_after_ns,
         wall_limit_ms: cli.wall_limit_ms,
@@ -580,6 +626,8 @@ fn replay_of(
         format!("{}/{}", cli.opts.mem_rate.0, cli.opts.mem_rate.1),
         "--net-latency".to_string(),
         format!("{}ns", cli.net_latency_ns),
+        "--switch-cost".to_string(),
+        format!("{}ns", cli.switch_ns),
         "--heap-size".to_string(),
         cli.heap_size.to_string(),
     ];
@@ -597,7 +645,7 @@ fn replay_of(
     Ok((cli, m, replay))
 }
 
-/// `rewrite suspects`: the loads and stores a failing seed needs.
+/// `derp suspects`: the loads and stores a failing seed needs.
 fn suspects(cli: &Cli) -> Fallible<()> {
     let (cli, _, replay) = replay_of(cli, "suspects")?;
     if cli.opts.mem_rate.0 == 0 {
@@ -622,7 +670,7 @@ fn suspects(cli: &Cli) -> Fallible<()> {
     Ok(())
 }
 
-/// `rewrite bisect`: find when the failing seed's failure was decided.
+/// `derp bisect`: find when the failing seed's failure was decided.
 fn bisect(cli: &Cli) -> Fallible<()> {
     let (cli, _, replay) = replay_of(cli, "bisect")?;
     let mut cfg = rewrite::bisect::Config {
@@ -774,7 +822,7 @@ fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
 /// The variable cargo reads the linker from, for the host's own target
 const LINKER_VAR: &str = "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER";
 
-/// `rewrite cargo …`: cargo with `rewrite cc` as the linker, through a
+/// `derp cargo …`: cargo with `derp cc` as the linker, through a
 /// script (cargo wants a program that takes the linker's arguments). No
 /// change to the program's own Cargo.toml or .cargo/config.
 fn rooms_cargo(args: Vec<OsString>) -> Fallible<ExitCode> {
@@ -796,7 +844,7 @@ fn rooms_cargo(args: Vec<OsString>) -> Fallible<ExitCode> {
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
-/// `rewrite rooms <prog>`: the plan `rewrite cc` would make for it.
+/// `derp rooms <prog>`: the plan `derp cc` would make for it.
 fn rooms_plan(prog: &Path) -> Fallible<()> {
     let m = read_macho(prog)?;
     let stats = rw::scan(&m, &Options::default())?;
@@ -824,7 +872,7 @@ fn rooms_plan(prog: &Path) -> Fallible<()> {
     Ok(())
 }
 
-/// `rewrite cc …`: link as `cc` would, then look at the result. An
+/// `derp cc …`: link as `cc` would, then look at the result. An
 /// executable with sites out of the stub segment's reach is linked once
 /// more, with a room for them in its text (`rooms`). Anything else, and
 /// a failed link, is left as it is.
@@ -863,7 +911,7 @@ fn rooms_link(args: Vec<OsString>) -> Fallible<ExitCode> {
     }
     if stats.rooms > 0 {
         eprintln!(
-            "rewrite cc: {name}: {} sites out of a b's reach with the {} rooms it has",
+            "derp cc: {name}: {} sites out of a b's reach with the {} rooms it has",
             stats.unreachable_sites, stats.rooms
         );
         return Ok(ExitCode::SUCCESS);
@@ -895,14 +943,14 @@ fn rooms_link(args: Vec<OsString>) -> Fallible<ExitCode> {
     again.push(format!("-Wl,-order_file,{}", order.display()).into());
     let relinked = std::process::Command::new("cc").args(&again).status()?;
     if !relinked.success() {
-        eprintln!("rewrite cc: {name}: linking with rooms failed; linked without");
+        eprintln!("derp cc: {name}: linking with rooms failed; linked without");
         let status = std::process::Command::new("cc").args(&args).status()?;
         return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
     }
     let after = read_macho(&out).and_then(|m| Ok(rw::scan(&m, &Options::default())?))?;
     let mb: u64 = plan.rooms.iter().map(|(_, b)| b).sum::<u64>() >> 20;
     let report = format!(
-        "rewrite cc: {name}: {} of {} sites were out of a b's reach; linked again with {} room{} \
+        "derp cc: {name}: {} of {} sites were out of a b's reach; linked again with {} room{} \
          ({mb} MB) in the text; {} still out of reach",
         plan.far_sites,
         stats.branch_sites + stats.call_sites + stats.unreachable_sites,

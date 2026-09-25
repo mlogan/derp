@@ -1,11 +1,15 @@
 # DERP: Deterministic Execution and Replay Platform. The rewriter and
-# launcher (this crate, the `rewrite` binary) and the supervisor dylib
+# launcher (this crate, the `derp` binary) and the supervisor dylib
 # (`supervisor/`) that runs inside every guest.
 [package]
 name = "rewrite"
 version = "0.1.0"
 edition = "2021"
 description = "Rewrites aarch64 Mach-O executables to hook branches and memory accesses, and launches them under a deterministic scheduler"
+
+[[bin]]
+name = "derp"
+path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"

@@ -147,6 +147,8 @@ pub struct Run {
     pub rewrite: Option<crate::rewrite::Options>,
     /// Virtual-time delay for traffic between different hosts
     pub net_latency_ns: u64,
+    /// Virtual time each baton hand-off costs
+    pub switch_ns: u64,
     /// Seed bisection: (virtual time, replacement seed)
     pub reseed: Option<(u64, u64)>,
     /// Virtual time at which the run is over whatever is still running
@@ -808,10 +810,7 @@ fn rewritten_path(run: &Run, payload: &[u8]) -> Result<Vec<u8>, i32> {
     match crate::cache::cached_rewrite(path, opts) {
         Ok(p) => Ok(p.as_os_str().as_bytes().to_vec()),
         Err(e) => {
-            eprintln!(
-                "rewrite: cannot rewrite {} for a guest: {e}",
-                path.display()
-            );
+            eprintln!("derp: cannot rewrite {} for a guest: {e}", path.display());
             Err(libc::ENOEXEC)
         }
     }
@@ -833,6 +832,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
     }
     if let Some(c) = coord {
         c.set_net_latency(run.net_latency_ns);
+        c.set_switch_cost(run.switch_ns);
         c.set_outside_network(run.outside_network);
         c.set_stop_at(run.stop_at_ns);
         c.set_debug_paths();
@@ -994,7 +994,7 @@ fn handle_frame(
             }
             channel.reply(0, &[]);
         }
-        other => eprintln!("rewrite: unknown frame type {other} from a guest"),
+        other => eprintln!("derp: unknown frame type {other} from a guest"),
     }
 }
 
@@ -1023,6 +1023,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         passive: cfg.passive,
         rewrite: cfg.rewrite.clone(),
         net_latency_ns: 0,
+        switch_ns: crate::shared::DEFAULT_SWITCH_NS,
         reseed: None,
         stop_at_ns: cfg.stop_at_ns,
         wall_limit_ms: cfg.wall_limit_ms,
@@ -1033,7 +1034,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
     Ok(out.guests.remove(0))
 }
 
-/// Where the supervisor dylib lives: next to the running `rewrite` binary.
+/// Where the supervisor dylib lives: next to the running `derp` binary.
 pub fn default_dylib() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;

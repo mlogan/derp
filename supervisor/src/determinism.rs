@@ -362,6 +362,82 @@ pub extern "C" fn my_mach_absolute_time() -> u64 {
     monotonic_ns() * 3 / 125
 }
 
+extern "C" {
+    pub fn rewrite_mach_absolute_time_shim();
+}
+
+// The link register is the caller's return address; the tail call keeps it.
+std::arch::global_asm!(
+    ".globl _rewrite_mach_absolute_time_shim",
+    ".p2align 2",
+    "_rewrite_mach_absolute_time_shim:",
+    "mov x0, x30",
+    "b _rewrite_mach_absolute_time_impl",
+);
+
+/// The system allocator reads the time for its own bookkeeping (`free`
+/// does), as often as its heap's state says, and GCD workers shape that
+/// state in real time: CoreFoundation's allocations on a scheduled thread
+/// ticked the clock once more or less from run to run. Such a read sees
+/// the clock and does not move it.
+#[no_mangle]
+pub extern "C" fn rewrite_mach_absolute_time_impl(caller: usize) -> u64 {
+    if crate::sched::on_scheduled_thread() && crate::process::in_system_allocator(caller) {
+        if let Some(now) = crate::sched::peek_clock() {
+            return (MONOTONIC_BASE_NS + now) * 3 / 125;
+        }
+    }
+    my_mach_absolute_time()
+}
+
+const SYSTEM_CLOCK: c_int = 0;
+const CALENDAR_CLOCK: c_int = 1;
+
+/// The Mach clock services a process has asked for: port and clock id.
+static CLOCK_PORTS: SpinLock<Vec<(u32, c_int)>> = SpinLock::new(Vec::new());
+
+extern "C" {
+    fn host_get_clock_service(host: u32, clock_id: c_int, clock: *mut u32) -> c_int;
+    fn clock_get_time(clock: u32, time: *mut [u32; 2]) -> c_int;
+}
+
+/// `host_get_clock_service`: the real port, remembered with its clock so
+/// that `clock_get_time` on it can answer from the run's clock.
+pub unsafe extern "C" fn my_host_get_clock_service(
+    host: u32,
+    clock_id: c_int,
+    clock: *mut u32,
+) -> c_int {
+    let rc = host_get_clock_service(host, clock_id, clock);
+    if rc == 0 && !clock.is_null() {
+        let mut ports = CLOCK_PORTS.lock();
+        ports.retain(|&(p, _)| p != *clock);
+        ports.push((*clock, clock_id));
+    }
+    rc
+}
+
+/// `clock_get_time`, a Mach call to the kernel's clock: `RocksDB`'s
+/// `NowNanos` on macOS reads the calendar clock this way, and mixed it
+/// into its DB and session ids. The calendar clock is the run's real
+/// time, the system clock its monotonic time.
+pub unsafe extern "C" fn my_clock_get_time(clock: u32, time: *mut [u32; 2]) -> c_int {
+    let id = CLOCK_PORTS
+        .lock()
+        .iter()
+        .find(|&&(p, _)| p == clock)
+        .map(|&(_, id)| id);
+    let ns = match id {
+        Some(CALENDAR_CLOCK) => realtime_ns(),
+        Some(SYSTEM_CLOCK) => monotonic_ns(),
+        _ => return clock_get_time(clock, time),
+    };
+    if !time.is_null() {
+        *time = [(ns / 1_000_000_000) as u32, (ns % 1_000_000_000) as u32];
+    }
+    0
+}
+
 pub extern "C" fn my_mach_continuous_time() -> u64 {
     monotonic_ns() * 3 / 125
 }

@@ -199,7 +199,7 @@ Yes, the way it reproduces the two-thread race.
   same process (parallel tests); exits are watched per pid with kqueue.
 - A test helper that used two launcher invocations passed the extra options
   to only one of them, and for a day the latency test compared outputs of
-  runs without latency. It is one invocation now (`rewrite run --capture`).
+  runs without latency. It is one invocation now (`derp run --capture`).
 
 ## Known limitations
 

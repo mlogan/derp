@@ -121,6 +121,11 @@ impl Coordinator {
         self.shared.lock().net.latency_ns = ns;
     }
 
+    /// Virtual time each baton hand-off costs.
+    pub fn set_switch_cost(&self, ns: u64) {
+        self.shared.lock().switch_ns = ns;
+    }
+
     /// End the run when the virtual clock reaches `ns` (0: never).
     pub fn set_stop_at(&self, ns: u64) {
         self.shared.lock().stop_at_ns = ns;

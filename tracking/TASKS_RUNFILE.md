@@ -48,7 +48,7 @@ Tracks `IMPLEMENTATION_PLAN_RUNFILE.md`. Branch `mlogan-multiproc`.
   interposers. The guard takes the cwd before its lock and marks the thread
   so the inner call passes; the first version spun on its own lock.
 - Spawned children inherit the policy even if the guest passes its own
-  `envp`. Single-program `rewrite run prog` has no policy and pays nothing.
+  `envp`. Single-program `derp run prog` has no policy and pays nothing.
 - The "first path outside the scratch directory" log is gone.
 - Test: `hostfs.c` on two hosts, 23 lines of allowed and refused operations
   each, the same relative name being a different file per host, `files:`
@@ -170,7 +170,7 @@ Found while re-running the curl/Python test next to the others (1 run in
   `PWD` and `TMPDIR`). The launcher forwards `REWRITE_TRACE` and
   `REWRITE_PARK_SPINS` explicitly. A trace path of another length moves the
   stack, so compare traces written to paths of equal length.
-- Single-program `rewrite run prog` still inherits the environment: that is
+- Single-program `derp run prog` still inherits the environment: that is
   the quick way to try a binary, and people expect their variables there.
 - Test: `envprobe.c` under two ambient environments that differ by 3 KB, a
   proxy, a locale and a time zone. Same variable names, same values, same

@@ -1,5 +1,5 @@
 //! A program too big for its sites to reach the stubs, linked with rooms
-//! for them in its text by `rewrite cc`.
+//! for them in its text by `derp cc`.
 
 mod common;
 
@@ -33,7 +33,7 @@ fn a_big_program_gets_rooms_and_every_site_is_hooked() {
 
     // The linker driver: links, sees the sites out of reach, links again
     let exe = dir.join("bigtext");
-    let out = Command::new(common::rewrite_bin())
+    let out = Command::new(common::derp_bin())
         .arg("cc")
         .arg("-o")
         .arg(&exe)
@@ -66,7 +66,7 @@ fn a_small_program_is_linked_once() {
     let dir = common::scratch_dir("rooms_small");
     let src = common::programs_dir().join("sleeper.c");
     let exe = dir.join("sleeper");
-    let out = Command::new(common::rewrite_bin())
+    let out = Command::new(common::derp_bin())
         .args(["cc", "-O1", "-o"])
         .arg(&exe)
         .arg(&src)

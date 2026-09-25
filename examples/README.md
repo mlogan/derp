@@ -4,7 +4,7 @@ Each directory holds a run file and a client for one system, meant to run
 repeatably: the same seed gives the same schedule hash and the same client
 output every time, and another seed another schedule.
 
-    rewrite run --manifest examples/redis/run.yaml --capture --scratch /tmp/rd
+    derp run --manifest examples/redis/run.yaml --capture --scratch /tmp/rd
     cat /tmp/rd/stdout.1
 
 ## Setting up
@@ -52,6 +52,12 @@ directory and point `PYTHONPATH` at it.
   output repeats, the schedule hash takes one of two values (one quantum
   ends one hook apart), which `tracking/TASKS_EXAMPLES.md` records with the next
   steps; set aside for now.
+
+A Sui cluster after sui-operations' Antithesis compose file (four
+validators, two fullnodes and the `stress` client) lives in the sui
+repository, `scripts/derp/`: its `run.sh` builds the binaries with
+`derp cargo` from that checkout (`DERP_DIR` names this one) and runs
+its run file. `tracking/TASKS_SUI_CLUSTER.md` has the numbers.
 
 ## Limits worth knowing
 

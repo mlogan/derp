@@ -1,7 +1,7 @@
 # Four processes on one host sharing a SQLite database in WAL mode: file
 # locks, the write-ahead log and its shared-memory index between guests.
 # Needs Homebrew's python@3.13 (its sqlite3 module), then
-#   rewrite run --manifest examples/sqlite/run.yaml --capture
+#   derp run --manifest examples/sqlite/run.yaml --capture
 seed: 1
 hosts:
   - name: db

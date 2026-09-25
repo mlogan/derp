@@ -92,7 +92,7 @@ Yes, and never with branch hooks only.
   tallies; both have a stable schedule hash per seed and different hashes
   across seeds (`tests/threads_tests.rs`).
 
-Determinism check (`rewrite repeat --runs N`, exit status + stdout +
+Determinism check (`derp repeat --runs N`, exit status + stdout +
 schedule hash): race.c 100/100, channel.rs 100/100, mutex.c 50/50, loops.c
 with dense memory hooks 20/20.
 

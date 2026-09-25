@@ -18,7 +18,7 @@ Plan: `IMPLEMENTATION_PLAN_SUSPECTS.md`. Branch `mlogan-site-bisect`.
   hook. Looked up only on expiry: no cost per hook. Addresses are taken
   before any slide, found for the executable itself (image 0 is the
   inserted library).
-- **`rewrite suspects --manifest FILE --seed S --mem-hook-rate R`**
+- **`derp suspects --manifest FILE --seed S --mem-hook-rate R`**
   (`src/suspects.rs`):
   1. reference run with a trace and an empty mask; it must fail;
   2. candidates: the loads and stores the run switched at. Masks are always
@@ -40,7 +40,7 @@ Plan: `IMPLEMENTATION_PLAN_SUSPECTS.md`. Branch `mlogan-site-bisect`.
 ## Results
 
 ```
-$ rewrite suspects --seed 1 --mem-hook-rate 1 --manifest lu.yaml
+$ derp suspects --seed 1 --mem-hook-rate 1 --manifest lu.yaml
 reference: seed 1 fails (entry 0: signal 6); it switched at 4 of 27 hooked loads and stores
   still fails with 2 sites
   still fails with 1 sites

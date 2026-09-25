@@ -1,7 +1,7 @@
 # A Redis server on one host and a Python client on another, running a
 # CRUD workload from several threads. Needs Homebrew's redis and
 # python@3.13, and a venv with redis-py (see ../README.md), then
-#   rewrite run --manifest examples/redis/run.yaml --capture
+#   derp run --manifest examples/redis/run.yaml --capture
 seed: 1
 env: { PYTHONPATH: site-packages }   # the venv's, copied into the client's host directory
 hosts:

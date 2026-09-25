@@ -75,19 +75,24 @@ const KV_RUN: &str = "hosts:
       - argv: [kv, server, 7000, 2, kv.log]
 SERVER_EXTRA  - name: c0
     processes:
-      - kv client server 7000 0 20
+      - kv client server 7000 0 ROUNDS
   - name: c1
     processes:
-      - kv client server 7000 1 20
+      - kv client server 7000 1 ROUNDS
 ";
 
-/// Three lines of one client's summary: counter, reconnects, changes seen.
-fn client_line(line: &str, id: u32) -> (u32, u32) {
+/// One client's summary: its counter, reconnects, changes seen.
+fn client_line(line: &str, id: u32) -> (u32, u32, u32) {
     let rest = line
-        .strip_prefix(&format!("client {id}: VALUE 60 reconnects="))
+        .strip_prefix(&format!("client {id}: VALUE "))
         .unwrap_or_else(|| panic!("{line}"));
+    let (value, rest) = rest.split_once(" reconnects=").unwrap();
     let (reconnects, changes) = rest.trim_end().split_once(" changes=").unwrap();
-    (reconnects.parse().unwrap(), changes.parse().unwrap())
+    (
+        value.parse().unwrap(),
+        reconnects.parse().unwrap(),
+        changes.parse().unwrap(),
+    )
 }
 
 #[test]
@@ -95,7 +100,11 @@ fn tokio_kv_server_and_clients_over_the_virtual_network() {
     let dir = common::scratch_dir("tokio_kv");
     common::build_kv(&dir);
     let manifest = dir.join("kv.yaml");
-    std::fs::write(&manifest, KV_RUN.replace("SERVER_EXTRA", "")).unwrap();
+    std::fs::write(
+        &manifest,
+        KV_RUN.replace("SERVER_EXTRA", "").replace("ROUNDS", "20"),
+    )
+    .unwrap();
     for seed in 1..=3 {
         let r = twice(&manifest, &dir.join("scratch"), seed, 3);
         // 2 clients x 3 tasks x 20 rounds, each adding to `total` once
@@ -105,7 +114,8 @@ fn tokio_kv_server_and_clients_over_the_virtual_network() {
             r.stdout[0]
         );
         for id in 0..2 {
-            let (reconnects, changes) = client_line(&r.stdout[id as usize + 1], id);
+            let (value, reconnects, changes) = client_line(&r.stdout[id as usize + 1], id);
+            assert_eq!(value, 60);
             assert_eq!(reconnects, 0);
             assert!(changes > 100, "the subscription saw {changes} changes");
         }
@@ -116,7 +126,8 @@ fn tokio_kv_server_and_clients_over_the_virtual_network() {
 
 /// The server writes every change down before it answers, so crashing it
 /// loses nothing: clients reconnect, resend, and the total is still exact
-/// because a resent `INCR` is recognised.
+/// because a resent `INCR` is recognised. The clients work for two seconds
+/// of the clock, which every crash falls within however fast it runs.
 #[test]
 fn tokio_kv_server_survives_crashes() {
     let dir = common::scratch_dir("tokio_kv_crash");
@@ -124,7 +135,13 @@ fn tokio_kv_server_survives_crashes() {
     let manifest = dir.join("crash.yaml");
     let faults = "        restart: on-failure\n        restart-delay: 50ms..150ms\n\
                   \x20       crash: { every: 150ms..400ms, times: 3 }\n";
-    std::fs::write(&manifest, KV_RUN.replace("SERVER_EXTRA", faults)).unwrap();
+    std::fs::write(
+        &manifest,
+        KV_RUN
+            .replace("SERVER_EXTRA", faults)
+            .replace("ROUNDS", "2000ms"),
+    )
+    .unwrap();
     // Also with switch points at memory accesses: between the halves of the
     // runtime's own atomics-and-queues protocols, and with less done per
     // virtual millisecond, so crashes land earlier in the work
@@ -138,15 +155,17 @@ fn tokio_kv_server_survives_crashes() {
         );
         assert_eq!(r.u64("run.crashes_injected"), 3, "seed {seed}");
         assert_eq!(r.u64("run.restarts"), 3, "seed {seed}");
-        // Only the last life gets to print
+        let clients: Vec<_> = (0..2)
+            .map(|id| client_line(&r.stdout[id as usize + 1], id))
+            .collect();
+        // Only the last life gets to print; its total is every client's
+        let total: u32 = clients.iter().map(|c| c.0).sum();
         assert!(
-            r.stdout[0].starts_with("server: total=120 done=2 "),
+            r.stdout[0].starts_with(&format!("server: total={total} done=2 ")),
             "seed {seed}: {}",
             r.stdout[0]
         );
-        let reconnects: u32 = (0..2)
-            .map(|id| client_line(&r.stdout[id as usize + 1], id).0)
-            .sum();
+        let reconnects: u32 = clients.iter().map(|c| c.1).sum();
         assert!(reconnects >= 3, "seed {seed}: {reconnects} reconnects");
     }
 }

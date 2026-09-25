@@ -1,25 +1,65 @@
 # DERP: Deterministic Execution and Replay Platform
 
-Runs native arm64 programs, several processes on virtual hosts if wanted,
-so that a run is a function of its seed: the same seed gives the same
-thread interleaving, clock, entropy, heap layout and network traffic
-every time, and a failing run replays, bisects to the moment it was
-decided, and names the lines it needs. The tool is `derp`: `derp rewrite`
-only rewrites a binary, and `derp run` rewrites what it runs (cached)
-before running it.
+Derp is a tool for running one or more processes deterministically, without containerization, hypervisors, or emulation.
+It works on whatever binaries your build system produces, or whatever you installed from homebrew.
+Thread scheduling, syscalls, hardware counters, heap layout, network traffic, and more are all determinstic.
 
-Rewrites arm64 Mach-O executables so that branches (and a sparse set of
-memory accesses) pass through stubs, and runs them under a supervisor
-dylib that owns the thread and process schedule. Given a seed, the
-interleaving of every thread in every process of a run repeats exactly.
+The main advantage of Derp is that you can use it locally on your mac, and benefit from a fast local iteration speed. Other tools like antithesis are far more sophisticated, 
 
-```
-derp run    --seed S [--mem-hook-rate R] prog args…
-derp run    --seed S --manifest FILE        # several processes on virtual hosts
-derp repeat --seed S --runs N …             # status, stdout and schedule hash must agree
-derp bench  prog args…                      # native vs rewritten, no scheduling
-```
+Derp **is not a secure sandbox or containerization system. Do not use it to run anything that you would not run directly**. It has some limited isolation features for convenience only.
 
+Currently Derp only supports arm64 Mach-O executables on MacOS.
+
+The approach it uses is binary rewriting.
+This is easy on arm64 because instructions are fixed-size.
+Branches, syscalls, loads/stores, hardware randomness, etc are all replaced with a unconditional branch to a small generated stub.
+This stub decrements a quantum counter, enters the scheduler if it reaches 0, and performs the task(s) of the original instruction, before jumping back to the original code.
+All threads (in all processes) contend on a single lock (claude calls it a "baton"), and the scheduler deterministically decides which thread will acquire the lock next.
+
+Execution is pseudo-randomly determinstic according to the seed supplied when starting the process(es).
+This allows us to do *Deterministic Simulation Testing* by repeating execution many times with different seeds.
+When a bug is found, it can be reproduced by re-running with the same seed.
+Derp can also automatically search for the point in (virtual) time at which the bug occurred, in cases where the incorrect execution precedes its detection by a substantial amount of time.
+
+## Capabilities and Limitations
+
+Derp can reproduce race conditions and other timing related bugs, errors in distributed systems, crash recovery, and any other sort of application logic bug.
+It cannot reproduce data races: All threads are serialized, so if your program has a data race, it can never occur while running in Derp.
+It similarly cannot expose any bug that is due to misuse of atomic operations.
+
+It uses a network simulator (currently very bare bones) for deterministic delivery of TCP and UDP traffic between processes.
+It can also inject process faults (i.e. killing processes randomly) to test crash recovery and fault tolerance.
+
+Several large systems including Postgres, sqlite, rocksdb, and redis have been tested and all run deterministically. See the examples directory.
+
+Derp generally has a slow-down factor of 2x or less for sequential code.
+Multithreaded or multi-process systems obviously lose all parallelism and will slow down accordingly.
+
+Derp can use debug or optimized binaries equally well.  Debuggers will probably mostly work on a binary that Derp has rewritten, but I haven't tested this.
+
+## Development
+
+Derp was written entirely by Claude Fable and Opus 5.5. The idea behind it was mine. (I don't claim to have invented the binary rewriting technique I used, I just mean that I directed Claude on the high level design).
+
+I built it mainly because I have always been frustrated by how few tools of this sort offer MacOS support, and since I do all my development on MacOS I don't get to take advantage of them.
+Also, I'm obsessed with Deterministic Simulation Testing, and wanted to explore a new approach.
+
+Behind the high-level idea lies a mountain of small hacks. It would have taken years to write this manually, mainly because of the amount of debugging required.
+
+The approach used was to get "hello world" working, and then through an escalating series of bigger challenges at claude.
+Each time, the goal was the same: No matter how many times the program is run, it must execute identically (and produce plausible output - crashing immediately would always produce identical output, but claude isn't that dumb.)
+Since this is a mechanically verifiable goal, claude is able to churn away mostly autonomously.
+Several times I had to stop it from trying to solve things in a stupid way, but for the most part it simply found bugs, fixed them, and kept going.
+
+## Known issues
+
+Although I've tested this on very large, non trivial programs (like postgres and sqlite) there are certainly still non-deterministic executions waiting to be found. Feel free to file an issue if you find one.
+
+Only arm64 Mach-O on MacOS is supported. Other operating systems or executable formats would probably be easy. Supporting x86_64 is more difficult because it doesn't have fixed-size instructions, but support would probably just be a matter of burning enough tokens.
+
+# Everything below this point is AI written, reader discretion advised.
+
+CLAUDE: document all options, not just a few, and use a table.
 Options worth knowing:
 
 - `--mem-hook-rate 1/16` hooks a sparse, seeded set of memory accesses;
@@ -61,6 +101,11 @@ Options worth knowing:
   when the baton bounces back within microseconds; off by default.
 
 ## The run file
+
+The run file allows you to configure a "cluster" that is split among several "hosts".
+For instance, you can start up a server as well as one or more clients that send load to it.
+Host isolation is extremely primitive, and does little besides telling hosts on different processes that they have different IPs.
+
 
 ```yaml
 seed: 7                  # optional; the command line overrides these
@@ -291,7 +336,9 @@ Results: `docs/REWRITE_RESULTS.md` (single process) and
   and `mappings_hinted`. An exited thread's stack is not reused; the
   region has room for about 30,000 threads of 2 MB.
 
-## Nondeterminism found and fixed
+## Sources of nondeterminism found and fixed
+
+CLAUDE: use a table for this section, its unreadable as is.
 
 Every item names an input the run took from outside itself, or a bug in
 the supervisor, and what was done. Keep this list current: a change that

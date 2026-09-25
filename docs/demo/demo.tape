@@ -28,12 +28,12 @@ Type "./counter; ./counter; ./counter"
 Enter
 Sleep 2s
 
-Type "# under derp, the seed decides the interleaving (the report on stderr is dropped here)"
+Type "# under derp, the seed decides the interleaving"
 Enter
-Type "derp run --seed 1 --mem-hook-rate 1 ./counter 2>/dev/null"
+Type "derp run --seed 1 --mem-hook-rate 1 ./counter"
 Enter
 Sleep 2s
-Type "derp run --seed 1 --mem-hook-rate 1 ./counter 2>/dev/null"
+Type "derp run --seed 1 --mem-hook-rate 1 ./counter"
 Enter
 Sleep 5s
 

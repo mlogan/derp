@@ -9,7 +9,7 @@ cargo build --release --workspace         # builds derp and, next to it, the sup
 target/release/derp run --seed 42 ./my-program arg1 arg2
 ```
 
-![derp running a racy counter under several seeds](docs/demo/demo.gif)
+![a racy counter run natively and twice under derp with the same seed](docs/demo/demo.gif)
 
 The main advantage of Derp over other similar tools is that you can use it locally on your Mac, and benefit from fast iteration speed.
 

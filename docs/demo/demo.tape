@@ -11,13 +11,12 @@ Set TypingSpeed 35ms
 Set Theme "Catppuccin Mocha"
 
 Hide
-Type "setopt interactive_comments; cd docs/demo && export PATH=$PWD/../../target/release:$PATH PS1='$ ' && rm -f counter counter.rw* && clear"
+Type "setopt interactive_comments nonomatch; cd docs/demo && export PATH=$PWD/../../target/release:$PATH PS1='$ ' && rm -f counter counter.rw* && clear"
 Enter
 Show
 
 Type "cat counter.c"
 Enter
-Sleep 3s
 
 Type "cc -O1 -o counter counter.c"
 Enter
@@ -36,12 +35,7 @@ Enter
 Sleep 2s
 Type "derp run --seed 1 --mem-hook-rate 1 ./counter 2>/dev/null"
 Enter
-Sleep 2s
-Type "# each seed is a different interleaving; search them for a failure"
-Enter
-Type "for s in 1 2 3 4 5; do derp run --seed $s --mem-hook-rate 1 ./counter 2>/dev/null; done"
-Enter
-Sleep 6s
+Sleep 5s
 
 Hide
 Type "rm -f counter counter.rw*"

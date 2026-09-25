@@ -432,11 +432,12 @@ repository's history starts there.
   Postgres, SQLite, memcached and Go, with `tests/examples_tests.rs`. Go
   is set aside with a residual recorded in `tracking/TASKS_EXAMPLES.md`.
 
-**Nondeterminism list**: `README.md` has a section "Nondeterminism found
-and fixed": one item per source of nondeterminism (or supervisor bug)
-closed, in the form *problem*: what was wrong, then what was done, in
-plain sentences. Every change that closes one must add its item there,
-in the same commit, under the fitting heading.
+**Nondeterminism list**: `README.md` has a section "Sources of
+nondeterminism found and fixed": one table row per source of
+nondeterminism (or supervisor bug) closed, with what was wrong in the
+Problem column and what was done in the Fix column, in plain sentences.
+Every change that closes one must add its row there, in the same commit,
+under the fitting heading.
 
 **Next**: not yet planned. Candidates in `tracking/TASKS_EXAMPLES.md`
 "Remaining": rewriting the dylibs a guest loads, replication and

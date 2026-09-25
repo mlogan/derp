@@ -4,6 +4,12 @@ Derp is a tool for running one or more processes deterministically, without cont
 It works on whatever binaries your build system produces, or whatever you installed from homebrew.
 Thread scheduling, syscalls, hardware counters, heap layout, network traffic, and more are all deterministic.
 
+```sh
+cargo build --release --workspace         # builds derp and, next to it, the supervisor dylib
+target/release/derp run --seed 42 ./my-program arg1 arg2
+target/release/derp repeat --seed 42 --runs 10 ./my-program arg1 arg2   # check that 10 runs agree
+```
+
 The main advantage of Derp over other similar tools is that you can use it locally on your Mac, and benefit from fast iteration speed.
 
 Derp **is not a secure sandbox! Do not use it to run anything that you would not run directly**. It has some limited isolation features for convenience only.
@@ -16,11 +22,39 @@ Branches, syscalls, loads/stores, hardware randomness, etc are all replaced with
 This stub decrements a quantum counter, enters the scheduler if it reaches 0, and performs the task(s) of the original instruction, before jumping back to the original code.
 All threads (in all processes) contend on a single lock (Claude calls it a "baton"), and the scheduler deterministically decides which thread will acquire the lock next.
 
+```
+   original            rewritten                    generated stub
+   ─────────────       ─────────────                ───────────────────────────────
+   cmp  x0, #0         cmp  x0, #0            ┌──►  stub_17:
+   b.ne loop           b    stub_17  ─────────┘       counter -= 1
+   add  x2, x2, #1     add  x2, x2, #1  ◄──┐          if counter == 0: enter scheduler
+                                           │          if ne: jump to loop   (the original b.ne)
+                                           └───────── else: jump back
+```
+
 Execution is pseudo-randomly deterministic according to the seed supplied when starting the process(es).
 This allows us to do *Deterministic Simulation Testing* by repeating execution many times with different seeds.
 When a bug is found, it can be reproduced by re-running with the same seed.
 
+```
+   process A: threads A1, A2          process B: threads B1, B2
+   only the holder of the baton runs; everyone else is parked
+
+   virtual time ─────────────────────────────────────────────►
+   seed 42   │ A1 │ B1 │ A2 │ A1 │ B2 │ B1 │ A2 │ ...    same seed, same order, every run
+   seed 7    │ B2 │ A1 │ A1 │ B1 │ A2 │ B2 │ A1 │ ...    another seed, another interleaving
+```
+
 Derp can automatically search for the point in (virtual) time at which the bug occurred, in cases where the incorrect execution precedes its detection by a substantial amount of time.
+
+```
+   virtual time ─────────────────────────────────────────────────────────►
+   seed 5              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ✗ assert fails
+   new future from t1  ━━━━━━━━━━━━━━━━━┯━ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  few futures fail: not decided yet
+   new future from t2  ━━━━━━━━━━━━━━━━━━━━━━━━━━┯━ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  nearly all fail: already decided
+                                        t1       t2
+                                        └────────┘ the bug happened in here; bisect narrows it further
+```
 
 ## Capabilities and Limitations
 

@@ -7,12 +7,12 @@ Plan: `IMPLEMENTATION_PLAN_BISECT.md`. Branch `mlogan-seed-bisect`.
 - **Reseed point** (`shared.rs`): `reseed_at`, `reseed_with`, `reseeded` in
   the shared state. At the first hand-off at or after `reseed_at` the
   scheduler's stream (thread choice, quanta) and the fault stream start
-  over from `reseed_with`. `rewrite run --reseed-at T --reseed N`.
+  over from `reseed_with`. `derp run --reseed-at T --reseed N`.
 - **Report**: `p<i>.died_at` (virtual time the run learned of each death),
   `run.clock_ns`, and for a failed run `run.failure=entry <n>: <status>`
   with `run.failure_at`. The failing entry is chosen as the exit status
   already was: the first non-daemon entry whose last life did not exit 0.
-- **`rewrite bisect --manifest FILE --seed S`** (`src/bisect.rs`):
+- **`derp bisect --manifest FILE --seed S`** (`src/bisect.rs`):
   1. runs the seed once with a schedule trace; it must fail;
   2. base rate: `--runs` (20) futures reseeded at the very start;
   3. binary search over `[0, failure time]`: each probe is `--runs` futures
@@ -95,7 +95,7 @@ rewriter hooked (chosen before the run).
 
 ## Not done
 
-- Run files only, no `rewrite run prog`.
+- Run files only, no `derp run prog`.
 - The signature is the failing entry and its status. Wrong output with a
   clean exit needs a user-supplied check command.
 - A deadlocked future is not counted as the reference's failure, and a

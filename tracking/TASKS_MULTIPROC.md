@@ -43,7 +43,7 @@ Updated at the end of each work unit.
   stores `pending_quantum` and whoever receives the baton installs it in
   its own `__STUBD` page. Hooks are accounted per process. This is also
   the fallback the plan names if the relocated counter costs too much.
-- `rewrite run|repeat --manifest FILE [--scratch DIR]`. Program paths are
+- `derp run|repeat --manifest FILE [--scratch DIR]`. Program paths are
   relative to the manifest; `argv[0]` is the manifest token, not the
   rewritten file. Manifest runs get the scratch directory as cwd and
   `TMPDIR`; an existing scratch directory is cleared only if it carries
@@ -184,7 +184,7 @@ Overhead on `loops 3` today (release build):
 - **External descriptors**: pipes and sockets on the launcher's own fds
   0-2 have their peer outside the run. The launcher exports their
   `dev:ino` and guests block on them for real; otherwise
-  `echo x | rewrite run prog` would be reported as a deadlock.
+  `echo x | derp run prog` would be reported as a deadlock.
 - `io_waits` per process in the report.
 - Test: `pipeline.c`, 200,000 lines through two pipes, every stage parks;
   correct on every seed, 100 identical runs at seed 2.
@@ -307,7 +307,7 @@ Overhead on `loops 3` today (release build):
   without, branch hooks only; seed 10 prints 500 of 2000 on 100 runs.
 - `shared_map.c`: exact with branch hooks; seed 30 at 1/16 prints 301,719
   of 400,000 on 100 runs.
-- `rewrite run --capture`. **Test-helper bug fixed:** it ran the launcher
+- `derp run --capture`. **Test-helper bug fixed:** it ran the launcher
   twice and passed extra options to one run only, so the latency test had
   been comparing outputs of runs without latency.
 

@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Once;
 
-pub fn rewrite_bin() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_rewrite"))
+pub fn derp_bin() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_derp"))
 }
 
 pub fn target_dir() -> PathBuf {
-    rewrite_bin().parent().unwrap().to_path_buf()
+    derp_bin().parent().unwrap().to_path_buf()
 }
 
 /// Build the supervisor cdylib once per test binary; cargo does not build
@@ -172,7 +172,7 @@ impl RunReport {
     }
 }
 
-/// One `rewrite run --capture`: the guests' stdout from the scratch
+/// One `derp run --capture`: the guests' stdout from the scratch
 /// directory and the aggregated report from the launcher's stderr.
 pub fn run_manifest(manifest: &Path, scratch: &Path, seed: u64, guests: usize) -> RunReport {
     run_manifest_with(manifest, scratch, seed, guests, &[])
@@ -186,7 +186,7 @@ pub fn run_manifest_with(
     extra: &[&str],
 ) -> RunReport {
     supervisor_dylib();
-    let report = Command::new(rewrite_bin())
+    let report = Command::new(derp_bin())
         .args(["run", "--capture", "--seed", &seed.to_string()])
         .args(extra)
         .arg("--scratch")
@@ -194,7 +194,7 @@ pub fn run_manifest_with(
         .arg("--manifest")
         .arg(manifest)
         .output()
-        .expect("rewrite run");
+        .expect("derp run");
     assert!(
         report.status.success(),
         "seed {seed}: {}",
@@ -245,7 +245,7 @@ pub fn report_fields(text: &str) -> BTreeMap<String, String> {
 /// `rewrite <args> <extra> --scratch … --manifest …`
 pub fn rewrite_cmd(args: &[&str], extra: &[&str], scratch: &Path, manifest: &Path) -> Command {
     supervisor_dylib();
-    let mut cmd = Command::new(rewrite_bin());
+    let mut cmd = Command::new(derp_bin());
     cmd.args(args)
         .args(extra)
         .arg("--scratch")
@@ -282,7 +282,7 @@ pub fn failing_and_passing_seed(extra: &[&str], scratch: &Path, manifest: &Path)
     panic!("200 seeds: failing {failing:?}, passing {passing:?}");
 }
 
-/// `rewrite run --capture` of a run file with a watchdog: None when the
+/// `derp run --capture` of a run file with a watchdog: None when the
 /// run was still going after `timeout` and had to be killed.
 pub fn run_manifest_timed(
     manifest: &Path,
@@ -299,7 +299,7 @@ pub fn run_manifest_timed(
     .stdout(std::process::Stdio::null())
     .stderr(std::process::Stdio::piped())
     .spawn()
-    .expect("rewrite run");
+    .expect("derp run");
     let began = std::time::Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {

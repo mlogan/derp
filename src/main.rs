@@ -10,26 +10,26 @@ use rewrite::rewrite::{self as rw, Options};
 
 const USAGE: &str = "\
 usage:
-  rewrite copy <in> <out>              round-trip a binary through the writer and re-sign it
-  rewrite scan [opts] <prog>           print what the rewriter would hook
-  rewrite rewrite [opts] <in> <out>    rewrite and sign
-  rewrite run [opts] <prog> [args…]    rewrite (cached), then launch under the supervisor
-  rewrite bench [opts] <prog> [args…]  time native vs rewritten (no supervisor)
-  rewrite repeat [opts] <prog> [args…] run N times; exit status, stdout and schedule hash must agree
-  rewrite bisect [opts] --manifest FILE  when was the failing seed's failure decided? Replays it
+  derp copy <in> <out>                 round-trip a binary through the writer and re-sign it
+  derp scan [opts] <prog>              print what the rewriter would hook
+  derp rewrite [opts] <in> <out>       rewrite and sign
+  derp run [opts] <prog> [args…]       rewrite (cached), then launch under the supervisor
+  derp bench [opts] <prog> [args…]     time native vs rewritten (no supervisor)
+  derp repeat [opts] <prog> [args…]    run N times; exit status, stdout and schedule hash must agree
+  derp bisect [opts] --manifest FILE   when was the failing seed's failure decided? Replays it
                                        with every stream reseeded at a virtual time, --runs
                                        futures per probe (default 20), --jobs at a time (4),
                                        down to --resolution (2ms)
-  rewrite suspects [opts] --manifest FILE  which loads and stores does the failing seed need?
+  derp suspects [opts] --manifest FILE  which loads and stores does the failing seed need?
                                        Masks switch points at hooked loads and stores until
                                        none can be dropped, and names their source lines
-  rewrite run|repeat [opts] --manifest FILE
+  derp run|repeat [opts] --manifest FILE
                                        several processes under one scheduler; see below
-  rewrite cargo <cargo args…>          cargo, with `rewrite cc` as the linker: a program too big
+  derp cargo <cargo args…>             cargo, with `derp cc` as the linker: a program too big
                                        for its sites to reach the stubs is linked again with
                                        rooms for them in its text (README, Big programs)
-  rewrite cc <linker args…>            the linker driver `rewrite cargo` installs
-  rewrite rooms <prog>                 the rooms `rewrite cc` would give <prog>, and why
+  derp cc <linker args…>               the linker driver `derp cargo` installs
+  derp rooms <prog>                    the rooms `derp cc` would give <prog>, and why
 options:
   --runs N                             repetitions for repeat (default 100)
   --seed S                             run seed (default 0)
@@ -84,7 +84,7 @@ run file:
 ";
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
-    eprintln!("rewrite: {msg}");
+    eprintln!("derp: {msg}");
     ExitCode::from(2)
 }
 
@@ -292,7 +292,7 @@ fn dylib_for(cli: &Cli) -> Fallible<Option<PathBuf>> {
     }
     launch::default_dylib()
         .map(Some)
-        .ok_or_else(|| "supervisor dylib not found next to the rewrite binary".into())
+        .ok_or_else(|| "supervisor dylib not found next to the derp binary".into())
 }
 
 fn run_guest(
@@ -335,7 +335,7 @@ fn prepare_scratch(dir: &Path) -> Fallible<()> {
         let ours = dir.join(SCRATCH_MARKER).exists();
         if !ours && std::fs::read_dir(dir)?.next().is_some() {
             return Err(format!(
-                "{} exists, is not empty and was not created by rewrite",
+                "{} exists, is not empty and was not created by derp",
                 dir.display()
             )
             .into());
@@ -645,7 +645,7 @@ fn replay_of(
     Ok((cli, m, replay))
 }
 
-/// `rewrite suspects`: the loads and stores a failing seed needs.
+/// `derp suspects`: the loads and stores a failing seed needs.
 fn suspects(cli: &Cli) -> Fallible<()> {
     let (cli, _, replay) = replay_of(cli, "suspects")?;
     if cli.opts.mem_rate.0 == 0 {
@@ -670,7 +670,7 @@ fn suspects(cli: &Cli) -> Fallible<()> {
     Ok(())
 }
 
-/// `rewrite bisect`: find when the failing seed's failure was decided.
+/// `derp bisect`: find when the failing seed's failure was decided.
 fn bisect(cli: &Cli) -> Fallible<()> {
     let (cli, _, replay) = replay_of(cli, "bisect")?;
     let mut cfg = rewrite::bisect::Config {
@@ -822,7 +822,7 @@ fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
 /// The variable cargo reads the linker from, for the host's own target
 const LINKER_VAR: &str = "CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER";
 
-/// `rewrite cargo …`: cargo with `rewrite cc` as the linker, through a
+/// `derp cargo …`: cargo with `derp cc` as the linker, through a
 /// script (cargo wants a program that takes the linker's arguments). No
 /// change to the program's own Cargo.toml or .cargo/config.
 fn rooms_cargo(args: Vec<OsString>) -> Fallible<ExitCode> {
@@ -844,7 +844,7 @@ fn rooms_cargo(args: Vec<OsString>) -> Fallible<ExitCode> {
     Ok(ExitCode::from(status.code().unwrap_or(1) as u8))
 }
 
-/// `rewrite rooms <prog>`: the plan `rewrite cc` would make for it.
+/// `derp rooms <prog>`: the plan `derp cc` would make for it.
 fn rooms_plan(prog: &Path) -> Fallible<()> {
     let m = read_macho(prog)?;
     let stats = rw::scan(&m, &Options::default())?;
@@ -872,7 +872,7 @@ fn rooms_plan(prog: &Path) -> Fallible<()> {
     Ok(())
 }
 
-/// `rewrite cc …`: link as `cc` would, then look at the result. An
+/// `derp cc …`: link as `cc` would, then look at the result. An
 /// executable with sites out of the stub segment's reach is linked once
 /// more, with a room for them in its text (`rooms`). Anything else, and
 /// a failed link, is left as it is.
@@ -911,7 +911,7 @@ fn rooms_link(args: Vec<OsString>) -> Fallible<ExitCode> {
     }
     if stats.rooms > 0 {
         eprintln!(
-            "rewrite cc: {name}: {} sites out of a b's reach with the {} rooms it has",
+            "derp cc: {name}: {} sites out of a b's reach with the {} rooms it has",
             stats.unreachable_sites, stats.rooms
         );
         return Ok(ExitCode::SUCCESS);
@@ -943,14 +943,14 @@ fn rooms_link(args: Vec<OsString>) -> Fallible<ExitCode> {
     again.push(format!("-Wl,-order_file,{}", order.display()).into());
     let relinked = std::process::Command::new("cc").args(&again).status()?;
     if !relinked.success() {
-        eprintln!("rewrite cc: {name}: linking with rooms failed; linked without");
+        eprintln!("derp cc: {name}: linking with rooms failed; linked without");
         let status = std::process::Command::new("cc").args(&args).status()?;
         return Ok(ExitCode::from(status.code().unwrap_or(1) as u8));
     }
     let after = read_macho(&out).and_then(|m| Ok(rw::scan(&m, &Options::default())?))?;
     let mb: u64 = plan.rooms.iter().map(|(_, b)| b).sum::<u64>() >> 20;
     let report = format!(
-        "rewrite cc: {name}: {} of {} sites were out of a b's reach; linked again with {} room{} \
+        "derp cc: {name}: {} of {} sites were out of a b's reach; linked again with {} room{} \
          ({mb} MB) in the text; {} still out of reach",
         plan.far_sites,
         stats.branch_sites + stats.call_sites + stats.unreachable_sites,

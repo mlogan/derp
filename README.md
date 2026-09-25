@@ -4,8 +4,9 @@ Runs native arm64 programs, several processes on virtual hosts if wanted,
 so that a run is a function of its seed: the same seed gives the same
 thread interleaving, clock, entropy, heap layout and network traffic
 every time, and a failing run replays, bisects to the moment it was
-decided, and names the lines it needs. The tool is `rewrite`, after what
-it does first.
+decided, and names the lines it needs. The tool is `derp`: `derp rewrite`
+only rewrites a binary, and `derp run` rewrites what it runs (cached)
+before running it.
 
 Rewrites arm64 Mach-O executables so that branches (and a sparse set of
 memory accesses) pass through stubs, and runs them under a supervisor
@@ -13,10 +14,10 @@ dylib that owns the thread and process schedule. Given a seed, the
 interleaving of every thread in every process of a run repeats exactly.
 
 ```
-rewrite run    --seed S [--mem-hook-rate R] prog args…
-rewrite run    --seed S --manifest FILE        # several processes on virtual hosts
-rewrite repeat --seed S --runs N …             # status, stdout and schedule hash must agree
-rewrite bench  prog args…                      # native vs rewritten, no scheduling
+derp run    --seed S [--mem-hook-rate R] prog args…
+derp run    --seed S --manifest FILE        # several processes on virtual hosts
+derp repeat --seed S --runs N …             # status, stdout and schedule hash must agree
+derp bench  prog args…                      # native vs rewritten, no scheduling
 ```
 
 Options worth knowing:
@@ -94,7 +95,7 @@ host's directory). Add to it in the run file: a top-level `env:` map for
 every process, `env:` on a process, or `pass-env: [NAME, ...]` to inherit
 named variables on purpose. Otherwise a proxy setting or a locale would be
 an input nobody wrote down, and the environment's length even decides where
-a guest's stack starts. Single-program `rewrite run prog` still inherits.
+a guest's stack starts. Single-program `derp run prog` still inherits.
 
 A process written as a map can be crashed on purpose and restarted:
 
@@ -207,7 +208,7 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
   fails with `ENETUNREACH` and looking up a name the run does not know
   fails with `EAI_NONAME`, unless the run file says `outside-network:
   allow`; then they reach the real network and what comes back is input.
-  A lone `rewrite run prog` allows them.
+  A lone `derp run prog` allows them.
 - A wait a system library makes for itself (libdispatch for a block on a
   GCD worker, libxpc for a reply: what the Security framework does to load
   certificates, what the resolver does) is made in the kernel with the
@@ -279,7 +280,7 @@ and `docs/MULTIPROC_RESULTS.md` (several processes, virtual network).
 - A read of the CPU's counter register (`mrs xN, cntvct_el0`, what Redis
   and others take their monotonic clock from, past every library) is
   rewritten into a read of the virtual clock, in the counter's ticks. The
-  report of `rewrite scan` and the "sites hooked" line count them.
+  report of `derp scan` and the "sites hooked" line count them.
 - Where a scheduled thread's mappings land is the run's: thread stacks,
   `pthread_t` blocks and `mmap`s without an address go to a reserved
   region (64 GB at `0x7c_0000_0000`) in schedule order, so the kernel's
@@ -554,7 +555,7 @@ closes a source of nondeterminism adds an item here.
 - *Sites more than 128 MB from the stub segment cannot reach it*: one
   shared stub body with a four-to-six-word trampoline per site, far
   callees through x16 islands at call sites, and rooms planted in the text
-  at link time by `rewrite cargo` for the sites still out of reach.
+  at link time by `derp cargo` for the sites still out of reach.
 - *A store-conditional fails when an interrupt lands between it and its
   load, and the retry branch after it was hooked*: the retry happened at
   the hardware's whim and counted a hook. The branch right after an
@@ -575,18 +576,18 @@ sites) has 45 MB of them. Every site must reach its trampoline, and the
 trampoline its target, with one `b` (±128 MB). The stub segment goes
 right after `__DATA`, so in a program whose code runs past about 120 MB
 the earliest sites cannot reach it: they are left as they are and counted
-(`unreachable` in `rewrite scan`, and in the "sites hooked" line; 2.5% of
+(`unreachable` in `derp scan`, and in the "sites hooked" line; 2.5% of
 sui's sites). Code that is not hooked runs without preemption until it
 reaches a hook or a blocking call; the run stays deterministic. A callee
 too far for a `b` is reached through x16, as a linker's branch island
 would. Below `__TEXT` is not an option: the kernel wants `__PAGEZERO` to
 cover the low 4 GB and reserves everything up to the first segment.
 
-For the rest, room is made at link time: `rewrite cargo build …` runs
-cargo with `rewrite cc` as the linker (through the
+For the rest, room is made at link time: `derp cargo build …` runs
+cargo with `derp cc` as the linker (through the
 `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER` variable; the program's own
 `Cargo.toml` and `.cargo/config` are not touched, and nothing happens
-unless you ask). `rewrite cc` links as `cc` would, and if the result has
+unless you ask). `derp cc` links as `cc` would, and if the result has
 sites out of the stubs' reach it links once more with a `.space` object
 per 128 MB of text, placed in the middle of its stretch by an order file
 listing the symbols before it (`<program>.rooms/`). The rewriter writes
@@ -594,10 +595,10 @@ the far sites' trampolines into those rooms, which are ordinary text.
 `<program>.rooms/report.txt` says what it did: how many sites were out of
 reach, how many rooms it made and how big, and how many sites still
 cannot be reached (cargo shows a linker's messages only when the link
-fails). `rewrite rooms <prog>` shows the plan for a program without
+fails). `derp rooms <prog>` shows the plan for a program without
 linking it. A `-O0` `sui-node` (180 MB of code, 4.8 million sites, 70% of
 them out of reach) gets two rooms of 76 MB together and every site is
-hooked; `rewrite run` then says how much went into rooms. `rewrite run` on a program that needed this and did not
+hooked; `derp run` then says how much went into rooms. `derp run` on a program that needed this and did not
 get it says so. No arm64 instruction reaches further than a `b` in one
 word, and stubs below `__TEXT` are impossible: the kernel wants
 `__PAGEZERO` to cover the low 4 GB and reserves everything up to the
@@ -626,7 +627,7 @@ that maps the region and schedules nothing. It adds under 1 ms of startup.
 ## When did a failing run go wrong?
 
 ```
-rewrite bisect --seed 5 --manifest run.yaml
+derp bisect --seed 5 --manifest run.yaml
 ```
 
 A race may corrupt something long before an assert notices. `bisect`
@@ -637,7 +638,7 @@ only as many as ever did. It measures that with `--runs` futures per probe
 (default 20, `--jobs` at a time), binary-searches `t` down to
 `--resolution` (2 ms of virtual time), and prints the probes, the interval
 in which the failure became certain, and the failing run's thread switches
-inside it. `--reseed-at T --reseed N` on `rewrite run` replays one such
+inside it. `--reseed-at T --reseed N` on `derp run` replays one such
 future. Every random stream starts over at `T`: thread choice and quanta,
 injected faults, where heap blocks land, and the entropy guests read. So a
 failure decided by pointer order or by a random value is found the same
@@ -646,7 +647,7 @@ way; its moment is the allocation or the draw.
 ## Which lines does a failing run need?
 
 ```
-rewrite suspects --seed 1 --mem-hook-rate 1 --manifest run.yaml
+derp suspects --seed 1 --mem-hook-rate 1 --manifest run.yaml
 ```
 
 With memory hooks on, a failing seed switched threads at some loads and

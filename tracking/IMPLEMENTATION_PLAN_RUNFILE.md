@@ -5,7 +5,7 @@ Follow-up to `IMPLEMENTATION_PLAN_MULTIPROC.md`, on the same branch
 
 ## 1. The run file is YAML
 
-Replaces the ad-hoc manifest format. `rewrite run|repeat --manifest run.yaml`.
+Replaces the ad-hoc manifest format. `derp run|repeat --manifest run.yaml`.
 
 ```yaml
 seed: 7                  # optional; the command line overrides all four
@@ -59,7 +59,7 @@ another's files by accident. Symlinks and deliberate tricks may escape.
   `truncate`, `chmod`, `chown`, `utimes`, `mkfifo`, `opendir`, `realpath`,
   and the `$NOCANCEL` forms libSystem uses. UNIX-domain socket paths are
   already per-host names with no filesystem node.
-- Single-program `rewrite run prog` has no host root and no checks.
+- Single-program `derp run prog` has no host root and no checks.
 - Replaces the "first path outside the scratch directory" log.
 
 Tests: a C program that reads and writes inside its root, is refused another

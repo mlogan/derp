@@ -174,16 +174,16 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
             format!(", {} counter reads", stats.counter_sites)
         };
         eprintln!(
-            "rewrite: {} sites hooked{unreachable}{rooms}{counters} -> {}",
+            "derp: {} sites hooked{unreachable}{rooms}{counters} -> {}",
             stats.branch_sites + stats.call_sites + stats.mem_sites,
             out.display()
         );
         if stats.unreachable_sites > 0 {
             eprintln!(
-                "rewrite: {}",
+                "derp: {}",
                 if stats.rooms == 0 {
                     "the program is too big for every site to reach the stubs; building it with \
-                     `rewrite cargo build …` leaves room for them in its text (README, Big programs)"
+                     `derp cargo build …` leaves room for them in its text (README, Big programs)"
                 } else {
                     "its rooms are full: a room plan from an older build?"
                 }

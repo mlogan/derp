@@ -8,8 +8,8 @@
 //! order file that lists the symbols meant to come before it (the linker
 //! keeps the rest in their usual order after the listed ones). The
 //! rewriter then writes the trampolines of sites out of the segment's
-//! reach into the room nearest them. `rewrite cc` does the planning and
-//! the second link; `rewrite cargo` puts it in cargo's way as the linker.
+//! reach into the room nearest them. `derp cc` does the planning and
+//! the second link; `derp cargo` puts it in cargo's way as the linker.
 //!
 //! The plan comes from the first link: sites per MB of text, from
 //! `Stats::sites_per_mb`, decide each room's size; a room covers 128 MB on

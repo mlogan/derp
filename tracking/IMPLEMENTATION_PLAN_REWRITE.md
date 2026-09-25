@@ -75,7 +75,7 @@ The experiment answers three questions with numbers:
   only jobs are building that environment, forwarding argv, and reporting
   the child's exit status, schedule hash and hook counts (which the
   supervisor writes to an inherited fd or shared page before exit).
-- Also drive the rewriter (component 2) on demand so `rewrite run prog`
+- Also drive the rewriter (component 2) on demand so `derp run prog`
   rewrites, signs and launches in one step, caching the rewritten file.
 
 ### 2. Rewriter (`src/rewrite.rs`, `decode.rs`, `macho.rs`)
@@ -229,10 +229,10 @@ the baton; this is a known limitation, acceptable for the test programs.
 
 ### 7. Driver and measurements
 
-`rewrite run --seed S [--mem-hook-rate R] [--quantum LO..HI] prog args…`
+`derp run --seed S [--mem-hook-rate R] [--quantum LO..HI] prog args…`
 rewrites and signs the binary if needed, launches it, and prints the
 guest's exit status, the schedule hash and hook counts to stderr.
-`rewrite bench prog` runs native and rewritten and prints the ratio.
+`derp bench prog` runs native and rewritten and prints the ratio.
 
 ## Implementation Order
 

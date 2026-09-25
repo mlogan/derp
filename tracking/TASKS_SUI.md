@@ -1,7 +1,7 @@
 # Sui under the supervisor: progress
 
 Goal: run `sui start` (a local network: a validator and a fullnode in one
-process) deterministically under `rewrite run`, end the run after a fixed
+process) deterministically under `derp run`, end the run after a fixed
 virtual time, and compare `RUST_LOG=trace` output between runs.
 
 Branch `mlogan-sui`. Sui checkout: `~/repos/sui` (main, 1.74.0), built
@@ -31,7 +31,7 @@ hosts:
       - argv: [/path/to/sui, start, --force-regenesis]
 ```
 
-`rewrite run --capture --capture-stderr --scratch DIR --manifest FILE`;
+`derp run --capture --capture-stderr --scratch DIR --manifest FILE`;
 the log is `DIR/net/sui.log.2027-01-15` (the virtual clock's date).
 
 ## What had to change (in commit order)
@@ -129,11 +129,11 @@ trampolines. Not built.
 
 ## Rooms: the `-O0` sui-node (2026-09-22)
 
-`rewrite cargo build -p sui-node --bin sui-node --no-default-features`
+`derp cargo build -p sui-node --bin sui-node --no-default-features`
 from the sui checkout. The wrapper links `sui-node` twice: the second
 time with two rooms (80 MB and 48 MB of `.space`, placed at 48 MB and
 230 MB of the text by a 775k-line order file); the file grows from 491 to
-619 MB and its text from 180 to 305 MB. `rewrite scan`: 4.79 million
+619 MB and its text from 180 to 305 MB. `derp scan`: 4.79 million
 sites hooked, 0 unreachable, 75 MB of trampolines in the rooms. The
 node (one validator, `sui genesis` config, `stop-after: 120s`, about 4 s
 real) runs consensus and executes checkpoints; three runs give the same
@@ -185,7 +185,7 @@ Other ways to measure, not done: count instructions natively with
 `xctrace` (Instruments' counters) against hooks x cost per hook; run
 the node natively with the same seed of work (a fixed number of
 transactions from a client) and stop both at the last transaction's
-effects; or `rewrite bench` on a Move unit-test run, which is longer
+effects; or `derp bench` on a Move unit-test run, which is longer
 and all compute. `sui move build` under a single-program run gave two
 hashes in three runs: such a run inherits the environment and the
 build cache's file times, both real input.

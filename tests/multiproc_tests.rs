@@ -79,7 +79,7 @@ fn a_guest_that_dies_holding_the_baton_does_not_hang_the_run() {
     )
     .unwrap();
     common::supervisor_dylib();
-    let out = Command::new(common::rewrite_bin())
+    let out = Command::new(common::derp_bin())
         .args(["run", "--seed", "1", "--scratch"])
         .arg(dir.join("scratch"))
         .arg("--manifest")
@@ -740,7 +740,7 @@ hosts:
     let scratch = dir.join("scratch");
     common::supervisor_dylib();
     let run = |extra: &[&str]| {
-        let out = Command::new(common::rewrite_bin())
+        let out = Command::new(common::derp_bin())
             .args(["run", "--capture"])
             .args(extra)
             .arg("--scratch")
@@ -779,7 +779,7 @@ hosts:
     ] {
         let bad = dir.join("bad.yaml");
         std::fs::write(&bad, text).unwrap();
-        let out = Command::new(common::rewrite_bin())
+        let out = Command::new(common::derp_bin())
             .args(["run", "--scratch"])
             .arg(&scratch)
             .arg("--manifest")
@@ -951,7 +951,7 @@ fn a_guest_that_uses_gcd_is_turned_away() {
             format!("hosts:\n  - name: a\n    processes:\n      - gcd_user {mode}\n"),
         )
         .unwrap();
-        let out = Command::new(common::rewrite_bin())
+        let out = Command::new(common::derp_bin())
             .args(["run", "--capture", "--seed", "1", "--scratch"])
             .arg(&scratch)
             .arg("--manifest")
@@ -1017,7 +1017,7 @@ hosts:
     for (i, vars) in ambient.iter().enumerate() {
         let trace = dir.join(format!("trace{i}"));
         let _ = std::fs::remove_file(&trace);
-        let out = Command::new(common::rewrite_bin())
+        let out = Command::new(common::derp_bin())
             .args(["run", "--capture", "--seed", "3", "--scratch"])
             .arg(&scratch)
             .arg("--manifest")
@@ -1066,7 +1066,7 @@ fn a_deadlock_across_processes_ends_the_run() {
     )
     .unwrap();
     common::supervisor_dylib();
-    let out = Command::new(common::rewrite_bin())
+    let out = Command::new(common::derp_bin())
         .args(["run", "--capture", "--seed", "1", "--scratch"])
         .arg(dir.join("scratch"))
         .arg("--manifest")
@@ -1126,7 +1126,7 @@ fn daemons_are_killed_in_runs_without_the_scheduler_too() {
     )
     .unwrap();
     for mode in ["--native", "--no-supervisor"] {
-        let out = Command::new(common::rewrite_bin())
+        let out = Command::new(common::derp_bin())
             .args(["run", "--capture", mode, "--scratch"])
             .arg(dir.join("scratch"))
             .arg("--manifest")
@@ -1291,7 +1291,7 @@ fn many_processes_can_crash_at_once() {
     }
     let manifest = dir.join("at_once.yaml");
     std::fs::write(&manifest, text).unwrap();
-    let out = Command::new(common::rewrite_bin())
+    let out = Command::new(common::derp_bin())
         .args(["run", "--capture", "--seed", "1", "--scratch"])
         .arg(dir.join("scratch"))
         .arg("--manifest")
@@ -1314,7 +1314,7 @@ fn fault_settings_need_the_supervisor() {
     )
     .unwrap();
     for mode in ["--native", "--no-supervisor"] {
-        let out = Command::new(common::rewrite_bin())
+        let out = Command::new(common::derp_bin())
             .args(["run", mode, "--scratch"])
             .arg(dir.join("scratch"))
             .arg("--manifest")
@@ -1402,7 +1402,7 @@ fn restarts_stop_where_the_run_file_says() {
             ),
         )
         .unwrap();
-        let out = Command::new(common::rewrite_bin())
+        let out = Command::new(common::derp_bin())
             .args(["run", "--capture", "--seed", "1", "--scratch"])
             .arg(&scratch)
             .arg("--manifest")
@@ -1438,7 +1438,7 @@ fn guests_exit_when_the_launcher_is_killed() {
         "hosts:\n  - name: a\n    processes:\n      - ping_pong pong 7000\n      - lifecycle forever\n",
     )
     .unwrap();
-    let mut launcher = Command::new(common::rewrite_bin())
+    let mut launcher = Command::new(common::derp_bin())
         .args(["run", "--capture", "--scratch"])
         .arg(dir.join("scratch"))
         .arg("--manifest")
@@ -1689,7 +1689,7 @@ fn a_single_program_run_stops_too() {
     let dir = common::scratch_dir("single_stop_after");
     let exe = common::build_c("sleeper", &dir, &[]);
     common::supervisor_dylib();
-    let out = Command::new(common::rewrite_bin())
+    let out = Command::new(common::derp_bin())
         .args(["run", "--seed", "3", "--stop-after", "2s"])
         .arg(&exe)
         .args(["100000", "1000"])
@@ -1706,7 +1706,7 @@ fn a_single_program_run_stops_too() {
 fn a_wall_limit_ends_a_native_run_and_cpu_time_is_reported() {
     let dir = common::scratch_dir("wall_limit");
     let exe = common::build_c("sleeper", &dir, &[]);
-    let out = Command::new(common::rewrite_bin())
+    let out = Command::new(common::derp_bin())
         .args(["run", "--native", "--wall-limit", "300ms"])
         .arg(&exe)
         .args(["100000", "1000"])

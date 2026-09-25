@@ -1,7 +1,7 @@
 # A Go key-value server on one host and a Go client of eight goroutines
 # on another (`go build -ldflags=-linkmode=external -o bin/kvgo .` first:
 # Go's own linker emits no LC_FUNCTION_STARTS), then
-#   rewrite run --manifest examples/go/run.yaml --capture
+#   derp run --manifest examples/go/run.yaml --capture
 seed: 1
 # Go resolves names itself unless told to use the system resolver, which
 # is how it learns the run's host names

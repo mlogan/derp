@@ -32,7 +32,7 @@ is the unmasked run exactly.
    no cost per hook). The variable is set for the reference run too, with
    an empty file: the environment's size decides where a guest's stack
    starts, so every run must have it.
-3. **`rewrite suspects --manifest FILE --seed S --mem-hook-rate R`**
+3. **`derp suspects --manifest FILE --seed S --mem-hook-rate R`**
    - Reference run with a trace; it must fail. The signature is the one
      seed bisection uses (`run.failure`).
    - Candidates: the load and store sites at which the reference run

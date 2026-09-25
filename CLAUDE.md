@@ -405,7 +405,7 @@ Before committing, verify:
 
 DERP, the Deterministic Execution and Replay Platform, runs native arm64
 Mach-O programs under a deterministic baton scheduler: the rewriter
-(`src/`, the `rewrite` binary) hooks branches, calls and a sparse set of
+(`src/`, the `derp` binary) hooks branches, calls and a sparse set of
 memory accesses, and the supervisor dylib (`supervisor/`) owns the
 schedule, the clock, the entropy, the heap layout and the virtual
 network of every guest. Usage in `README.md`. The project began as the
@@ -424,9 +424,9 @@ repository's history starts there.
 - Process fault injection (`FAULTS`): seeded crashes and restart policies.
 - Tokio guest (`TOKIO`): `tests/programs/kv`.
 - Seeded heap layout (`HEAP`), seed bisection (`BISECT`, `rewrite
-  bisect`), site minimisation (`SUSPECTS`, `rewrite suspects`).
+  bisect`), site minimisation (`SUSPECTS`, `derp suspects`).
 - Sui under the supervisor (`SUI`): compact stubs, rooms for
-  binaries past 128 MB (`rewrite cargo`), `--stop-after`, `--wall-limit`,
+  binaries past 128 MB (`derp cargo`), `--stop-after`, `--wall-limit`,
   CPU time in the report.
 - Examples of real systems (`EXAMPLES`): `examples/` holds Redis,
   Postgres, SQLite, memcached and Go, with `tests/examples_tests.rs`. Go

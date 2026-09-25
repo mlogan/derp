@@ -17,13 +17,13 @@ replacement streams, because what is measured is a probability.
 
 ## Goals
 
-1. `--reseed-at NS --reseed N` on `rewrite run`: at the first hand-off at
+1. `--reseed-at NS --reseed N` on `derp run`: at the first hand-off at
    or after virtual time `NS`, the scheduler's stream (thread choice and
    quanta) and the fault stream are reseeded from `N`. The run is identical
    to the plain run until then, and a function of (seed, NS, N) after.
 2. The report says when each process died in virtual time
    (`p<i>.died_at`).
-3. `rewrite bisect --manifest FILE --seed S [--runs N] [--jobs J]
+3. `derp bisect --manifest FILE --seed S [--runs N] [--jobs J]
    [--resolution DUR]`:
    - runs the seed, takes the failure's signature (which run-file entry
      died and how) and its time `T`;
@@ -43,7 +43,7 @@ replacement streams, because what is measured is a probability.
 - Reseeding the per-process streams (heap layout, entropy). Their state is
   in each guest; a later step. Until then a failure that depends only on
   heap layout looks decided from the start.
-- Single-program runs (`rewrite run prog`): bisection takes a run file. A
+- Single-program runs (`derp run prog`): bisection takes a run file. A
   one-process run file is three lines.
 - Failures that are not an exit status (wrong output). The signature could
   later be a user-supplied check command.

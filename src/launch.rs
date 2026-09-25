@@ -810,10 +810,7 @@ fn rewritten_path(run: &Run, payload: &[u8]) -> Result<Vec<u8>, i32> {
     match crate::cache::cached_rewrite(path, opts) {
         Ok(p) => Ok(p.as_os_str().as_bytes().to_vec()),
         Err(e) => {
-            eprintln!(
-                "rewrite: cannot rewrite {} for a guest: {e}",
-                path.display()
-            );
+            eprintln!("derp: cannot rewrite {} for a guest: {e}", path.display());
             Err(libc::ENOEXEC)
         }
     }
@@ -997,7 +994,7 @@ fn handle_frame(
             }
             channel.reply(0, &[]);
         }
-        other => eprintln!("rewrite: unknown frame type {other} from a guest"),
+        other => eprintln!("derp: unknown frame type {other} from a guest"),
     }
 }
 
@@ -1037,7 +1034,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
     Ok(out.guests.remove(0))
 }
 
-/// Where the supervisor dylib lives: next to the running `rewrite` binary.
+/// Where the supervisor dylib lives: next to the running `derp` binary.
 pub fn default_dylib() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;

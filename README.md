@@ -7,8 +7,9 @@ Thread scheduling, syscalls, hardware counters, heap layout, network traffic, an
 ```sh
 cargo build --release --workspace         # builds derp and, next to it, the supervisor dylib
 target/release/derp run --seed 42 ./my-program arg1 arg2
-target/release/derp repeat --seed 42 --runs 10 ./my-program arg1 arg2   # check that 10 runs agree
 ```
+
+![derp running a racy counter under several seeds](docs/demo/demo.gif)
 
 The main advantage of Derp over other similar tools is that you can use it locally on your Mac, and benefit from fast iteration speed.
 

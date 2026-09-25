@@ -40,7 +40,7 @@ fn a_reseeded_run_is_the_plain_run_until_the_reseed() {
         let trace = dir.join(name);
         let _ = std::fs::remove_file(&trace);
         let out = Command::new(common::derp_bin())
-            .args(["run", "--capture", "--seed", "3"])
+            .args(["run", "-v", "--capture", "--seed", "3"])
             .args(extra)
             .arg("--scratch")
             .arg(dir.join("scratch"))
@@ -182,7 +182,7 @@ fn bisection_replays_the_run_file_as_run_does() {
 
     // The seed and quantum from the file, none on the command line
     std::fs::write(&manifest, format!("seed: {seed}\n{settings}{with_daemon}")).unwrap();
-    let plain = rewrite(&["run", "--capture"], &scratch, &manifest);
+    let plain = rewrite(&["run", "-v", "--capture"], &scratch, &manifest);
     let plain = common::report_fields(&String::from_utf8_lossy(&plain.stderr));
     let out = rewrite(&["bisect"], &scratch, &manifest);
     let text = String::from_utf8_lossy(&out.stdout).into_owned();

@@ -31,6 +31,8 @@ usage:
   derp cc <linker args…>               the linker driver `derp cargo` installs
   derp rooms <prog>                    the rooms `derp cc` would give <prog>, and why
 options:
+  -v, --verbose                        run, rewrite: say what was rewritten and print the
+                                       run's report (key=value lines) on stderr
   --runs N                             repetitions for repeat (default 100)
   --seed S                             run seed (default 0)
   --mem-hook-rate R                    0, 1 or a fraction like 1/16 (default 0)
@@ -115,6 +117,7 @@ struct Cli {
     disable_aslr: bool,
     native: bool,
     runs: u32,
+    verbose: bool,
     rest: Vec<OsString>,
 }
 
@@ -193,6 +196,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         disable_aslr: true,
         native: false,
         runs: 100,
+        verbose: false,
         rest: Vec::new(),
     };
     while let Some(a) = args.first().and_then(|a| a.to_str()).map(str::to_owned) {
@@ -265,6 +269,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             "--no-supervisor" => cli.supervisor = false,
             "--aslr" => cli.disable_aslr = false,
             "--native" => cli.native = true,
+            "-v" | "--verbose" => cli.verbose = true,
             "--runs" => {
                 cli.runs = take_value(&mut args)?.parse().map_err(|_| "bad --runs")?;
                 cli.given.push("runs");
@@ -997,6 +1002,7 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
+    rewrite::cache::set_verbose(cli.verbose);
     let rest = cli.rest.clone();
     let result: Fallible<ExitCode> = match cmd.to_str() {
         Some("copy") if rest.len() == 2 => {
@@ -1010,14 +1016,18 @@ fn main() -> ExitCode {
             }),
         Some("rewrite") if rest.len() == 2 => {
             rewrite_file(Path::new(&rest[0]), Path::new(&rest[1]), &cli.opts).map(|stats| {
-                eprintln!("{stats}");
+                if cli.verbose {
+                    eprintln!("{stats}");
+                }
                 ExitCode::SUCCESS
             })
         }
         Some("run") if rest.is_empty() && cli.manifest.is_some() => {
             let manifest = cli.manifest.clone().unwrap();
             run_manifest(&cli, &manifest, &scratch_dir(&cli), cli.capture).map(|o| {
-                print_run_report(&o);
+                if cli.verbose {
+                    print_run_report(&o);
+                }
                 exit_from_run(&o)
             })
         }
@@ -1028,7 +1038,7 @@ fn main() -> ExitCode {
             } else {
                 cached_rewrite(&prog, &cli.opts)
             };
-            exe.and_then(|exe| run_guest(exe, &cli, rest[1..].to_vec(), false, None))
+            exe.and_then(|exe| run_guest(exe, &cli, rest[1..].to_vec(), !cli.verbose, None))
                 .map(|o| exit_from(&o))
         }
         Some("bisect") if rest.is_empty() && cli.manifest.is_some() => {

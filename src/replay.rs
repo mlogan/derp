@@ -116,7 +116,7 @@ impl Replay {
         // The supervisor appends
         let _ = std::fs::remove_file(&trace);
         let mut child = Command::new(std::env::current_exe().expect("own path"))
-            .args(["run", "--capture"])
+            .args(["run", "--verbose", "--capture"])
             .args(&self.pass)
             .args(extra)
             .arg("--scratch")

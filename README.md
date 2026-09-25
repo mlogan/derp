@@ -122,6 +122,7 @@ there; the command line wins.
 
 | Option | Default | Run file | What it does |
 | --- | --- | --- | --- |
+| `-v`, `--verbose` | off | | `run`: say what was rewritten and where, and print the run's report (below). `rewrite`: print what was hooked. Without it `derp` prints only warnings and errors. |
 | `--seed S` | `0` | `seed:` | The run's seed. Everything the run decides is drawn from it. |
 | `--quantum LO..HI` | `1000..10000` | `quantum:` | Hook events per scheduling quantum, drawn from this range. The default finds races in short programs and costs about 57% on two compute-bound processes; `10000..100000` costs about 10% and misses races in short programs. |
 | `--mem-hook-rate R` | `0` | `mem-hook-rate:` | `0`, `1` or a fraction like `1/16`: hooks a sparse, seeded set of memory accesses. Races on plain memory need it; races through files and sockets do not. |
@@ -142,7 +143,7 @@ there; the command line wins.
 | `--native` | | | Run the original binary, without the rewriter or the dylib. |
 | `--aslr` | off | | Leave ASLR on. |
 
-The report goes to stderr: `run.*` totals, then `p<index>.*` per process.
+With `-v`, the report goes to stderr: `run.*` totals, then `p<index>.*` per process.
 
 Two environment variables help with debugging:
 

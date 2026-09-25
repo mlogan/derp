@@ -19,18 +19,18 @@ Currently Derp only supports arm64 Mach-O executables on macOS.
 
 The approach it uses is binary rewriting.
 This is easy on arm64 because instructions are fixed-size.
-Branches, syscalls, loads/stores, hardware randomness, etc are all replaced with a unconditional branch to a small generated stub.
+Branches, syscalls, loads/stores, hardware randomness, etc are all replaced with an unconditional branch to a small generated stub.
 This stub decrements a quantum counter, enters the scheduler if it reaches 0, and performs the task(s) of the original instruction, before jumping back to the original code.
 All threads (in all processes) contend on a single lock (Claude calls it a "baton"), and the scheduler deterministically decides which thread will acquire the lock next.
 
 ```
    original            rewritten                    generated stub
-   ─────────────       ─────────────                ───────────────────────────────
+   ─────────────       ─────────────                ─────────────────────────────────────────────
    cmp  x0, #0         cmp  x0, #0            ┌──►  stub_17:
-   b.ne loop           b    stub_17  ─────────┘       counter -= 1
-   add  x2, x2, #1     add  x2, x2, #1  ◄──┐          if counter == 0: enter scheduler
-                                           │          if ne: jump to loop   (the original b.ne)
-                                           └───────── else: jump back
+   b.ne loop           b    stub_17  ─────────┘       b.eq 1f        ; Skip the stub when the branch is not taken.
+   add  x2, x2, #1     add  x2, x2, #1  ◄──┐          bl   quantum   ; Decrement the counter. At 0, call the scheduler.
+                                           │          b    loop      ; This is the original b.ne.
+                                           └────── 1: b    <site + 4>
 ```
 
 Execution is pseudo-randomly deterministic according to the seed supplied when starting the process(es).
@@ -38,23 +38,23 @@ This allows us to do *Deterministic Simulation Testing* by repeating execution m
 When a bug is found, it can be reproduced by re-running with the same seed.
 
 ```
-   process A: threads A1, A2          process B: threads B1, B2
-   only the holder of the baton runs; everyone else is parked
+   Process A has threads A1 and A2. Process B has threads B1 and B2.
+   Only the thread that holds the baton runs. The other threads wait.
 
    virtual time ─────────────────────────────────────────────►
-   seed 42   │ A1 │ B1 │ A2 │ A1 │ B2 │ B1 │ A2 │ ...    same seed, same order, every run
-   seed 7    │ B2 │ A1 │ A1 │ B1 │ A2 │ B2 │ A1 │ ...    another seed, another interleaving
+   seed 42   │ A1 │ B1 │ A2 │ A1 │ B2 │ B1 │ A2 │ ...    Every run with seed 42 has this order.
+   seed 7    │ B2 │ A1 │ A1 │ B1 │ A2 │ B2 │ A1 │ ...    Seed 7 gives a different order.
 ```
 
 Derp can automatically search for the point in (virtual) time at which the bug occurred, in cases where the incorrect execution precedes its detection by a substantial amount of time.
 
 ```
    virtual time ─────────────────────────────────────────────────────────►
-   seed 5              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ✗ assert fails
-   new future from t1  ━━━━━━━━━━━━━━━━━┯━ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  few futures fail: not decided yet
-   new future from t2  ━━━━━━━━━━━━━━━━━━━━━━━━━━┯━ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  nearly all fail: already decided
+   seed 5              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ✗ The assert fails.
+   new future from t1  ━━━━━━━━━━━━━━━━━┯━ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  Few futures fail. The bug has not happened yet.
+   new future from t2  ━━━━━━━━━━━━━━━━━━━━━━━━━━┯━ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  Nearly all futures fail. The bug has happened.
                                         t1       t2
-                                        └────────┘ the bug happened in here; bisect narrows it further
+                                        └────────┘ The bug happened here. Bisect narrows this interval further.
 ```
 
 ## Capabilities and Limitations

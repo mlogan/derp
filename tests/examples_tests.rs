@@ -25,6 +25,7 @@ fn run_example(name: &str, seed: u64, scratch: &Path) -> (String, String) {
     let out = Command::new(common::derp_bin())
         .args([
             "run",
+            "-v",
             "--capture",
             "--stop-after",
             "120s",

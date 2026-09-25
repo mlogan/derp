@@ -79,7 +79,7 @@ fn a_mask_moves_switches_and_nothing_else() {
         let trace_path = dir.join(trace);
         let _ = std::fs::remove_file(&trace_path);
         let out = rewrite_cmd(
-            &["run", "--capture", "--seed", &seed.to_string()],
+            &["run", "-v", "--capture", "--seed", &seed.to_string()],
             &scratch,
             &manifest,
         )

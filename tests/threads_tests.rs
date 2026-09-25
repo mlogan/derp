@@ -154,3 +154,31 @@ fn rwlock_readers_never_see_half_a_write() {
         assert_eq!((text2, hash2), (text, hash), "seed {seed} not repeatable");
     }
 }
+
+/// `derp run` prints only the guest's own output unless asked for more.
+#[test]
+fn run_is_quiet_without_verbose() {
+    common::supervisor_dylib();
+    let dir = common::scratch_dir("quiet_run");
+    let exe = common::build_c("mutex", &dir, &[]);
+    let derp = |extra: &[&str]| {
+        let out = std::process::Command::new(common::derp_bin())
+            .arg("run")
+            .args(extra)
+            .args(["--seed", "1"])
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), TWO_N);
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    // A fresh build misses the rewrite cache, which would say what it did
+    assert_eq!(derp(&[]), "");
+    let report = derp(&["-v"]);
+    assert!(report.contains("schedule_hash="), "{report}");
+    let _ = std::fs::remove_file(&exe);
+    common::build_c("mutex", &dir, &[]);
+    let report = derp(&["--verbose"]);
+    assert!(report.contains("sites hooked"), "{report}");
+}

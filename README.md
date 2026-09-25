@@ -4,6 +4,13 @@ Derp is a tool for running one or more processes deterministically, without cont
 It works on whatever binaries your build system produces, or whatever you installed from homebrew.
 Thread scheduling, syscalls, hardware counters, heap layout, network traffic, and more are all deterministic.
 
+```sh
+cargo build --release --workspace         # builds derp and, next to it, the supervisor dylib
+target/release/derp run --seed 42 ./my-program arg1 arg2
+```
+
+![a racy counter run natively and twice under derp with the same seed](docs/demo/demo.gif)
+
 The main advantage of Derp over other similar tools is that you can use it locally on your Mac, and benefit from fast iteration speed.
 
 Derp **is not a secure sandbox! Do not use it to run anything that you would not run directly**. It has some limited isolation features for convenience only.
@@ -16,11 +23,39 @@ Branches, syscalls, loads/stores, hardware randomness, etc are all replaced with
 This stub decrements a quantum counter, enters the scheduler if it reaches 0, and performs the task(s) of the original instruction, before jumping back to the original code.
 All threads (in all processes) contend on a single lock (Claude calls it a "baton"), and the scheduler deterministically decides which thread will acquire the lock next.
 
+```
+   original            rewritten                    generated stub
+   ─────────────       ─────────────                ───────────────────────────────
+   cmp  x0, #0         cmp  x0, #0            ┌──►  stub_17:
+   b.ne loop           b    stub_17  ─────────┘       counter -= 1
+   add  x2, x2, #1     add  x2, x2, #1  ◄──┐          if counter == 0: enter scheduler
+                                           │          if ne: jump to loop   (the original b.ne)
+                                           └───────── else: jump back
+```
+
 Execution is pseudo-randomly deterministic according to the seed supplied when starting the process(es).
 This allows us to do *Deterministic Simulation Testing* by repeating execution many times with different seeds.
 When a bug is found, it can be reproduced by re-running with the same seed.
 
+```
+   process A: threads A1, A2          process B: threads B1, B2
+   only the holder of the baton runs; everyone else is parked
+
+   virtual time ─────────────────────────────────────────────►
+   seed 42   │ A1 │ B1 │ A2 │ A1 │ B2 │ B1 │ A2 │ ...    same seed, same order, every run
+   seed 7    │ B2 │ A1 │ A1 │ B1 │ A2 │ B2 │ A1 │ ...    another seed, another interleaving
+```
+
 Derp can automatically search for the point in (virtual) time at which the bug occurred, in cases where the incorrect execution precedes its detection by a substantial amount of time.
+
+```
+   virtual time ─────────────────────────────────────────────────────────►
+   seed 5              ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ ✗ assert fails
+   new future from t1  ━━━━━━━━━━━━━━━━━┯━ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  few futures fail: not decided yet
+   new future from t2  ━━━━━━━━━━━━━━━━━━━━━━━━━━┯━ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─  nearly all fail: already decided
+                                        t1       t2
+                                        └────────┘ the bug happened in here; bisect narrows it further
+```
 
 ## Capabilities and Limitations
 
@@ -87,6 +122,7 @@ there; the command line wins.
 
 | Option | Default | Run file | What it does |
 | --- | --- | --- | --- |
+| `-v`, `--verbose` | off | | `run`: say what was rewritten and where, and print the run's report (below). `rewrite`: print what was hooked. Without it `derp` prints only warnings and errors. |
 | `--seed S` | `0` | `seed:` | The run's seed. Everything the run decides is drawn from it. |
 | `--quantum LO..HI` | `1000..10000` | `quantum:` | Hook events per scheduling quantum, drawn from this range. The default finds races in short programs and costs about 57% on two compute-bound processes; `10000..100000` costs about 10% and misses races in short programs. |
 | `--mem-hook-rate R` | `0` | `mem-hook-rate:` | `0`, `1` or a fraction like `1/16`: hooks a sparse, seeded set of memory accesses. Races on plain memory need it; races through files and sockets do not. |
@@ -107,7 +143,7 @@ there; the command line wins.
 | `--native` | | | Run the original binary, without the rewriter or the dylib. |
 | `--aslr` | off | | Leave ASLR on. |
 
-The report goes to stderr: `run.*` totals, then `p<index>.*` per process.
+With `-v`, the report goes to stderr: `run.*` totals, then `p<index>.*` per process.
 
 Two environment variables help with debugging:
 

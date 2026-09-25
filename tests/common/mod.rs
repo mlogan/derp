@@ -187,7 +187,7 @@ pub fn run_manifest_with(
 ) -> RunReport {
     supervisor_dylib();
     let report = Command::new(derp_bin())
-        .args(["run", "--capture", "--seed", &seed.to_string()])
+        .args(["run", "-v", "--capture", "--seed", &seed.to_string()])
         .args(extra)
         .arg("--scratch")
         .arg(scratch)
@@ -261,7 +261,7 @@ pub fn failing_and_passing_seed(extra: &[&str], scratch: &Path, manifest: &Path)
     let (mut failing, mut passing) = (None, None);
     for seed in 1..=200u64 {
         let out = rewrite_cmd(
-            &["run", "--capture", "--seed", &seed.to_string()],
+            &["run", "-v", "--capture", "--seed", &seed.to_string()],
             extra,
             scratch,
             manifest,
@@ -291,7 +291,7 @@ pub fn run_manifest_timed(
     timeout: std::time::Duration,
 ) -> Option<std::process::Output> {
     let mut child = rewrite_cmd(
-        &["run", "--capture", "--seed", &seed.to_string()],
+        &["run", "-v", "--capture", "--seed", &seed.to_string()],
         &[],
         scratch,
         manifest,

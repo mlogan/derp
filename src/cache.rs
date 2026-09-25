@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use crate::macho::{self, MachO};
@@ -12,6 +13,14 @@ use crate::macho::{self, MachO};
 /// found in the cache: the launcher reports a guest's program by what it
 /// ran, and that is the rewritten file.
 static ORIGINALS: Mutex<Option<HashMap<PathBuf, PathBuf>>> = Mutex::new(None);
+
+/// Whether a rewrite says what it hooked and where it went; warnings are
+/// printed regardless.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_verbose(on: bool) {
+    VERBOSE.store(on, Ordering::Relaxed);
+}
 
 #[must_use]
 pub fn original_of(rewritten: &Path) -> Option<PathBuf> {
@@ -150,34 +159,36 @@ pub fn cached_rewrite(input: &Path, opts: &Options) -> Fallible<PathBuf> {
         // The table first: a rewritten file that exists has one
         std::fs::rename(sites_path(&tmp), sites_path(&out))?;
         std::fs::rename(&tmp, &out)?;
-        let unreachable = if stats.unreachable_sites > 0 {
-            format!(
-                " ({} out of a b's reach, left alone)",
-                stats.unreachable_sites
-            )
-        } else {
-            String::new()
-        };
-        let rooms = if stats.rooms > 0 {
-            format!(
-                ", {} MB of them in {} room{}",
-                stats.room_bytes >> 20,
-                stats.rooms,
-                if stats.rooms == 1 { "" } else { "s" }
-            )
-        } else {
-            String::new()
-        };
-        let counters = if stats.counter_sites == 0 {
-            String::new()
-        } else {
-            format!(", {} counter reads", stats.counter_sites)
-        };
-        eprintln!(
-            "derp: {} sites hooked{unreachable}{rooms}{counters} -> {}",
-            stats.branch_sites + stats.call_sites + stats.mem_sites,
-            out.display()
-        );
+        if VERBOSE.load(Ordering::Relaxed) {
+            let unreachable = if stats.unreachable_sites > 0 {
+                format!(
+                    " ({} out of a b's reach, left alone)",
+                    stats.unreachable_sites
+                )
+            } else {
+                String::new()
+            };
+            let rooms = if stats.rooms > 0 {
+                format!(
+                    ", {} MB of them in {} room{}",
+                    stats.room_bytes >> 20,
+                    stats.rooms,
+                    if stats.rooms == 1 { "" } else { "s" }
+                )
+            } else {
+                String::new()
+            };
+            let counters = if stats.counter_sites == 0 {
+                String::new()
+            } else {
+                format!(", {} counter reads", stats.counter_sites)
+            };
+            eprintln!(
+                "derp: {} sites hooked{unreachable}{rooms}{counters} -> {}",
+                stats.branch_sites + stats.call_sites + stats.mem_sites,
+                out.display()
+            );
+        }
         if stats.unreachable_sites > 0 {
             eprintln!(
                 "derp: {}",

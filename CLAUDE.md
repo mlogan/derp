@@ -120,7 +120,7 @@ At the end of each implementation session, **create a permanent task tracking fi
 - Before taking a break from the project
 - When significant milestones are reached
 
-**Naming Convention**: `TASKS_PHASE{N}.md` corresponds to `IMPLEMENTATION_PLAN_PHASE{N}.md`; both live in `tracking/`
+**Naming Convention**: `TASKS_PHASE{N}.md` corresponds to `IMPLEMENTATION_PLAN_PHASE{N}.md`; both live in `tracking/`, which git ignores: the files are local, not part of the repository
 
 ---
 

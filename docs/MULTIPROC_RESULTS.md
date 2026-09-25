@@ -1,10 +1,8 @@
 # Multi-Process Deterministic Runs: Results
 
-Outcome of the experiment planned in `tracking/IMPLEMENTATION_PLAN_MULTIPROC.md`.
-Code lives in the repository (rewriter, launcher, CLI) and `supervisor/`
-(the injected dylib). Progress by day, and every place the implementation
-departs from the plan, is in `tracking/TASKS_MULTIPROC.md`. How to use it and what a
-guest must be: `README.md`.
+Outcome of the multi-process experiment. Code lives in the repository
+(rewriter, launcher, CLI) and `supervisor/` (the injected dylib). How to
+use it and what a guest must be: `README.md`.
 
 All numbers are from one machine (Apple Silicon, macOS 26.2), release
 builds, best of several runs.

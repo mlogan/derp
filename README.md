@@ -130,6 +130,12 @@ there; the command line wins.
 | `--manifest FILE` | | | The run file, in YAML (below). Hosts get `10.0.0.1` upward in the order listed and are reachable by name. |
 | `--net-latency T` | `0` | `net-latency:` | Virtual-time delay of traffic between different hosts, such as `5ms`, `250us` or `1s`. |
 | `--switch-cost T` | `10us` | `switch-cost:` | How far each baton hand-off moves the virtual clock, quantum expiries included; a clock read moves it 1µs. Threads run one at a time on one clock, so the cost is kept low: at 1ms, the old default, a run of several threaded servers with hundreds of threads between them got so little done per virtual second that their own timeouts fired. The price is that code timing its own work finds it very fast. Only a run-file run can change it. |
+| `--pause N/M` | `1/200` | `pause: {chance: N/M}` | With this chance, a scheduling choice pauses the thread it picked instead of running it, while another thread can run: the thread is passed over until its pause ends, or until nothing else is runnable. This is how a lock holder stalls in its critical section, or a writer falls behind, as a thread starved of the CPU would. `off` or `0/1` turns pauses off. In measurements (`docs/CHAOS_RESULTS.md`) their cost was within the noise, and they found a write after a lease ran out in 21 of 50 seeds where the uniform pick found it in none. |
+| `--pause-for LO..HI` | `10us..100ms` | `pause: {for: LO..HI}` | How long a pause lasts in virtual time, drawn log-uniformly: each doubling of the length is about equally likely, so short pauses in a narrow window and long starvations are both common. |
+| `--scheduler random\|pct` | `random` | `scheduler:` | How the next thread is chosen. `random` draws uniformly among the runnable threads at every choice. `pct` is PCT (Burckhardt et al., ASPLOS 2010): every thread gets a random priority, the highest runnable one runs, and at `depth - 1` random points the thread holding the baton drops below every other. A bug that needs `d` ordering constraints is found with probability at least 1/(n·k^(d-1)) per run, for `n` threads and `k` scheduling points. Pauses apply under either. |
+| `--pct-depth D` | `3` | `pct: {depth: D}` | PCT's `d`, 1 to 16. A one-sided ordering bug is depth 1, an atomicity violation or a two-lock deadlock depth 2. |
+| `--pct-horizon T` | `--stop-after` | `pct: {horizon: T}` | The span of virtual time the change points are drawn from. Priorities hold until it is over; after it the `random` pick takes over (Coyote's "fair PCT"), so a program that spins on a lower thread's progress is slow only within it. Set it to about the length of the run (`run.clock_ns` of an earlier one) or of the window of interest: a change point after the interesting part does nothing. One of it and `--stop-after` is needed. |
+| `--pct-starve T` | `50ms` | `pct: {starve: T}` | Within the horizon, a runnable thread passed over this long runs once anyway, so a thread spinning on a lower one's progress cannot stall the run. |
 | `--stop-after T` | | `stop-after:` | End the run at this virtual time: whatever still runs is killed at that point of the schedule, reported as `stopped`, and does not fail the run. For servers that never exit by themselves, and for comparing what a program did in a fixed span of virtual time. Needs the supervisor. |
 | `--wall-limit T` | | `wall-limit:` | The same at a real time. Works for `--native` runs too, which have no virtual clock: every process reports `cpu_user_ns` and `cpu_system_ns`, and `run.cpu_*` sum them, so a program's cost natively and under the supervisor can be compared over the same span. |
 | `--scratch DIR` | under the system temp dir | | Where a run file's host directories are made, fresh. An existing directory is only cleared if an earlier run made it. |
@@ -166,6 +172,11 @@ heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
 switch-cost: 10us        # virtual time a baton hand-off costs (the default)
+pause:                   # or `pause: off`
+  chance: 1/200          # of each scheduling choice (the default)
+  for: 10us..100ms       # log-uniform
+scheduler: pct           # or random (the default)
+pct: { depth: 3, horizon: 2s, starve: 50ms }
 stop-after: 30s          # the run is over at this virtual time (default: never)
 wall-limit: 60s          # or at this real time, native runs included
 outside-network: refuse  # or allow: connections and name lookups beyond the
@@ -194,7 +205,8 @@ named variables on purpose. Otherwise a proxy setting or a locale would be
 an input nobody wrote down, and the environment's length even decides where
 a guest's stack starts. Single-program `derp run prog` still inherits.
 
-A process written as a map can be crashed on purpose and restarted:
+A process written as a map can be crashed or shut down on purpose, and
+restarted:
 
 ```yaml
       - argv: [server, --port, 7000]
@@ -202,9 +214,14 @@ A process written as a map can be crashed on purpose and restarted:
         restart: on-failure      # never (default) | on-failure | always
         restart-delay: 50ms..150ms   # how long it stays down (default 100ms)
         max-restarts: 10         # default: no limit
-        crash:
+        crash:                   # SIGKILL: it dies where it stands
           every: 100ms..300ms    # into each life
           times: 3               # default: no limit
+        shutdown:                # as for an upgrade: a signal, then a crash
+          every: 2s..10s         # into each life
+          times: 3               # default: no limit
+          signal: TERM           # TERM (default), INT, QUIT, HUP, USR1, USR2
+          grace: 5s              # crashed if still alive then (default 10s)
 ```
 
 All times are virtual and drawn from the seed, so a seed crashes the same
@@ -218,6 +235,15 @@ last life. The report counts `run.crashes_injected` and `run.restarts`,
 and `p<i>.entry` says which run-file entry process `i` was a life of;
 `p<i>.program` and `p<i>.image` say what it ran, children a guest started
 included.
+
+A shutdown sends its signal as another guest's `kill` would: every
+blocked thread of the process is woken, the handler runs at a point of the
+schedule and ends a `sleep`, `poll` or `kevent` with `EINTR`, and with no
+handler the signal ends the process. If the process is still alive when
+its grace period is over, it is crashed. A life that was sent its shutdown
+signal is restarted under `on-failure` however it ends, exit 0 included:
+it was stopped to come back. The report counts `run.shutdowns_injected`,
+and `run.shutdowns_forced` for the ones that ran out of grace.
 
 `restart-delay` may not be zero, and it and `max-restarts` need a restart
 policy. Only run-file entries are restarted, not a guest's own children. A
@@ -365,10 +391,15 @@ Results: `docs/REWRITE_RESULTS.md` (single process) and
   virtual deadline: its SIGALRM is pending from that moment of the
   schedule and wakes a blocked thread of the process, instead of landing
   on a parked thread at a real moment (Postgres times statements so).
-- A signal one guest sends another (`kill` with anything but SIGTERM and
-  SIGKILL, which end the target) is delivered when the target next takes
-  the baton up, on that thread, so its handler runs at a point of the
-  schedule; `kill(pid, 0)` says whether a guest lives. A kqueue watch on
+- A signal one guest sends another (`kill` with anything but SIGKILL,
+  which ends the target where it stands) is delivered when a thread of the
+  target next takes the baton up, so its handler runs at a point of the
+  schedule. Every blocked thread of the target is woken to take it, and a
+  handler that runs during `sleep`, `nanosleep`, `usleep`, `poll`,
+  `select` or `kevent` ends the wait with `EINTR` once nothing is ready, as
+  natively. A signal with no handler whose default is to terminate ends
+  the target at that point (SIGTERM included, so a server can be shut
+  down gracefully); `kill(pid, 0)` says whether a guest lives. A kqueue watch on
   a guest's pid (`EVFILT_PROC`) or on a signal (`EVFILT_SIGNAL`) is the
   run's too: Postgres's children watch the postmaster and its latches are
   SIGURG.
@@ -464,6 +495,9 @@ that closes a source of nondeterminism adds a row here.
 | A signal a guest sends itself went to whichever thread the kernel picked, at a real moment | `kill(getpid(), sig)` is delivered with `pthread_kill` to the calling thread, so the handler runs there with the baton. |
 | `SIGCHLD` arrived from the kernel at a real moment | The guest's handler is kept by the supervisor, the kernel's delivery is dropped, and the handler runs on the parent's next thread to take the baton up after the death is recorded, with the child's pid and status in `siginfo`, `SA_RESETHAND` honoured, and a blocked signal left for a thread that takes it. |
 | Signals between guests were dropped (Postgres's latches are SIGURG, its procsignals SIGUSR1) | A signal to another guest is recorded against the target and raised on the target's next thread to take the baton up; `kill(pid, 0)` answers whether the guest lives. |
+| A signal to another guest reached it only when one of its threads happened to run: a guest asleep or blocked on a lock went on waiting, natively it is interrupted at once | Every blocked thread of the target is woken when the signal is sent, and the first to take the baton up without the signal blocked takes it. |
+| A handler that ran during `sleep`, `nanosleep`, `usleep`, `poll`, `select` or `kevent` did not end the wait: the guest slept on to its deadline, natively the call returns `EINTR` | Each thread counts the handlers run on it; these waits return `EINTR` (with the time left) when the count moved and nothing is ready. |
+| SIGTERM from one guest to another was turned into SIGKILL, so a handler for it never ran and a graceful shutdown was a crash | SIGTERM is delivered like any other signal; with no handler it ends the target at the point of the schedule where it is raised, with the signal as its status. |
 
 ### Processes
 

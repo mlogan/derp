@@ -18,6 +18,15 @@ use crate::rng::Rng;
 pub mod netstate;
 
 pub const MAGIC: u64 = 0x0031_4448_5357_5252;
+
+/// What each secondary random stream's seed is the run's seed xored with
+const FAULT_STREAM: u64 = 0xFA17_FA17_FA17_FA17;
+const PAUSE_STREAM: u64 = 0x9A05_E9A0_5E9A_05E9;
+const PCT_STREAM: u64 = 0x0C70_0C70_0C70_0C70;
+/// Mixed into the trace hash with the id of a thread that is paused, or
+/// that a PCT change point demotes
+const PAUSE_MARK: u64 = 0x9A05_E000;
+const PCT_MARK: u64 = 0x0C70_0000;
 /// Slots are never reused, so these bound what a whole run may create. A
 /// server with a thread per request gets through a thousand quickly.
 pub const MAX_THREADS: usize = 16384;
@@ -90,6 +99,73 @@ pub struct Faults {
     pub crash_hi_ns: u64,
     /// `NO_LIMIT`, or how many crashes are left to inject
     pub crashes_left: u32,
+    /// A shutdown is injected this far into each life, drawn from the range
+    /// (both 0: none): `shutdown_signal` is sent, and the process is
+    /// crashed if it is still alive `grace_ns` later
+    pub shutdown_lo_ns: u64,
+    pub shutdown_hi_ns: u64,
+    /// `NO_LIMIT`, or how many shutdowns are left to inject
+    pub shutdowns_left: u32,
+    pub shutdown_signal: u8,
+    pub grace_ns: u64,
+}
+
+/// How often the scheduler pauses the thread it chose, and for how long
+/// (virtual time, drawn log-uniformly from the range)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pauses {
+    /// `num / den` of scheduling choices; `num` 0: never
+    pub num: u32,
+    pub den: u32,
+    pub lo_ns: u64,
+    pub hi_ns: u64,
+}
+
+impl Pauses {
+    pub const OFF: Pauses = Pauses {
+        num: 0,
+        den: 1,
+        lo_ns: 10_000,
+        hi_ns: 100_000_000,
+    };
+    /// What `derp` runs with unless told otherwise: in measurements their
+    /// cost was within the noise of a run's wall time
+    pub const DEFAULT: Pauses = Pauses {
+        num: 1,
+        den: 200,
+        ..Pauses::OFF
+    };
+}
+
+/// The uniform pick: each choice draws among the runnable threads
+pub const SCHED_RANDOM: u8 = 0;
+/// PCT (Burckhardt et al., ASPLOS 2010): the runnable thread of highest
+/// priority runs; at `depth - 1` points the holder drops below everyone
+pub const SCHED_PCT: u8 = 1;
+pub const MAX_PCT_DEPTH: u32 = 16;
+
+/// How the next baton holder is chosen
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scheduler {
+    pub kind: u8,
+    /// PCT's d: it finds a bug that needs d ordering constraints with
+    /// probability at least 1/(n * k^(d-1)) per run
+    pub pct_depth: u32,
+    /// The change points fall in `[0, horizon)` of virtual time, and
+    /// priorities hold until it is over
+    pub pct_horizon_ns: u64,
+    /// A runnable thread passed over for this long runs once anyway, so a
+    /// thread spinning on a lower one's progress cannot livelock the run
+    pub pct_starve_ns: u64,
+}
+
+impl Scheduler {
+    pub const RANDOM: Scheduler = Scheduler {
+        kind: SCHED_RANDOM,
+        pct_depth: 3,
+        pct_horizon_ns: 0,
+        pct_starve_ns: 50_000_000,
+    };
 }
 
 pub const DEBUG_PATH_LEN: usize = 1024;
@@ -223,6 +299,18 @@ pub struct ThreadRec {
     /// Set while the thread is in `Shared::park`: it is not running, so a
     /// lock it holds stays held until the scheduler picks it again
     pub in_park: AtomicU32,
+    /// Virtual time until which the scheduler passes this thread over while
+    /// another can run (0: not paused)
+    pub paused_until: u64,
+    /// Signal handlers run on this thread, so a wait can tell that one
+    /// interrupted it (`EINTR`)
+    pub handlers_run: u64,
+    /// PCT: higher runs first. Drawn above `MAX_PCT_DEPTH` at creation; a
+    /// change point sets it to its own number, below every drawn one.
+    pub priority: u64,
+    /// PCT: since when this runnable thread has been passed over (0: it
+    /// was chosen last time, or has not been runnable since)
+    pub waiting_since: u64,
 }
 
 #[repr(C)]
@@ -271,6 +359,13 @@ pub struct ProcRec {
     pub faults: Faults,
     /// Virtual time at which this life is crashed (0: not)
     pub crash_at: u64,
+    /// Virtual time at which this life is sent its shutdown signal (0: not)
+    pub shutdown_at: u64,
+    /// The end of the grace period of a shutdown under way (0: none)
+    pub kill_at: u64,
+    /// Sent its shutdown signal: however it ends, a restart policy other
+    /// than `never` brings it back, as after an upgrade
+    pub shut_down: bool,
     /// The process registered to take this one's place, or `NO_PROC`
     pub replaced_by: u32,
     /// `SIGKILL` has been sent (or the process saw `killed` while attaching
@@ -286,9 +381,23 @@ pub struct ProcRec {
 }
 
 impl ProcRec {
+    fn alive(&self) -> bool {
+        self.state != P_EXITED && !self.killed
+    }
+
     /// When this life is due to be crashed, if it still is
     fn pending_crash(&self) -> Option<u64> {
-        (self.crash_at != 0 && self.state != P_EXITED && !self.killed).then_some(self.crash_at)
+        (self.crash_at != 0 && self.alive()).then_some(self.crash_at)
+    }
+
+    /// When this life is due to be sent its shutdown signal, or crashed at
+    /// the end of its grace period, if it still is
+    fn pending_shutdown(&self) -> Option<u64> {
+        let due = [self.shutdown_at, self.kill_at]
+            .into_iter()
+            .filter(|&t| t != 0)
+            .min()?;
+        self.alive().then_some(due)
     }
 }
 
@@ -317,6 +426,31 @@ pub struct State {
     /// Crash times come from their own stream, so that adding faults to a
     /// run does not shift the choice of threads
     fault_rng: Rng,
+    /// Pauses come from their own stream too: with pauses off, the run is
+    /// the one it was before they existed
+    pause_rng: Rng,
+    /// A scheduling choice pauses the chosen thread with probability
+    /// `pause_num / pause_den` (`pause_num` 0: never), for a time drawn
+    /// log-uniformly from `pause_lo_ns..=pause_hi_ns`
+    pub pause_num: u32,
+    pub pause_den: u32,
+    pub pause_lo_ns: u64,
+    pub pause_hi_ns: u64,
+    pub pauses: u64,
+    pub scheduler: u8,
+    pct_rng: Rng,
+    pct_starve_ns: u64,
+    /// Past it the uniform pick takes over, as in Coyote's fair PCT: a
+    /// program that spins on a lower thread's progress would otherwise go
+    /// at the pace of the starvation bound for the rest of the run
+    pct_horizon_ns: u64,
+    /// Virtual times of the change points, ascending; the first
+    /// `pct_points` are valid and `pct_next` is the next to come
+    pct_change_at: [u64; MAX_PCT_DEPTH as usize],
+    pct_points: u32,
+    pct_next: u32,
+    pub pct_changes: u64,
+    pub pct_starved: u64,
     /// Seed bisection: one more than the virtual time (0: never) from whose
     /// first hand-off on every stream starts over from `reseed_with`. Until
     /// then the run is the plain run of its seed.
@@ -329,6 +463,9 @@ pub struct State {
     pub trace_path: [u8; DEBUG_PATH_LEN],
     pub mask_path: [u8; DEBUG_PATH_LEN],
     pub crashes_injected: u64,
+    pub shutdowns_injected: u64,
+    /// Shutdowns whose grace period ran out: the process was crashed
+    pub shutdowns_forced: u64,
     /// System V objects the guests created, for the launcher to remove
     /// when the run ends: (1 shared memory, 2 semaphore set), id. Guests
     /// get private objects (`IPC_PRIVATE`) whatever key they name, since
@@ -487,7 +624,9 @@ impl Shared {
         let shared = &*mem;
         let mut s = shared.lock();
         s.rng = Rng::seed_from_u64(seed);
-        s.fault_rng = Rng::seed_from_u64(seed ^ 0xFA17_FA17_FA17_FA17);
+        s.fault_rng = Rng::seed_from_u64(seed ^ FAULT_STREAM);
+        s.pause_rng = Rng::seed_from_u64(seed ^ PAUSE_STREAM);
+        s.pct_rng = Rng::seed_from_u64(seed ^ PCT_STREAM);
         s.quantum_lo = quantum_lo;
         s.quantum_hi = quantum_hi;
         s.switch_ns = DEFAULT_SWITCH_NS;
@@ -692,6 +831,8 @@ impl State {
         self.draw_crash(pid, from);
     }
 
+    /// When this life of `pid` is crashed and shut down, if it is. A run
+    /// without shutdowns draws as it did before they existed.
     fn draw_crash(&mut self, pid: u32, life_starts: u64) {
         let f = self.procs[pid as usize].faults;
         self.procs[pid as usize].crash_at = if f.crash_hi_ns == 0 || f.crashes_left == 0 {
@@ -699,6 +840,12 @@ impl State {
         } else {
             let span = f.crash_hi_ns - f.crash_lo_ns + 1;
             (life_starts + f.crash_lo_ns + self.fault_rng.below(span)).max(1)
+        };
+        self.procs[pid as usize].shutdown_at = if f.shutdown_hi_ns == 0 || f.shutdowns_left == 0 {
+            0
+        } else {
+            let span = f.shutdown_hi_ns - f.shutdown_lo_ns + 1;
+            (life_starts + f.shutdown_lo_ns + self.fault_rng.below(span)).max(1)
         };
     }
 
@@ -719,6 +866,8 @@ impl State {
         p.killed = true;
         p.died_at = now;
         p.crash_at = 0;
+        p.shutdown_at = 0;
+        p.kill_at = 0;
         self.unsignalled += 1;
         // One that has not attached holds nothing the run could wait for
         if p.state == P_LIVE {
@@ -782,7 +931,7 @@ impl State {
         let p = &self.procs[pid as usize];
         let wanted = match p.faults.restart {
             RESTART_ALWAYS => true,
-            RESTART_ON_FAILURE => status != 0,
+            RESTART_ON_FAILURE => status != 0 || p.shut_down,
             _ => false,
         };
         wanted && !self.stopped && p.spec != NO_PROC && p.faults.restarts_left > 0
@@ -850,6 +999,38 @@ impl State {
         }
     }
 
+    /// Shutdowns whose time has come: the signal is sent as by another
+    /// guest. Grace periods that are over: the process is crashed.
+    fn inject_due_shutdowns(&mut self) {
+        let now = self.clock_ns;
+        for pid in 0..self.nprocs {
+            let p = &self.procs[pid as usize];
+            if !p.alive() {
+                continue;
+            }
+            if p.kill_at != 0 && p.kill_at <= now {
+                self.crash(pid);
+                self.shutdowns_forced += 1;
+                continue;
+            }
+            if p.shutdown_at == 0 || p.shutdown_at > now {
+                continue;
+            }
+            let p = &mut self.procs[pid as usize];
+            let f = &mut p.faults;
+            if f.shutdowns_left != NO_LIMIT {
+                f.shutdowns_left -= 1;
+            }
+            let (sig, grace) = (c_int::from(f.shutdown_signal), f.grace_ns);
+            p.shutdown_at = 0;
+            p.kill_at = now + grace.max(1);
+            p.shut_down = true;
+            self.post_signal(pid, sig);
+            self.wake_io();
+            self.shutdowns_injected += 1;
+        }
+    }
+
     /// The stop that is still ahead, if the run has one.
     fn pending_stop(&self) -> Option<u64> {
         (self.stop_at_ns != 0 && !self.stopped).then_some(self.stop_at_ns)
@@ -877,9 +1058,10 @@ impl State {
     }
 
     fn next_crash(&self) -> Option<u64> {
-        self.procs[..self.nprocs as usize]
-            .iter()
-            .filter_map(ProcRec::pending_crash)
+        let procs = &self.procs[..self.nprocs as usize];
+        let crashes = procs.iter().filter_map(ProcRec::pending_crash);
+        crashes
+            .chain(procs.iter().filter_map(ProcRec::pending_shutdown))
             .min()
     }
 
@@ -889,9 +1071,15 @@ impl State {
         let id = self.nthreads as usize;
         assert!(id < MAX_THREADS, "too many threads in one run");
         self.nthreads += 1;
+        let priority = if self.scheduler == SCHED_PCT {
+            u64::from(MAX_PCT_DEPTH) + 1 + (self.pct_rng.next_u64() >> 1)
+        } else {
+            0
+        };
         let t = &mut self.threads[id];
         t.state = T_RUNNABLE;
         t.pid = pid;
+        t.priority = priority;
         id
     }
 
@@ -934,6 +1122,22 @@ impl State {
     pub fn wake_io(&mut self) {
         for t in self.live() {
             if t.state == T_BLOCKED && t.key == IO_KEY {
+                t.state = T_RUNNABLE;
+            }
+        }
+    }
+
+    /// Another guest sent `sig` to `pid`: pending until a thread of it
+    /// that does not block the signal takes the baton up. Every blocked
+    /// thread of it is woken to look, as the kernel interrupts whichever
+    /// thread takes a signal; waits that the signal does not end go back
+    /// to waiting. A life still down before its restart is left alone.
+    pub fn post_signal(&mut self, pid: u32, sig: c_int) {
+        let p = &mut self.procs[pid as usize];
+        p.sig_pending |= 1 << sig;
+        p.sig_counts[sig as usize] += 1;
+        for t in self.live() {
+            if t.pid == pid && t.state == T_BLOCKED && t.key != RESTART_KEY {
                 t.state = T_RUNNABLE;
             }
         }
@@ -1062,13 +1266,16 @@ impl State {
         if self.reseed_at != 0 && !self.reseeded && self.clock_ns + 1 >= self.reseed_at {
             self.reseeded = true;
             self.rng = Rng::seed_from_u64(self.reseed_with);
-            self.fault_rng = Rng::seed_from_u64(self.reseed_with ^ 0xFA17_FA17_FA17_FA17);
+            self.fault_rng = Rng::seed_from_u64(self.reseed_with ^ FAULT_STREAM);
+            self.pause_rng = Rng::seed_from_u64(self.reseed_with ^ PAUSE_STREAM);
+            self.pct_rng = Rng::seed_from_u64(self.reseed_with ^ PCT_STREAM);
         }
         if self.pending_stop().is_some_and(|at| self.clock_ns >= at) {
             self.stop_run();
         }
         self.clock_moved();
         self.inject_due_crashes();
+        self.inject_due_shutdowns();
         self.expire_deadlines();
         self.fire_alarms();
         let mut runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
@@ -1095,17 +1302,134 @@ impl State {
             }
             self.clock_moved();
             self.inject_due_crashes();
+            self.inject_due_shutdowns();
             self.expire_deadlines();
             self.fire_alarms();
             runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         }
-        let n = self.rng.below(runnable as u64) as usize;
+        // A pause holds a thread back only while another can run
+        let now = self.clock_ns;
+        let unpaused = self
+            .live()
+            .iter()
+            .filter(|t| t.state == T_RUNNABLE && t.paused_until <= now)
+            .count();
+        self.pct_change_points();
+        if unpaused == 0 {
+            return Some(self.choose_candidate(false, runnable));
+        }
+        let chosen = self.choose_candidate(true, unpaused);
+        if unpaused == 1 || !self.draw_pause() {
+            return Some(chosen);
+        }
+        let until = now
+            + self
+                .pause_rng
+                .log_uniform(self.pause_lo_ns, self.pause_hi_ns);
+        self.threads[chosen].paused_until = until;
+        self.pauses += 1;
+        self.trace_hash = fnv(fnv(self.trace_hash, PAUSE_MARK), chosen as u64);
+        Some(self.choose_candidate(true, unpaused - 1))
+    }
+
+    /// Before a run's first thread: PCT's change points are drawn over the
+    /// horizon, and threads added from now on get priorities.
+    pub fn set_scheduler(&mut self, sched: Scheduler) {
+        self.scheduler = sched.kind;
+        if sched.kind != SCHED_PCT {
+            return;
+        }
+        self.pct_starve_ns = sched.pct_starve_ns;
+        self.pct_horizon_ns = sched.pct_horizon_ns.max(1);
+        let n = sched.pct_depth.clamp(1, MAX_PCT_DEPTH) - 1;
+        for i in 0..n as usize {
+            self.pct_change_at[i] = self.pct_rng.below(sched.pct_horizon_ns.max(1));
+        }
+        self.pct_change_at[..n as usize].sort_unstable();
+        self.pct_points = n;
+        self.pct_next = 0;
+    }
+
+    /// Change points the clock has reached: the thread that last held the
+    /// baton drops to the point's number, below every drawn priority. Later
+    /// points give higher numbers, as in PCT.
+    fn pct_change_points(&mut self) {
+        while self.pct_next < self.pct_points
+            && self.pct_change_at[self.pct_next as usize] <= self.clock_ns
+        {
+            self.pct_next += 1;
+            let holder = self.current as usize;
+            if holder < self.nthreads as usize {
+                self.threads[holder].priority = u64::from(self.pct_next);
+                self.pct_changes += 1;
+                self.trace_hash = fnv(fnv(self.trace_hash, PCT_MARK), holder as u64);
+            }
+        }
+    }
+
+    /// The next holder among the `count` runnable threads (paused ones
+    /// passed over when `honour_pauses`).
+    fn choose_candidate(&mut self, honour_pauses: bool, count: usize) -> usize {
+        if self.scheduler != SCHED_PCT || self.clock_ns >= self.pct_horizon_ns {
+            return self.nth_candidate(honour_pauses, count);
+        }
+        let now = self.clock_ns;
+        let starve = self.pct_starve_ns;
+        let eligible =
+            |t: &ThreadRec| t.state == T_RUNNABLE && (!honour_pauses || t.paused_until <= now);
+        let live = &self.threads[..self.nthreads as usize];
+        // The longest passed over, if past the bound; else the highest
+        // priority. Ties go to the lowest id.
+        let starved = live
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| eligible(t) && t.waiting_since != 0 && now - t.waiting_since >= starve)
+            .min_by_key(|(i, t)| (t.waiting_since, *i))
+            .map(|(i, _)| i);
+        let chosen = starved.unwrap_or_else(|| {
+            live.iter()
+                .enumerate()
+                .filter(|(_, t)| eligible(t))
+                .max_by_key(|(i, t)| (t.priority, std::cmp::Reverse(*i)))
+                .map(|(i, _)| i)
+                .expect("a candidate")
+        });
+        if starved.is_some() {
+            self.pct_starved += 1;
+        }
+        for (i, t) in self.live().iter_mut().enumerate() {
+            if i == chosen {
+                t.waiting_since = 0;
+            } else if t.state == T_RUNNABLE && t.waiting_since == 0 {
+                t.waiting_since = now.max(1);
+            }
+        }
+        chosen
+    }
+
+    pub fn set_pauses(&mut self, p: Pauses) {
+        (self.pause_num, self.pause_den) = (p.num, p.den);
+        (self.pause_lo_ns, self.pause_hi_ns) = (p.lo_ns, p.hi_ns);
+    }
+
+    /// Whether this choice pauses the chosen thread
+    fn draw_pause(&mut self) -> bool {
+        self.pause_num != 0
+            && self.pause_rng.below(u64::from(self.pause_den)) < u64::from(self.pause_num)
+    }
+
+    /// One of the `count` runnable threads, drawn uniformly; paused ones
+    /// are passed over when `honour_pauses`.
+    fn nth_candidate(&mut self, honour_pauses: bool, count: usize) -> usize {
+        let now = self.clock_ns;
+        let n = self.rng.below(count as u64) as usize;
         self.live()
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.state == T_RUNNABLE)
+            .filter(|(_, t)| t.state == T_RUNNABLE && (!honour_pauses || t.paused_until <= now))
             .nth(n)
             .map(|(i, _)| i)
+            .expect("as many candidates as counted")
     }
 
     /// Record the caller's new state and pass the baton. `from` is None
@@ -1165,6 +1489,8 @@ impl State {
             // It held the baton, so this is a point of the schedule too
             self.register_restart(pid, status);
             self.procs[pid as usize].crash_at = 0;
+            self.procs[pid as usize].shutdown_at = 0;
+            self.procs[pid as usize].kill_at = 0;
             // Its descriptors are closed: peers may see EOF or EPIPE now
             self.net.process_died(pid);
             self.wake_io();
@@ -1232,6 +1558,10 @@ mod tests {
 
     /// A shared mapping with a lock in it, as the run's state is
     fn shared_mapping() -> &'static Shared {
+        shared_mapping_seeded(1)
+    }
+
+    fn shared_mapping_seeded(seed: u64) -> &'static Shared {
         let mem = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1243,7 +1573,7 @@ mod tests {
             )
         };
         assert_ne!(mem, libc::MAP_FAILED);
-        unsafe { Shared::init(mem.cast(), 1, 1000, 10000) }
+        unsafe { Shared::init(mem.cast(), seed, 1000, 10000) }
     }
 
     #[test]
@@ -1326,6 +1656,279 @@ mod tests {
         drop(guard);
         assert_eq!(unsafe { &*sh.state.get() }.threads[id].state, T_RUNNABLE);
         assert_eq!(sh.lock.load(Ordering::Relaxed), 0);
+    }
+
+    /// A run's state with `threads` runnable threads in one process
+    fn state_with_threads(seed: u64, threads: usize) -> &'static mut State {
+        let sh = shared_mapping_seeded(seed);
+        let s = unsafe { &mut *sh.state.get() };
+        let p = s.add_proc(0, NO_PROC);
+        for _ in 0..threads {
+            s.add_thread(p);
+        }
+        s
+    }
+
+    /// Picks, with the clock moving 10µs before each as a hand-off moves it
+    fn picks(s: &mut State, n: usize) -> Vec<usize> {
+        (0..n)
+            .map(|_| {
+                s.clock_ns += 10_000;
+                s.pick().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_pauses_the_choice_is_a_uniform_draw_from_the_run_stream() {
+        let s = state_with_threads(5, 3);
+        let mut rng = Rng::seed_from_u64(5);
+        let expected: Vec<usize> = (0..200).map(|_| rng.below(3) as usize).collect();
+        assert_eq!(picks(s, 200), expected);
+        assert_eq!(s.pauses, 0);
+    }
+
+    #[test]
+    fn a_lone_runnable_thread_is_never_paused() {
+        let s = state_with_threads(5, 1);
+        (s.pause_num, s.pause_den, s.pause_lo_ns, s.pause_hi_ns) = (1, 1, 1_000_000, 1_000_000);
+        assert!(picks(s, 50).iter().all(|&t| t == 0));
+        assert_eq!(s.pauses, 0);
+    }
+
+    #[test]
+    fn a_paused_thread_is_passed_over_until_its_pause_ends() {
+        let s = state_with_threads(9, 3);
+        (s.pause_num, s.pause_den, s.pause_lo_ns, s.pause_hi_ns) = (1, 4, 50_000, 5_000_000);
+        let mut paused_seen = 0;
+        for _ in 0..2000 {
+            s.clock_ns += 10_000;
+            let before = s.pauses;
+            let now = s.clock_ns;
+            let unpaused: Vec<usize> = (0..3)
+                .filter(|&i| s.threads[i].paused_until <= now)
+                .collect();
+            let chosen = s.pick().unwrap();
+            if unpaused.is_empty() {
+                continue;
+            }
+            assert!(
+                s.threads[chosen].paused_until <= now,
+                "t{chosen} is paused while {unpaused:?} were not"
+            );
+            if s.pauses > before {
+                paused_seen += 1;
+                assert!(unpaused.len() > 1, "paused the only candidate");
+            }
+        }
+        assert!(paused_seen > 20, "{paused_seen}");
+        assert_eq!(s.pauses, paused_seen);
+    }
+
+    #[test]
+    fn with_every_thread_paused_one_still_runs() {
+        let s = state_with_threads(9, 2);
+        s.threads[0].paused_until = u64::MAX;
+        s.threads[1].paused_until = u64::MAX;
+        (s.pause_num, s.pause_den, s.pause_lo_ns, s.pause_hi_ns) = (1, 1, 1_000, 1_000);
+        assert_eq!(picks(s, 20).len(), 20);
+        assert_eq!(s.pauses, 0);
+    }
+
+    #[test]
+    fn pauses_are_a_function_of_the_seed() {
+        let run = |seed| {
+            let s = state_with_threads(seed, 4);
+            (s.pause_num, s.pause_den, s.pause_lo_ns, s.pause_hi_ns) = (1, 10, 10_000, 100_000_000);
+            (picks(s, 3000), s.pauses, s.trace_hash)
+        };
+        assert_eq!(run(11), run(11));
+        assert_ne!(run(11).0, run(12).0);
+    }
+
+    /// PCT over `threads` threads of one process, change points as given
+    fn pct_state(seed: u64, threads: usize, depth: u32, horizon_ns: u64) -> &'static mut State {
+        let sh = shared_mapping_seeded(seed);
+        let s = unsafe { &mut *sh.state.get() };
+        s.set_scheduler(Scheduler {
+            kind: SCHED_PCT,
+            pct_depth: depth,
+            pct_horizon_ns: horizon_ns,
+            pct_starve_ns: 50_000_000,
+        });
+        let p = s.add_proc(0, NO_PROC);
+        for _ in 0..threads {
+            s.add_thread(p);
+        }
+        s
+    }
+
+    /// `pick` as `choose` uses it: the chosen thread becomes the holder
+    fn pct_picks(s: &mut State, n: usize) -> Vec<usize> {
+        (0..n)
+            .map(|_| {
+                s.clock_ns += 10_000;
+                let t = s.pick().unwrap();
+                s.current = t as u32;
+                t
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pct_runs_the_highest_priority_thread_until_a_change_point() {
+        let s = pct_state(4, 3, 1, 10_000_000_000);
+        let top = (0..3).max_by_key(|&i| s.threads[i].priority).unwrap();
+        assert!((0..3).all(|i| s.threads[i].priority > u64::from(MAX_PCT_DEPTH)));
+        assert!(pct_picks(s, 100).iter().all(|&t| t == top));
+        assert_eq!(s.pct_changes, 0);
+        // The holder blocks: the next one down runs
+        s.threads[top].state = T_BLOCKED;
+        let second = (0..3)
+            .filter(|&i| i != top)
+            .max_by_key(|&i| s.threads[i].priority)
+            .unwrap();
+        assert!(pct_picks(s, 10).iter().all(|&t| t == second));
+    }
+
+    #[test]
+    fn a_change_point_drops_the_holder_below_everyone() {
+        // Depth 2: one change point somewhere in the first millisecond
+        let s = pct_state(4, 3, 2, 1_000_000);
+        // Priorities hold past the span the change point was drawn from
+        s.pct_horizon_ns = u64::MAX;
+        let top = (0..3).max_by_key(|&i| s.threads[i].priority).unwrap();
+        let picks = pct_picks(s, 200);
+        assert_eq!(s.pct_changes, 1);
+        assert_eq!(s.threads[top].priority, 1);
+        let switch = picks.iter().position(|&t| t != top).unwrap();
+        assert!(picks[..switch].iter().all(|&t| t == top));
+        assert!(picks[switch..].iter().all(|&t| t == picks[switch]));
+        // The change point fell where the switch is
+        assert!(switch <= 100, "{switch}");
+    }
+
+    #[test]
+    fn a_thread_passed_over_too_long_runs_once() {
+        let s = pct_state(4, 2, 1, 10_000_000_000);
+        let top = (0..2).max_by_key(|&i| s.threads[i].priority).unwrap();
+        let low = 1 - top;
+        // 50ms of 10µs hand-offs: the low thread runs once per bound
+        let picks = pct_picks(s, 20_000);
+        let low_runs: Vec<usize> = (0..picks.len()).filter(|&i| picks[i] == low).collect();
+        assert_eq!(low_runs.len(), 3, "{low_runs:?}");
+        assert!(
+            low_runs.windows(2).all(|w| w[1] - w[0] == 5001),
+            "{low_runs:?}"
+        );
+        assert_eq!(s.pct_starved, 3);
+    }
+
+    #[test]
+    fn past_the_horizon_the_uniform_pick_takes_over() {
+        // Depth 1, horizon 1ms: 100 picks of priorities, then uniform
+        let s = pct_state(4, 3, 1, 1_000_000);
+        let top = (0..3).max_by_key(|&i| s.threads[i].priority).unwrap();
+        let picks = pct_picks(s, 1000);
+        assert!(picks[..99].iter().all(|&t| t == top));
+        for t in 0..3 {
+            let n = picks[100..].iter().filter(|&&p| p == t).count();
+            assert!((200..400).contains(&n), "t{t} ran {n} of 900");
+        }
+    }
+
+    #[test]
+    fn pct_is_a_function_of_the_seed_and_leaves_the_quantum_stream_alone() {
+        let run = |seed| {
+            let s = pct_state(seed, 5, 4, 10_000_000);
+            (pct_picks(s, 2000), s.pct_changes, s.trace_hash)
+        };
+        assert_eq!(run(21), run(21));
+        assert_ne!(run(21).0, run(22).0);
+        // The random scheduler draws from the run's stream; PCT does not
+        let s = pct_state(21, 3, 3, 10_000_000_000);
+        pct_picks(s, 500);
+        let mut rng = Rng::seed_from_u64(21);
+        assert_eq!(s.rng.next_u64(), rng.next_u64());
+    }
+
+    /// A run with one live process of two threads blocked in a sleep, set
+    /// to be shut down 1ms into its life with a 5ms grace period
+    fn shutdown_state(restart: u8) -> &'static mut State {
+        let sh = shared_mapping_seeded(3);
+        let s = unsafe { &mut *sh.state.get() };
+        let p = s.add_proc(0, NO_PROC);
+        s.procs[p as usize].state = P_LIVE;
+        for _ in 0..2 {
+            let t = s.add_thread(p);
+            s.threads[t].state = T_BLOCKED;
+            s.threads[t].key = SLEEP_KEY;
+            s.threads[t].deadline = 10_000_000_000;
+        }
+        let faults = Faults {
+            restart,
+            restart_delay_lo_ns: 1_000_000,
+            restart_delay_hi_ns: 1_000_000,
+            restarts_left: NO_LIMIT,
+            shutdown_lo_ns: 1_000_000,
+            shutdown_hi_ns: 1_000_000,
+            shutdowns_left: 1,
+            shutdown_signal: libc::SIGTERM as u8,
+            grace_ns: 5_000_000,
+            ..Faults::default()
+        };
+        s.set_faults(p, faults, 0);
+        s
+    }
+
+    #[test]
+    fn a_shutdown_sends_its_signal_and_wakes_the_process() {
+        let s = shutdown_state(RESTART_NEVER);
+        assert_eq!(s.procs[0].shutdown_at, 1_000_000);
+        // Nothing runnable: the clock jumps to the shutdown
+        let t = s.pick().unwrap();
+        assert_eq!(s.clock_ns, 1_000_000);
+        assert_eq!(s.threads[t].pid, 0);
+        assert_eq!(s.procs[0].sig_pending, 1 << libc::SIGTERM);
+        assert_eq!(s.procs[0].sig_counts[libc::SIGTERM as usize], 1);
+        assert!(s.threads[..2].iter().all(|t| t.state == T_RUNNABLE));
+        assert_eq!(s.procs[0].kill_at, 6_000_000);
+        assert_eq!(s.shutdowns_injected, 1);
+        assert!(!s.procs[0].killed);
+    }
+
+    #[test]
+    fn a_process_still_alive_after_its_grace_period_is_crashed() {
+        let s = shutdown_state(RESTART_ON_FAILURE);
+        s.pick().unwrap();
+        // It handles the signal and goes back to sleep
+        for t in &mut s.threads[..2] {
+            t.state = T_BLOCKED;
+        }
+        // Crashed at 6ms; the next life's thread runs after its 1ms delay
+        assert!(s.pick().is_some());
+        assert_eq!(s.procs[0].died_at, 6_000_000);
+        assert_eq!(s.clock_ns, 7_000_000);
+        assert!(s.procs[0].killed);
+        assert_eq!(s.shutdowns_forced, 1);
+        assert_eq!(s.restarts, 1);
+        // The next life has no shutdown left to inject
+        let next = s.procs[0].replaced_by as usize;
+        assert_eq!(s.procs[next].shutdown_at, 0);
+    }
+
+    #[test]
+    fn a_clean_exit_during_a_shutdown_counts_as_a_failure_for_restarts() {
+        let s = shutdown_state(RESTART_ON_FAILURE);
+        s.pick().unwrap();
+        s.current = 0;
+        s.process_died(0, 0);
+        assert_eq!(s.restarts, 1);
+        assert_eq!(s.shutdowns_forced, 0);
+        // Without a shutdown, exit 0 is not a failure
+        let s = shutdown_state(RESTART_ON_FAILURE);
+        s.process_died(0, 0);
+        assert_eq!(s.restarts, 0);
     }
 
     #[test]

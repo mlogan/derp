@@ -29,9 +29,11 @@ fn two_loops_processes_share_one_schedule() {
     .unwrap();
     let scratch = dir.join("scratch");
 
+    // A pause would let one process run alone for a while
+    let off = ["--pause", "off"];
     let mut hashes = Vec::new();
     for seed in 1..=3u64 {
-        let r = run_manifest(&manifest, &scratch, seed, 2);
+        let r = run_manifest_with(&manifest, &scratch, seed, 2, &off);
         assert_eq!(
             r.stdout,
             [expected.clone(), expected.clone()],
@@ -42,7 +44,7 @@ fn two_loops_processes_share_one_schedule() {
         // switches with both processes consuming hooks.
         assert!(r.u64("run.switches") > 100, "{:?}", r.fields);
         assert!(r.u64("p0.hooks") > 0 && r.u64("p1.hooks") > 0);
-        let again = run_manifest(&manifest, &scratch, seed, 2);
+        let again = run_manifest_with(&manifest, &scratch, seed, 2, &off);
         assert_eq!(
             r.fields["run.schedule_hash"], again.fields["run.schedule_hash"],
             "seed {seed} not repeatable"
@@ -1734,11 +1736,19 @@ fn the_switch_cost_is_what_a_hand_off_adds_to_the_clock() {
         .unwrap();
     };
     let scratch = dir.join("scratch");
+    // Pauses are virtual time too, so they would move the schedule
+    let off = ["--pause", "off"];
     write("");
-    let fast = run_manifest(&manifest, &scratch, 1, 1);
-    let slow = run_manifest_with(&manifest, &scratch, 1, 1, &["--switch-cost", "1ms"]);
+    let fast = run_manifest_with(&manifest, &scratch, 1, 1, &off);
+    let slow = run_manifest_with(
+        &manifest,
+        &scratch,
+        1,
+        1,
+        &["--switch-cost", "1ms", "--pause", "off"],
+    );
     write("switch-cost: 1ms\n");
-    let from_file = run_manifest(&manifest, &scratch, 1, 1);
+    let from_file = run_manifest_with(&manifest, &scratch, 1, 1, &off);
     assert_eq!(slow.stdout, fast.stdout);
     assert_eq!(slow.u64("run.switches"), fast.u64("run.switches"));
     assert!(
@@ -1846,4 +1856,139 @@ fn the_outside_network_is_refused_unless_allowed() {
         "{}",
         r.stdout[0]
     );
+}
+
+/// Signals between guests arrive as sent: a child asleep in `sleep` is
+/// woken by them, its handler runs and ends the sleep (`EINTR`), and one
+/// without a handler dies of the signal. What each mode prints natively is
+/// what it must print here, the promptness of the death included.
+#[test]
+fn signals_between_guests_behave_as_they_do_natively() {
+    let dir = common::scratch_dir("peer_signal");
+    let exe = common::build_c("peer_signal", &dir, &[]);
+    for mode in ["int", "term", "handler", "ignore"] {
+        let native = Command::new(&exe).arg(mode).output().unwrap();
+        assert!(native.status.success(), "{mode} natively");
+        let manifest = dir.join(format!("{mode}.yaml"));
+        std::fs::write(
+            &manifest,
+            format!("hosts:\n  - name: a\n    processes:\n      - peer_signal {mode}\n"),
+        )
+        .unwrap();
+        for seed in 1..=3 {
+            let r = run_manifest(&manifest, &dir.join("scratch"), seed, 1);
+            assert_eq!(
+                r.stdout[0],
+                String::from_utf8_lossy(&native.stdout),
+                "{mode}, seed {seed}"
+            );
+        }
+    }
+}
+
+/// `graceful` under a run file that shuts it down twice, 50 to 80ms into
+/// each life, with a grace period of 20ms; `extra` adds keys to its entry.
+/// `test` names the scratch directory, one per test.
+fn shut_down_twice(test: &str, mode: &str, extra: &str, seed: u64) -> RunReport {
+    let dir = common::scratch_dir(&format!("shutdown_{test}_{mode}"));
+    common::build_c("graceful", &dir, &[]);
+    let manifest = dir.join("run.yaml");
+    std::fs::write(
+        &manifest,
+        format!(
+            "stop-after: 300ms
+hosts:
+  - name: a
+    processes:
+      - argv: [graceful, {mode}]
+        restart: on-failure
+        restart-delay: 10ms
+        shutdown: {{ every: 50ms..80ms, times: 2, grace: 20ms }}
+{extra}"
+        ),
+    )
+    .unwrap();
+    let scratch = dir.join("scratch");
+    let r = run_manifest(&manifest, &scratch, seed, 1);
+    let again = run_manifest(&manifest, &scratch, seed, 1);
+    assert_eq!(again.stdout, r.stdout, "{mode}, seed {seed} not repeatable");
+    assert_eq!(
+        again.fields["run.schedule_hash"],
+        r.fields["run.schedule_hash"]
+    );
+    r
+}
+
+/// A server with a SIGTERM handler finishes its record, marks the journal
+/// and exits 0; under on-failure it comes back and finds the mark.
+#[test]
+fn a_shut_down_server_exits_cleanly_and_comes_back() {
+    for seed in 1..=3 {
+        let r = shut_down_twice("clean", "handle", "", seed);
+        let lines: Vec<&str> = r.stdout[0].lines().collect();
+        assert_eq!(lines.len(), 5, "seed {seed}: {lines:?}");
+        assert_eq!(lines[0], "start: last life none");
+        assert!(lines[1].starts_with("stop: clean after "), "{lines:?}");
+        assert_eq!(lines[2], "start: last life ended clean");
+        assert!(lines[3].starts_with("stop: clean after "), "{lines:?}");
+        assert_eq!(lines[4], "start: last life ended clean");
+        assert_eq!(r.u64("run.shutdowns_injected"), 2);
+        assert_eq!(r.u64("run.shutdowns_forced"), 0);
+        assert_eq!(r.u64("run.restarts"), 2);
+        assert_eq!(r.fields["p0.status"], "exit 0");
+        assert_eq!(r.fields["p1.status"], "exit 0");
+        assert_eq!(r.fields["p2.status"], "stopped");
+    }
+}
+
+/// One that ignores the signal, or takes longer than its grace period, is
+/// crashed when the period is over; one with no handler dies of the signal.
+#[test]
+fn a_server_that_does_not_stop_in_time_is_crashed() {
+    for mode in ["ignore", "slow"] {
+        let r = shut_down_twice("late", mode, "", 1);
+        assert_eq!(
+            r.stdout[0],
+            "start: last life none\nstart: last life ended without a mark\n\
+             start: last life ended without a mark\n",
+            "{mode}"
+        );
+        assert_eq!(r.u64("run.shutdowns_forced"), 2, "{mode}");
+        assert_eq!(r.fields["p0.status"], "signal 9", "{mode}");
+        assert_eq!(r.u64("run.restarts"), 2, "{mode}");
+    }
+    let r = shut_down_twice("late", "default", "", 1);
+    assert_eq!(r.u64("run.shutdowns_forced"), 0);
+    assert_eq!(r.fields["p0.status"], "signal 15");
+    assert_eq!(r.fields["p1.status"], "signal 15");
+    assert_eq!(r.u64("run.restarts"), 2);
+}
+
+/// Crashes and shutdowns on one process: each life draws both, and
+/// whichever comes first ends it.
+#[test]
+fn crashes_and_shutdowns_mix() {
+    let mut both = false;
+    for seed in 1..=6 {
+        let r = shut_down_twice(
+            "mix",
+            "handle",
+            "        crash: { every: 40ms..90ms, times: 2 }\n",
+            seed,
+        );
+        let (crashes, shutdowns) = (
+            r.u64("run.crashes_injected"),
+            r.u64("run.shutdowns_injected"),
+        );
+        assert!(crashes + shutdowns >= 2, "seed {seed}");
+        assert_eq!(r.u64("run.restarts"), crashes + shutdowns, "seed {seed}");
+        assert_eq!(
+            r.stdout[0].matches("ended without a mark").count() as u64,
+            crashes,
+            "seed {seed}: {}",
+            r.stdout[0]
+        );
+        both |= crashes > 0 && shutdowns > 0;
+    }
+    assert!(both, "no seed had both");
 }

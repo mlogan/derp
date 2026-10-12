@@ -431,6 +431,11 @@ repository's history starts there.
 - Examples of real systems (`EXAMPLES`): `examples/` holds Redis,
   Postgres, SQLite, memcached and Go, with `tests/examples_tests.rs`. Go
   is set aside with a residual recorded in `tracking/TASKS_EXAMPLES.md`.
+- Pauses, PCT and shutdowns (`CHAOS`): seeded thread pauses (on by
+  default), a PCT scheduler (`--scheduler pct`), `shutdown:` faults that
+  signal and then crash after a grace period, signals between guests that
+  wake their target and end its waits with `EINTR`, and Redis stopped for
+  an upgrade (`examples/redis/upgrade.yaml`). `docs/CHAOS_RESULTS.md`.
 
 **Nondeterminism list**: `README.md` has a section "Sources of
 nondeterminism found and fixed": one table row per source of

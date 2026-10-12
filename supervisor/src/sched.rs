@@ -1000,10 +1000,31 @@ fn deliver_pending_signals() {
     })
     .unwrap_or(0);
     for sig in 1..32 {
-        if take & (1 << sig) != 0 {
-            unsafe { libc::pthread_kill(libc::pthread_self(), sig) };
+        if take & (1 << sig) == 0 {
+            continue;
         }
+        if has_handler(sig) {
+            with(|s, _| s.threads[me].handlers_run += 1);
+        }
+        unsafe { libc::pthread_kill(libc::pthread_self(), sig) };
     }
+}
+
+/// Whether a delivery of `sig` runs guest code (and so interrupts a wait)
+/// rather than being ignored or ending the process
+fn has_handler(sig: i32) -> bool {
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::sigaction(sig, std::ptr::null(), &raw mut old) };
+    rc == 0 && old.sa_sigaction != libc::SIG_DFL && old.sa_sigaction != libc::SIG_IGN
+}
+
+/// How many signal handlers have run on this thread at points of the
+/// schedule. A wait that sees the count move was interrupted: natively it
+/// would return `EINTR`.
+pub fn handlers_run() -> u64 {
+    my_id()
+        .and_then(|me| with(|s, _| s.threads[me].handlers_run))
+        .unwrap_or(0)
 }
 
 /// The run's stop reached this process: its report, then its end. Its
@@ -1368,11 +1389,16 @@ pub fn report(out: &mut String) {
     }
     let (threads, expiries, switches, hash) =
         with(|s, pid| (s.threads_of(pid), s.expiries, s.switches, s.trace_hash)).unwrap();
+    let (pauses, pct_changes, pct_starved) =
+        with(|s, _| (s.pauses, s.pct_changes, s.pct_starved)).unwrap();
     let _ = writeln!(out, "proc={}", pid());
     let _ = writeln!(out, "threads={threads}");
     let _ = writeln!(out, "expiries={expiries}");
     let _ = writeln!(out, "switches={switches}");
     let _ = writeln!(out, "schedule_hash={hash:016x}");
+    let _ = writeln!(out, "pauses={pauses}");
+    let _ = writeln!(out, "pct_changes={pct_changes}");
+    let _ = writeln!(out, "pct_starved={pct_starved}");
     let _ = writeln!(out, "paths_refused={}", crate::hostfs::refused());
     let _ = writeln!(
         out,

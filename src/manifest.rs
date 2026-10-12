@@ -87,6 +87,7 @@ struct RawFull {
     #[serde(rename = "max-restarts")]
     max_restarts: Option<u32>,
     crash: Option<RawCrash>,
+    shutdown: Option<RawShutdown>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +95,39 @@ struct RawFull {
 struct RawCrash {
     every: Scalar,
     times: Option<u32>,
+}
+
+/// `pause: off`, or how often and how long
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawPause {
+    Off(String),
+    Full(RawPauseFull),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPauseFull {
+    chance: Scalar,
+    #[serde(rename = "for")]
+    length: Option<Scalar>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPct {
+    depth: Option<u32>,
+    horizon: Option<Scalar>,
+    starve: Option<Scalar>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawShutdown {
+    every: Scalar,
+    times: Option<u32>,
+    signal: Option<String>,
+    grace: Option<Scalar>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +151,9 @@ struct RawRun {
     heap_size: Option<Scalar>,
     stop_after: Option<Scalar>,
     wall_limit: Option<Scalar>,
+    pause: Option<RawPause>,
+    scheduler: Option<String>,
+    pct: Option<RawPct>,
     outside_network: Option<String>,
     #[serde(default)]
     allow: Vec<String>,
@@ -143,6 +180,23 @@ pub struct Process {
 /// How long a process stays down when `restart-delay` is not given. Not
 /// zero: a restart is never instantaneous.
 const DEFAULT_RESTART_DELAY_NS: u64 = 100_000_000;
+
+/// How long a shut-down process has to exit before it is crashed
+const DEFAULT_GRACE_NS: u64 = 10_000_000_000;
+
+/// The signals a shutdown may send, by name with or without `SIG`
+fn shutdown_signal(name: &str) -> Option<u8> {
+    let sig = match name.strip_prefix("SIG").unwrap_or(name) {
+        "TERM" => libc::SIGTERM,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "HUP" => libc::SIGHUP,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        _ => return None,
+    };
+    Some(sig as u8)
+}
 
 /// A year
 const MAX_DURATION_NS: u64 = 365 * 24 * 3600 * 1_000_000_000;
@@ -176,6 +230,48 @@ pub fn parse_duration_ns(s: &str) -> Option<u64> {
     let ns = digits.parse::<u64>().ok()?.checked_mul(scale)?;
     // Far from overflowing the virtual clock when added to it
     (ns <= MAX_DURATION_NS).then_some(ns)
+}
+
+/// `random` or `pct`
+#[must_use]
+pub fn parse_scheduler(s: &str) -> Option<u8> {
+    match s {
+        "random" => Some(shared::SCHED_RANDOM),
+        "pct" => Some(shared::SCHED_PCT),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn parse_pct_depth(d: u32) -> Option<u32> {
+    (1..=shared::MAX_PCT_DEPTH).contains(&d).then_some(d)
+}
+
+/// A duration that is not zero
+#[must_use]
+pub fn parse_positive(s: &str) -> Option<u64> {
+    parse_duration_ns(s).filter(|&ns| ns > 0)
+}
+
+/// How often a scheduling choice pauses a thread: `off`, or `N/M`
+#[must_use]
+pub fn parse_chance(s: &str) -> Option<(u32, u32)> {
+    if s == "off" {
+        return Some((0, 1));
+    }
+    let (num, den) = s.split_once('/')?;
+    let (num, den) = (
+        num.trim().parse::<u32>().ok()?,
+        den.trim().parse::<u32>().ok()?,
+    );
+    (den > 0 && num <= den).then_some((num, den))
+}
+
+/// How long a pause lasts: a range whose low end is not zero, since the
+/// lengths are drawn log-uniformly
+#[must_use]
+pub fn parse_pause_for(s: &str) -> Option<(u64, u64)> {
+    parse_duration_range(s).filter(|&(lo, _)| lo > 0)
 }
 
 /// `50ms..200ms`, or one duration for both ends
@@ -216,6 +312,24 @@ fn faults_of(full: &RawFull) -> Result<Faults, String> {
             (lo, hi, c.times.unwrap_or(shared::NO_LIMIT))
         }
     };
+    let mut shutdown = Faults::default();
+    if let Some(sd) = &full.shutdown {
+        let (lo, hi) = parse_duration_range(&sd.every.text())
+            .filter(|&(lo, _)| lo > 0)
+            .ok_or(format!("run file: bad shutdown every {}", sd.every.text()))?;
+        let signal = sd.signal.as_deref().unwrap_or("TERM");
+        shutdown.shutdown_signal = shutdown_signal(signal).ok_or(format!(
+            "run file: shutdown signal {signal} (TERM, INT, QUIT, HUP, USR1 or USR2)"
+        ))?;
+        shutdown.grace_ns = match &sd.grace {
+            None => DEFAULT_GRACE_NS,
+            Some(g) => parse_duration_ns(&g.text())
+                .filter(|&ns| ns > 0)
+                .ok_or(format!("run file: bad shutdown grace {}", g.text()))?,
+        };
+        (shutdown.shutdown_lo_ns, shutdown.shutdown_hi_ns) = (lo, hi);
+        shutdown.shutdowns_left = sd.times.unwrap_or(shared::NO_LIMIT);
+    }
     Ok(Faults {
         restart,
         restart_delay_lo_ns: delay_lo,
@@ -228,6 +342,7 @@ fn faults_of(full: &RawFull) -> Result<Faults, String> {
         crash_lo_ns: crash_lo,
         crash_hi_ns: crash_hi,
         crashes_left: crashes,
+        ..shutdown
     })
 }
 
@@ -254,6 +369,14 @@ pub struct Manifest {
     pub stop_after: Option<String>,
     /// Real time after which the run is over, whatever still runs
     pub wall_limit: Option<String>,
+    /// As on the command line: `off` or `1/200`, and `10us..100ms`
+    pub pause_chance: Option<String>,
+    pub pause_for: Option<String>,
+    /// `random` or `pct`, and PCT's settings as on the command line
+    pub scheduler: Option<String>,
+    pub pct_depth: Option<u32>,
+    pub pct_horizon: Option<String>,
+    pub pct_starve: Option<String>,
     /// Whether a guest may connect to addresses outside the virtual
     /// network (what comes back is input the run cannot repeat); refused
     /// with `ENETUNREACH` unless the run file says `outside-network: allow`
@@ -319,12 +442,63 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         heap_size: raw.heap_size.as_ref().map(Scalar::text),
         stop_after: raw.stop_after.as_ref().map(Scalar::text),
         wall_limit: raw.wall_limit.as_ref().map(Scalar::text),
+        pause_chance: match &raw.pause {
+            None => None,
+            Some(RawPause::Off(s)) => Some(s.clone()),
+            Some(RawPause::Full(p)) => Some(p.chance.text()),
+        },
+        pause_for: match &raw.pause {
+            Some(RawPause::Full(p)) => p.length.as_ref().map(Scalar::text),
+            _ => None,
+        },
+        scheduler: raw.scheduler.clone(),
+        pct_depth: raw.pct.as_ref().and_then(|p| p.depth),
+        pct_horizon: raw
+            .pct
+            .as_ref()
+            .and_then(|p| p.horizon.as_ref().map(Scalar::text)),
+        pct_starve: raw
+            .pct
+            .as_ref()
+            .and_then(|p| p.starve.as_ref().map(Scalar::text)),
         outside_network,
         allow: raw.allow,
         env: raw.env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
         pass_env: raw.pass_env,
         ..Manifest::default()
     };
+    if let Some(c) = m
+        .pause_chance
+        .as_deref()
+        .filter(|c| parse_chance(c).is_none())
+    {
+        return Err(format!("run file: pause: bad chance {c} (off, or N/M)"));
+    }
+    if let Some(f) = m
+        .pause_for
+        .as_deref()
+        .filter(|f| parse_pause_for(f).is_none())
+    {
+        return Err(format!("run file: pause: bad for {f} (a range above zero)"));
+    }
+    if let Some(k) = m
+        .scheduler
+        .as_deref()
+        .filter(|k| parse_scheduler(k).is_none())
+    {
+        return Err(format!("run file: scheduler: {k} (expected random or pct)"));
+    }
+    if let Some(d) = m.pct_depth.filter(|&d| parse_pct_depth(d).is_none()) {
+        return Err(format!(
+            "run file: pct: depth {d} (1 to {})",
+            shared::MAX_PCT_DEPTH
+        ));
+    }
+    for (what, v) in [("horizon", &m.pct_horizon), ("starve", &m.pct_starve)] {
+        if let Some(v) = v.as_deref().filter(|v| parse_positive(v).is_none()) {
+            return Err(format!("run file: pct: bad {what} {v}"));
+        }
+    }
     for host in raw.hosts {
         if !valid_host_name(&host.name) {
             return Err(format!(
@@ -503,6 +677,7 @@ hosts:
                 crash_lo_ns: 50_000_000,
                 crash_hi_ns: 200_000_000,
                 crashes_left: 3,
+                ..Faults::default()
             }
         );
         let f = m.processes[1].faults;
@@ -532,6 +707,98 @@ hosts:
     fn the_switch_cost_is_read_as_given() {
         let m = parse("switch-cost: 50us\nhosts: [{name: a, processes: [p]}]\n").unwrap();
         assert_eq!(m.switch_cost.as_deref(), Some("50us"));
+    }
+
+    #[test]
+    fn pauses() {
+        let m =
+            parse("pause: {chance: 1/200, for: 10us..100ms}\nhosts: [{name: a, processes: [p]}]")
+                .unwrap();
+        assert_eq!(m.pause_chance.as_deref(), Some("1/200"));
+        assert_eq!(m.pause_for.as_deref(), Some("10us..100ms"));
+        let m = parse("pause: off\nhosts: [{name: a, processes: [p]}]").unwrap();
+        assert_eq!(m.pause_chance.as_deref(), Some("off"));
+        assert_eq!(m.pause_for, None);
+        assert_eq!(parse_chance("off"), Some((0, 1)));
+        assert_eq!(parse_chance("3/1000"), Some((3, 1000)));
+        assert_eq!(parse_chance("2/1"), None);
+        assert_eq!(parse_chance("1/0"), None);
+        assert_eq!(parse_pause_for("1ms"), Some((1_000_000, 1_000_000)));
+        assert_eq!(parse_pause_for("0..1ms"), None);
+        let err = |text: &str| parse(text).unwrap_err();
+        assert!(err("pause: sometimes\nhosts: [{name: a, processes: [p]}]").contains("bad chance"));
+        assert!(
+            err("pause: {chance: 1/2, for: 0}\nhosts: [{name: a, processes: [p]}]")
+                .contains("bad for")
+        );
+        assert!(
+            err("pause: {chance: 1/2, often: 1}\nhosts: [{name: a, processes: [p]}]")
+                .contains("run file")
+        );
+    }
+
+    #[test]
+    fn pct() {
+        let m = parse(
+            "scheduler: pct\npct: {depth: 4, horizon: 10s, starve: 5ms}\nhosts: [{name: a, processes: [p]}]",
+        )
+        .unwrap();
+        assert_eq!(m.scheduler.as_deref(), Some("pct"));
+        assert_eq!(m.pct_depth, Some(4));
+        assert_eq!(m.pct_horizon.as_deref(), Some("10s"));
+        assert_eq!(m.pct_starve.as_deref(), Some("5ms"));
+        let err = |text: &str| parse(text).unwrap_err();
+        let hosts = "\nhosts: [{name: a, processes: [p]}]";
+        assert!(err(&format!("scheduler: fifo{hosts}")).contains("random or pct"));
+        assert!(err(&format!("pct: {{depth: 0}}{hosts}")).contains("depth 0"));
+        assert!(err(&format!("pct: {{depth: 17}}{hosts}")).contains("depth 17"));
+        assert!(err(&format!("pct: {{horizon: 0}}{hosts}")).contains("bad horizon"));
+        assert!(err(&format!("pct: {{starve: soon}}{hosts}")).contains("bad starve"));
+        assert!(err(&format!("pct: {{width: 3}}{hosts}")).contains("run file"));
+    }
+
+    #[test]
+    fn shutdowns() {
+        let m = parse(
+            "hosts:
+  - name: a
+    processes:
+      - argv: [server]
+        restart: on-failure
+        shutdown: { every: 2s..10s, times: 3, signal: INT, grace: 5s }
+      - argv: [other]
+        shutdown: { every: 1s }
+",
+        )
+        .unwrap();
+        let f = m.processes[0].faults;
+        assert_eq!(
+            (f.shutdown_lo_ns, f.shutdown_hi_ns),
+            (2_000_000_000, 10_000_000_000)
+        );
+        assert_eq!(f.shutdowns_left, 3);
+        assert_eq!(i32::from(f.shutdown_signal), libc::SIGINT);
+        assert_eq!(f.grace_ns, 5_000_000_000);
+        assert_eq!(f.crash_hi_ns, 0);
+        let f = m.processes[1].faults;
+        assert_eq!(i32::from(f.shutdown_signal), libc::SIGTERM);
+        assert_eq!(f.grace_ns, DEFAULT_GRACE_NS);
+        assert_eq!(f.shutdowns_left, shared::NO_LIMIT);
+        assert_eq!(f.restart, shared::RESTART_NEVER);
+        let err = |sd: &str| {
+            parse(&format!(
+                "hosts: [{{name: a, processes: [{{argv: [p], shutdown: {sd}}}]}}]"
+            ))
+            .unwrap_err()
+        };
+        assert!(err("{every: 0}").contains("bad shutdown every"));
+        assert!(err("{every: 1s, signal: KILL}").contains("shutdown signal KILL"));
+        assert!(err("{every: 1s, grace: 0}").contains("bad shutdown grace"));
+        assert!(err("{every: 1s, after: 2s}").contains("run file"));
+        assert!(parse(
+            "hosts: [{name: a, processes: [{argv: [p], shutdown: {every: 1s, signal: SIGHUP}}]}]"
+        )
+        .is_ok());
     }
 
     #[test]

@@ -57,6 +57,15 @@ options:
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
   --switch-cost T                      virtual time each baton hand-off costs (default 10us)
+  --pause N/M                          pause the thread a scheduling choice picks with this
+                                       chance, while another can run (default 1/200; off)
+  --pause-for LO..HI                   how long, drawn log-uniformly (default 10us..100ms)
+  --scheduler random|pct               how the next thread is chosen (default random)
+  --pct-depth D                        PCT: D-1 priority change points (default 3)
+  --pct-horizon T                      PCT: they fall in this much virtual time (default:
+                                       --stop-after)
+  --pct-starve T                       PCT: a thread passed over this long runs once anyway
+                                       (default 50ms)
   --stop-after T                       the run is over at this virtual time: what still runs
                                        is killed there, reported as stopped, and does not
                                        fail the run (for servers that never exit)
@@ -69,6 +78,9 @@ run file:
   mem-hook-rate: 1/16
   net-latency: 5ms
   switch-cost: 10us
+  pause: { chance: 1/200, for: 10us..100ms }   or pause: off
+  scheduler: pct
+  pct: { depth: 3, horizon: 10s, starve: 50ms }
   heap-size: 32G
   stop-after: 30s
   wall-limit: 60s
@@ -105,6 +117,8 @@ struct Cli {
     capture_stderr: bool,
     net_latency_ns: u64,
     switch_ns: u64,
+    pauses: rewrite::shared::Pauses,
+    scheduler: rewrite::shared::Scheduler,
     heap_size: u64,
     /// Virtual time at which the run is over (0: when its processes are)
     stop_after_ns: u64,
@@ -155,6 +169,24 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(c), true) = (&m.switch_cost, from_file("switch-cost")) {
         cli.switch_ns = parse_switch_cost(c)?;
     }
+    if let (Some(c), true) = (&m.pause_chance, from_file("pause")) {
+        (cli.pauses.num, cli.pauses.den) = parse_chance(c)?;
+    }
+    if let (Some(f), true) = (&m.pause_for, from_file("pause-for")) {
+        (cli.pauses.lo_ns, cli.pauses.hi_ns) = parse_pause_for(f)?;
+    }
+    if let (Some(k), true) = (&m.scheduler, from_file("scheduler")) {
+        cli.scheduler.kind = parse_scheduler(k)?;
+    }
+    if let (Some(d), true) = (m.pct_depth, from_file("pct-depth")) {
+        cli.scheduler.pct_depth = parse_pct_depth(&d.to_string())?;
+    }
+    if let (Some(h), true) = (&m.pct_horizon, from_file("pct-horizon")) {
+        cli.scheduler.pct_horizon_ns = parse_positive("pct horizon", h)?;
+    }
+    if let (Some(t), true) = (&m.pct_starve, from_file("pct-starve")) {
+        cli.scheduler.pct_starve_ns = parse_positive("pct starve", t)?;
+    }
     if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
         cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
     }
@@ -164,7 +196,62 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(t), true) = (&m.wall_limit, from_file("wall-limit")) {
         cli.wall_limit_ms = parse_stop_after(t)? / 1_000_000;
     }
+    if m.pause_chance.is_some() {
+        // Asked for: a run without the scheduler refuses it
+        cli.given.push("pause");
+    }
     Ok(cli)
+}
+
+fn parse_scheduler(v: &str) -> Result<u8, String> {
+    manifest::parse_scheduler(v).ok_or(format!("bad scheduler {v} (random or pct)"))
+}
+
+fn parse_pct_depth(v: &str) -> Result<u32, String> {
+    v.parse()
+        .ok()
+        .and_then(manifest::parse_pct_depth)
+        .ok_or(format!(
+            "bad PCT depth {v} (1 to {})",
+            rewrite::shared::MAX_PCT_DEPTH
+        ))
+}
+
+fn parse_positive(what: &str, v: &str) -> Result<u64, String> {
+    manifest::parse_positive(v).ok_or(format!("bad {what} {v}"))
+}
+
+/// PCT's change points need a span of virtual time to fall in: its own,
+/// or the run's.
+fn scheduler_of(cli: &Cli) -> Result<rewrite::shared::Scheduler, String> {
+    let mut s = cli.scheduler;
+    if s.kind == rewrite::shared::SCHED_PCT && s.pct_horizon_ns == 0 {
+        if cli.stop_after_ns == 0 {
+            return Err("the PCT scheduler needs --pct-horizon or --stop-after: \
+                 the span of virtual time its change points fall in"
+                .into());
+        }
+        s.pct_horizon_ns = cli.stop_after_ns;
+    }
+    Ok(s)
+}
+
+/// Pauses are on by default, but a run without the scheduler has nothing to
+/// pause: off unless asked for, which is then an error.
+fn pauses_of(cli: &Cli) -> rewrite::shared::Pauses {
+    if cli.supervisor && !cli.native || cli.given.contains(&"pause") {
+        cli.pauses
+    } else {
+        rewrite::shared::Pauses::OFF
+    }
+}
+
+fn parse_chance(v: &str) -> Result<(u32, u32), String> {
+    manifest::parse_chance(v).ok_or(format!("bad pause chance {v} (off, or N/M)"))
+}
+
+fn parse_pause_for(v: &str) -> Result<(u64, u64), String> {
+    manifest::parse_pause_for(v).ok_or(format!("bad pause length {v} (a range above zero)"))
 }
 
 fn parse_stop_after(v: &str) -> Result<u64, String> {
@@ -186,6 +273,8 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         capture_stderr: false,
         net_latency_ns: 0,
         switch_ns: rewrite::shared::DEFAULT_SWITCH_NS,
+        pauses: rewrite::shared::Pauses::DEFAULT,
+        scheduler: rewrite::shared::Scheduler::RANDOM,
         heap_size: launch::DEFAULT_HEAP,
         stop_after_ns: 0,
         wall_limit_ms: 0,
@@ -233,6 +322,32 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             "--switch-cost" => {
                 cli.switch_ns = parse_switch_cost(&take_value(&mut args)?)?;
                 cli.given.push("switch-cost");
+            }
+            "--pause" => {
+                (cli.pauses.num, cli.pauses.den) = parse_chance(&take_value(&mut args)?)?;
+                cli.given.push("pause");
+            }
+            "--pause-for" => {
+                (cli.pauses.lo_ns, cli.pauses.hi_ns) = parse_pause_for(&take_value(&mut args)?)?;
+                cli.given.push("pause-for");
+            }
+            "--scheduler" => {
+                cli.scheduler.kind = parse_scheduler(&take_value(&mut args)?)?;
+                cli.given.push("scheduler");
+            }
+            "--pct-depth" => {
+                cli.scheduler.pct_depth = parse_pct_depth(&take_value(&mut args)?)?;
+                cli.given.push("pct-depth");
+            }
+            "--pct-horizon" => {
+                let v = take_value(&mut args)?;
+                cli.scheduler.pct_horizon_ns = parse_positive("pct horizon", &v)?;
+                cli.given.push("pct-horizon");
+            }
+            "--pct-starve" => {
+                let v = take_value(&mut args)?;
+                cli.scheduler.pct_starve_ns = parse_positive("pct starve", &v)?;
+                cli.given.push("pct-starve");
             }
             "--heap-size" => {
                 let v = take_value(&mut args)?;
@@ -318,6 +433,8 @@ fn run_guest(
         seed: cli.opts.seed,
         quantum: cli.quantum,
         stop_at_ns: cli.stop_after_ns,
+        pauses: pauses_of(cli),
+        scheduler: scheduler_of(cli)?,
         wall_limit_ms: cli.wall_limit_ms,
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
@@ -496,6 +613,8 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
         switch_ns: cli.switch_ns,
+        pauses: pauses_of(cli),
+        scheduler: scheduler_of(cli)?,
         reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
         stop_at_ns: cli.stop_after_ns,
         wall_limit_ms: cli.wall_limit_ms,
@@ -504,12 +623,20 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
     if run.stop_at_ns != 0 && (run.passive || run.dylib.is_none()) {
         return Err("stop-after needs the supervisor: it is a virtual time".into());
     }
-    let has_faults = run
-        .guests
-        .iter()
-        .any(|g| g.faults.restart != rewrite::shared::RESTART_NEVER || g.faults.crash_hi_ns != 0);
+    if (run.pauses.num != 0 || run.scheduler.kind != rewrite::shared::SCHED_RANDOM)
+        && (run.passive || run.dylib.is_none())
+    {
+        return Err(
+            "pauses and the PCT scheduler need the supervisor: it makes the schedule".into(),
+        );
+    }
+    let has_faults = run.guests.iter().any(|g| {
+        g.faults.restart != rewrite::shared::RESTART_NEVER
+            || g.faults.crash_hi_ns != 0
+            || g.faults.shutdown_hi_ns != 0
+    });
     if has_faults && (run.passive || run.dylib.is_none()) {
-        return Err("crash and restart settings need the supervisor".into());
+        return Err("crash, shutdown and restart settings need the supervisor".into());
     }
     let outcome = launch::launch_run(&run)?;
     if outcome.totals.restarts_refused > 0 {
@@ -526,7 +653,14 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
 }
 
 /// Fields every guest reports but that describe the whole run
-const RUN_WIDE: [&str; 3] = ["switches", "expiries", "schedule_hash"];
+const RUN_WIDE: [&str; 6] = [
+    "switches",
+    "expiries",
+    "schedule_hash",
+    "pauses",
+    "pct_changes",
+    "pct_starved",
+];
 
 /// The aggregated report: run-wide totals, then each process's own fields.
 fn print_run_report(o: &RunOutcome) {
@@ -540,7 +674,12 @@ fn print_run_report(o: &RunOutcome) {
     eprintln!("run.net_dropped={}", o.totals.net_dropped);
     eprintln!("run.net_bytes={}", o.totals.net_bytes);
     eprintln!("run.net_passthrough={}", o.totals.net_passthrough);
+    eprintln!("run.pauses={}", o.totals.pauses);
+    eprintln!("run.pct_changes={}", o.totals.pct_changes);
+    eprintln!("run.pct_starved={}", o.totals.pct_starved);
     eprintln!("run.crashes_injected={}", o.totals.crashes_injected);
+    eprintln!("run.shutdowns_injected={}", o.totals.shutdowns_injected);
+    eprintln!("run.shutdowns_forced={}", o.totals.shutdowns_forced);
     eprintln!("run.restarts={}", o.totals.restarts);
     eprintln!("run.clock_ns={}", o.totals.clock_ns);
     if o.totals.stopped_at != 0 {
@@ -635,7 +774,26 @@ fn replay_of(
         format!("{}ns", cli.switch_ns),
         "--heap-size".to_string(),
         cli.heap_size.to_string(),
+        "--pause".to_string(),
+        format!("{}/{}", cli.pauses.num, cli.pauses.den),
+        "--pause-for".to_string(),
+        format!("{}ns..{}ns", cli.pauses.lo_ns, cli.pauses.hi_ns),
+        "--scheduler".to_string(),
+        if cli.scheduler.kind == rewrite::shared::SCHED_PCT {
+            "pct"
+        } else {
+            "random"
+        }
+        .to_string(),
+        "--pct-depth".to_string(),
+        cli.scheduler.pct_depth.to_string(),
+        "--pct-starve".to_string(),
+        format!("{}ns", cli.scheduler.pct_starve_ns),
     ];
+    if cli.scheduler.pct_horizon_ns != 0 {
+        pass.push("--pct-horizon".to_string());
+        pass.push(format!("{}ns", cli.scheduler.pct_horizon_ns));
+    }
     if cli.stop_after_ns != 0 {
         pass.push("--stop-after".to_string());
         pass.push(format!("{}ns", cli.stop_after_ns));

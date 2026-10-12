@@ -674,28 +674,19 @@ pub unsafe extern "C" fn my_kill(vpid: libc::pid_t, sig: c_int) -> c_int {
     if sig == 0 {
         return 0;
     }
-    if sig != libc::SIGTERM && sig != libc::SIGKILL {
+    if sig != libc::SIGKILL {
         if !(1..32).contains(&sig) {
             return crate::errno::fail(libc::EINVAL);
         }
-        // The target is parked: it takes the signal when it next takes
-        // the baton up, and a wait of its on the signal sees it now
+        // The target is parked: it takes the signal when a thread of it
+        // next takes the baton up, and its handler runs there, at a point
+        // of the schedule. With no handler, that thread ends the process
+        // then, as `die` does.
         sched::with(|s, _| {
-            let p = &mut s.procs[target as usize];
-            p.sig_pending |= 1 << sig;
-            p.sig_counts[sig as usize] += 1;
+            s.post_signal(target, sig);
+            s.wake_io();
         });
-        sched::wake_io();
         return 0;
-    }
-    if sig == libc::SIGTERM {
-        // The target is parked. A SIGTERM handler would run its code without
-        // the baton, and a process that survives could never be scheduled
-        // again, so the signal that arrives is the one that cannot be caught.
-        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            crate::report::log("kill: SIGTERM to another guest is delivered as SIGKILL");
-        }
     }
     // The target is parked, so it dies where it stands. All that its death
     // means to the run happens now, under the lock: the launcher only hears

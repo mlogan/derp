@@ -15,8 +15,13 @@ int main(void) {
     struct sigaction sa = {0};
     sa.sa_sigaction = on_chld; sa.sa_flags = SA_SIGINFO;
     sigaction(SIGCHLD, &sa, NULL);
+    // Held until `child` is set: natively the handler could run first
+    sigset_t chld, old;
+    sigemptyset(&chld); sigaddset(&chld, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &chld, &old);
     child = fork();
     if (child == 0) _exit(3);
+    sigprocmask(SIG_SETMASK, &old, NULL);
     for (int i = 0; i < 100 && !ran; i++) usleep(1000);
     printf("siginfo: ran %d, si_pid is the child: %d, si_code CLD_EXITED: %d, si_status %d\n", (int)ran, (int)pid_ok, (int)code_ok, (int)status);
     waitpid(child, NULL, 0);

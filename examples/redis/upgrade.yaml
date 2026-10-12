@@ -1,0 +1,21 @@
+# The Redis example's server stopped twice for an upgrade while a client
+# writes: SIGTERM, Redis saves its data and exits, and it comes back from
+# what it saved. The client retries across the restarts and then checks
+# that no acknowledged write is gone. Setup as for run.yaml, then
+#   derp run --manifest examples/redis/upgrade.yaml --capture
+seed: 1
+env: { PYTHONPATH: site-packages }
+hosts:
+  - name: cache
+    processes:
+      - argv: [/opt/homebrew/bin/redis-server, --port, "6379", --bind, 0.0.0.0,
+               --protected-mode, "no", --save, "3600 1", --appendonly, "no",
+               --dir, ., --logfile, redis.log]
+        daemon: true
+        restart: on-failure
+        restart-delay: 200ms
+        shutdown: { every: 1s..2s, times: 2, grace: 5s }
+  - name: client
+    files: [upgrade_client.py, ../.venv/lib/python3.13/site-packages]
+    processes:
+      - [/opt/homebrew/opt/python@3.13/bin/python3.13, -u, upgrade_client.py]

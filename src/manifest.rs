@@ -297,6 +297,7 @@ fn faults_of(full: &RawFull) -> Result<Faults, String> {
         crash_lo_ns: crash_lo,
         crash_hi_ns: crash_hi,
         crashes_left: crashes,
+        ..Faults::default()
     })
 }
 
@@ -631,6 +632,7 @@ hosts:
                 crash_lo_ns: 50_000_000,
                 crash_hi_ns: 200_000_000,
                 crashes_left: 3,
+                ..Faults::default()
             }
         );
         let f = m.processes[1].faults;

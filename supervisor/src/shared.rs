@@ -99,6 +99,15 @@ pub struct Faults {
     pub crash_hi_ns: u64,
     /// `NO_LIMIT`, or how many crashes are left to inject
     pub crashes_left: u32,
+    /// A shutdown is injected this far into each life, drawn from the range
+    /// (both 0: none): `shutdown_signal` is sent, and the process is
+    /// crashed if it is still alive `grace_ns` later
+    pub shutdown_lo_ns: u64,
+    pub shutdown_hi_ns: u64,
+    /// `NO_LIMIT`, or how many shutdowns are left to inject
+    pub shutdowns_left: u32,
+    pub shutdown_signal: u8,
+    pub grace_ns: u64,
 }
 
 /// How often the scheduler pauses the thread it chose, and for how long
@@ -343,6 +352,13 @@ pub struct ProcRec {
     pub faults: Faults,
     /// Virtual time at which this life is crashed (0: not)
     pub crash_at: u64,
+    /// Virtual time at which this life is sent its shutdown signal (0: not)
+    pub shutdown_at: u64,
+    /// The end of the grace period of a shutdown under way (0: none)
+    pub kill_at: u64,
+    /// Sent its shutdown signal: however it ends, a restart policy other
+    /// than `never` brings it back, as after an upgrade
+    pub shut_down: bool,
     /// The process registered to take this one's place, or `NO_PROC`
     pub replaced_by: u32,
     /// `SIGKILL` has been sent (or the process saw `killed` while attaching
@@ -358,9 +374,23 @@ pub struct ProcRec {
 }
 
 impl ProcRec {
+    fn alive(&self) -> bool {
+        self.state != P_EXITED && !self.killed
+    }
+
     /// When this life is due to be crashed, if it still is
     fn pending_crash(&self) -> Option<u64> {
-        (self.crash_at != 0 && self.state != P_EXITED && !self.killed).then_some(self.crash_at)
+        (self.crash_at != 0 && self.alive()).then_some(self.crash_at)
+    }
+
+    /// When this life is due to be sent its shutdown signal, or crashed at
+    /// the end of its grace period, if it still is
+    fn pending_shutdown(&self) -> Option<u64> {
+        let due = [self.shutdown_at, self.kill_at]
+            .into_iter()
+            .filter(|&t| t != 0)
+            .min()?;
+        self.alive().then_some(due)
     }
 }
 
@@ -426,6 +456,9 @@ pub struct State {
     pub trace_path: [u8; DEBUG_PATH_LEN],
     pub mask_path: [u8; DEBUG_PATH_LEN],
     pub crashes_injected: u64,
+    pub shutdowns_injected: u64,
+    /// Shutdowns whose grace period ran out: the process was crashed
+    pub shutdowns_forced: u64,
     /// System V objects the guests created, for the launcher to remove
     /// when the run ends: (1 shared memory, 2 semaphore set), id. Guests
     /// get private objects (`IPC_PRIVATE`) whatever key they name, since
@@ -791,6 +824,8 @@ impl State {
         self.draw_crash(pid, from);
     }
 
+    /// When this life of `pid` is crashed and shut down, if it is. A run
+    /// without shutdowns draws as it did before they existed.
     fn draw_crash(&mut self, pid: u32, life_starts: u64) {
         let f = self.procs[pid as usize].faults;
         self.procs[pid as usize].crash_at = if f.crash_hi_ns == 0 || f.crashes_left == 0 {
@@ -798,6 +833,12 @@ impl State {
         } else {
             let span = f.crash_hi_ns - f.crash_lo_ns + 1;
             (life_starts + f.crash_lo_ns + self.fault_rng.below(span)).max(1)
+        };
+        self.procs[pid as usize].shutdown_at = if f.shutdown_hi_ns == 0 || f.shutdowns_left == 0 {
+            0
+        } else {
+            let span = f.shutdown_hi_ns - f.shutdown_lo_ns + 1;
+            (life_starts + f.shutdown_lo_ns + self.fault_rng.below(span)).max(1)
         };
     }
 
@@ -818,6 +859,8 @@ impl State {
         p.killed = true;
         p.died_at = now;
         p.crash_at = 0;
+        p.shutdown_at = 0;
+        p.kill_at = 0;
         self.unsignalled += 1;
         // One that has not attached holds nothing the run could wait for
         if p.state == P_LIVE {
@@ -881,7 +924,7 @@ impl State {
         let p = &self.procs[pid as usize];
         let wanted = match p.faults.restart {
             RESTART_ALWAYS => true,
-            RESTART_ON_FAILURE => status != 0,
+            RESTART_ON_FAILURE => status != 0 || p.shut_down,
             _ => false,
         };
         wanted && !self.stopped && p.spec != NO_PROC && p.faults.restarts_left > 0
@@ -949,6 +992,38 @@ impl State {
         }
     }
 
+    /// Shutdowns whose time has come: the signal is sent as by another
+    /// guest. Grace periods that are over: the process is crashed.
+    fn inject_due_shutdowns(&mut self) {
+        let now = self.clock_ns;
+        for pid in 0..self.nprocs {
+            let p = &self.procs[pid as usize];
+            if !p.alive() {
+                continue;
+            }
+            if p.kill_at != 0 && p.kill_at <= now {
+                self.crash(pid);
+                self.shutdowns_forced += 1;
+                continue;
+            }
+            if p.shutdown_at == 0 || p.shutdown_at > now {
+                continue;
+            }
+            let p = &mut self.procs[pid as usize];
+            let f = &mut p.faults;
+            if f.shutdowns_left != NO_LIMIT {
+                f.shutdowns_left -= 1;
+            }
+            let (sig, grace) = (c_int::from(f.shutdown_signal), f.grace_ns);
+            p.shutdown_at = 0;
+            p.kill_at = now + grace.max(1);
+            p.shut_down = true;
+            self.post_signal(pid, sig);
+            self.wake_io();
+            self.shutdowns_injected += 1;
+        }
+    }
+
     /// The stop that is still ahead, if the run has one.
     fn pending_stop(&self) -> Option<u64> {
         (self.stop_at_ns != 0 && !self.stopped).then_some(self.stop_at_ns)
@@ -976,9 +1051,10 @@ impl State {
     }
 
     fn next_crash(&self) -> Option<u64> {
-        self.procs[..self.nprocs as usize]
-            .iter()
-            .filter_map(ProcRec::pending_crash)
+        let procs = &self.procs[..self.nprocs as usize];
+        let crashes = procs.iter().filter_map(ProcRec::pending_crash);
+        crashes
+            .chain(procs.iter().filter_map(ProcRec::pending_shutdown))
             .min()
     }
 
@@ -1192,6 +1268,7 @@ impl State {
         }
         self.clock_moved();
         self.inject_due_crashes();
+        self.inject_due_shutdowns();
         self.expire_deadlines();
         self.fire_alarms();
         let mut runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
@@ -1218,6 +1295,7 @@ impl State {
             }
             self.clock_moved();
             self.inject_due_crashes();
+            self.inject_due_shutdowns();
             self.expire_deadlines();
             self.fire_alarms();
             runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
@@ -1404,6 +1482,8 @@ impl State {
             // It held the baton, so this is a point of the schedule too
             self.register_restart(pid, status);
             self.procs[pid as usize].crash_at = 0;
+            self.procs[pid as usize].shutdown_at = 0;
+            self.procs[pid as usize].kill_at = 0;
             // Its descriptors are closed: peers may see EOF or EPIPE now
             self.net.process_died(pid);
             self.wake_io();
@@ -1763,6 +1843,85 @@ mod tests {
         pct_picks(s, 500);
         let mut rng = Rng::seed_from_u64(21);
         assert_eq!(s.rng.next_u64(), rng.next_u64());
+    }
+
+    /// A run with one live process of two threads blocked in a sleep, set
+    /// to be shut down 1ms into its life with a 5ms grace period
+    fn shutdown_state(restart: u8) -> &'static mut State {
+        let sh = shared_mapping_seeded(3);
+        let s = unsafe { &mut *sh.state.get() };
+        let p = s.add_proc(0, NO_PROC);
+        s.procs[p as usize].state = P_LIVE;
+        for _ in 0..2 {
+            let t = s.add_thread(p);
+            s.threads[t].state = T_BLOCKED;
+            s.threads[t].key = SLEEP_KEY;
+            s.threads[t].deadline = 10_000_000_000;
+        }
+        let faults = Faults {
+            restart,
+            restart_delay_lo_ns: 1_000_000,
+            restart_delay_hi_ns: 1_000_000,
+            restarts_left: NO_LIMIT,
+            shutdown_lo_ns: 1_000_000,
+            shutdown_hi_ns: 1_000_000,
+            shutdowns_left: 1,
+            shutdown_signal: libc::SIGTERM as u8,
+            grace_ns: 5_000_000,
+            ..Faults::default()
+        };
+        s.set_faults(p, faults, 0);
+        s
+    }
+
+    #[test]
+    fn a_shutdown_sends_its_signal_and_wakes_the_process() {
+        let s = shutdown_state(RESTART_NEVER);
+        assert_eq!(s.procs[0].shutdown_at, 1_000_000);
+        // Nothing runnable: the clock jumps to the shutdown
+        let t = s.pick().unwrap();
+        assert_eq!(s.clock_ns, 1_000_000);
+        assert_eq!(s.threads[t].pid, 0);
+        assert_eq!(s.procs[0].sig_pending, 1 << libc::SIGTERM);
+        assert_eq!(s.procs[0].sig_counts[libc::SIGTERM as usize], 1);
+        assert!(s.threads[..2].iter().all(|t| t.state == T_RUNNABLE));
+        assert_eq!(s.procs[0].kill_at, 6_000_000);
+        assert_eq!(s.shutdowns_injected, 1);
+        assert!(!s.procs[0].killed);
+    }
+
+    #[test]
+    fn a_process_still_alive_after_its_grace_period_is_crashed() {
+        let s = shutdown_state(RESTART_ON_FAILURE);
+        s.pick().unwrap();
+        // It handles the signal and goes back to sleep
+        for t in &mut s.threads[..2] {
+            t.state = T_BLOCKED;
+        }
+        // Crashed at 6ms; the next life's thread runs after its 1ms delay
+        assert!(s.pick().is_some());
+        assert_eq!(s.procs[0].died_at, 6_000_000);
+        assert_eq!(s.clock_ns, 7_000_000);
+        assert!(s.procs[0].killed);
+        assert_eq!(s.shutdowns_forced, 1);
+        assert_eq!(s.restarts, 1);
+        // The next life has no shutdown left to inject
+        let next = s.procs[0].replaced_by as usize;
+        assert_eq!(s.procs[next].shutdown_at, 0);
+    }
+
+    #[test]
+    fn a_clean_exit_during_a_shutdown_counts_as_a_failure_for_restarts() {
+        let s = shutdown_state(RESTART_ON_FAILURE);
+        s.pick().unwrap();
+        s.current = 0;
+        s.process_died(0, 0);
+        assert_eq!(s.restarts, 1);
+        assert_eq!(s.shutdowns_forced, 0);
+        // Without a shutdown, exit 0 is not a failure
+        let s = shutdown_state(RESTART_ON_FAILURE);
+        s.process_died(0, 0);
+        assert_eq!(s.restarts, 0);
     }
 
     #[test]

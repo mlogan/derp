@@ -31,6 +31,7 @@ pub struct Launch {
     /// See `Run::stop_at_ns`
     pub stop_at_ns: u64,
     pub pauses: crate::shared::Pauses,
+    pub scheduler: crate::shared::Scheduler,
     /// See `Run::wall_limit_ms`
     pub wall_limit_ms: u64,
     /// Inject the dylib without scheduling: see `Run::passive`
@@ -151,6 +152,7 @@ pub struct Run {
     /// Virtual time each baton hand-off costs
     pub switch_ns: u64,
     pub pauses: crate::shared::Pauses,
+    pub scheduler: crate::shared::Scheduler,
     /// Seed bisection: (virtual time, replacement seed)
     pub reseed: Option<(u64, u64)>,
     /// Virtual time at which the run is over whatever is still running
@@ -836,6 +838,7 @@ fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -
         c.set_net_latency(run.net_latency_ns);
         c.set_switch_cost(run.switch_ns);
         c.set_pauses(run.pauses);
+        c.set_scheduler(run.scheduler);
         c.set_outside_network(run.outside_network);
         c.set_stop_at(run.stop_at_ns);
         c.set_debug_paths();
@@ -1028,6 +1031,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         net_latency_ns: 0,
         switch_ns: crate::shared::DEFAULT_SWITCH_NS,
         pauses: cfg.pauses,
+        scheduler: cfg.scheduler,
         reseed: None,
         stop_at_ns: cfg.stop_at_ns,
         wall_limit_ms: cfg.wall_limit_ms,

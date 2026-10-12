@@ -114,6 +114,14 @@ struct RawPauseFull {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RawPct {
+    depth: Option<u32>,
+    horizon: Option<Scalar>,
+    starve: Option<Scalar>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawHost {
     name: String,
     #[serde(default)]
@@ -134,6 +142,8 @@ struct RawRun {
     stop_after: Option<Scalar>,
     wall_limit: Option<Scalar>,
     pause: Option<RawPause>,
+    scheduler: Option<String>,
+    pct: Option<RawPct>,
     outside_network: Option<String>,
     #[serde(default)]
     allow: Vec<String>,
@@ -193,6 +203,27 @@ pub fn parse_duration_ns(s: &str) -> Option<u64> {
     let ns = digits.parse::<u64>().ok()?.checked_mul(scale)?;
     // Far from overflowing the virtual clock when added to it
     (ns <= MAX_DURATION_NS).then_some(ns)
+}
+
+/// `random` or `pct`
+#[must_use]
+pub fn parse_scheduler(s: &str) -> Option<u8> {
+    match s {
+        "random" => Some(shared::SCHED_RANDOM),
+        "pct" => Some(shared::SCHED_PCT),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn parse_pct_depth(d: u32) -> Option<u32> {
+    (1..=shared::MAX_PCT_DEPTH).contains(&d).then_some(d)
+}
+
+/// A duration that is not zero
+#[must_use]
+pub fn parse_positive(s: &str) -> Option<u64> {
+    parse_duration_ns(s).filter(|&ns| ns > 0)
 }
 
 /// How often a scheduling choice pauses a thread: `off`, or `N/M`
@@ -295,6 +326,11 @@ pub struct Manifest {
     /// As on the command line: `off` or `1/200`, and `10us..100ms`
     pub pause_chance: Option<String>,
     pub pause_for: Option<String>,
+    /// `random` or `pct`, and PCT's settings as on the command line
+    pub scheduler: Option<String>,
+    pub pct_depth: Option<u32>,
+    pub pct_horizon: Option<String>,
+    pub pct_starve: Option<String>,
     /// Whether a guest may connect to addresses outside the virtual
     /// network (what comes back is input the run cannot repeat); refused
     /// with `ENETUNREACH` unless the run file says `outside-network: allow`
@@ -369,6 +405,16 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
             Some(RawPause::Full(p)) => p.length.as_ref().map(Scalar::text),
             _ => None,
         },
+        scheduler: raw.scheduler.clone(),
+        pct_depth: raw.pct.as_ref().and_then(|p| p.depth),
+        pct_horizon: raw
+            .pct
+            .as_ref()
+            .and_then(|p| p.horizon.as_ref().map(Scalar::text)),
+        pct_starve: raw
+            .pct
+            .as_ref()
+            .and_then(|p| p.starve.as_ref().map(Scalar::text)),
         outside_network,
         allow: raw.allow,
         env: raw.env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
@@ -388,6 +434,24 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         .filter(|f| parse_pause_for(f).is_none())
     {
         return Err(format!("run file: pause: bad for {f} (a range above zero)"));
+    }
+    if let Some(k) = m
+        .scheduler
+        .as_deref()
+        .filter(|k| parse_scheduler(k).is_none())
+    {
+        return Err(format!("run file: scheduler: {k} (expected random or pct)"));
+    }
+    if let Some(d) = m.pct_depth.filter(|&d| parse_pct_depth(d).is_none()) {
+        return Err(format!(
+            "run file: pct: depth {d} (1 to {})",
+            shared::MAX_PCT_DEPTH
+        ));
+    }
+    for (what, v) in [("horizon", &m.pct_horizon), ("starve", &m.pct_starve)] {
+        if let Some(v) = v.as_deref().filter(|v| parse_positive(v).is_none()) {
+            return Err(format!("run file: pct: bad {what} {v}"));
+        }
     }
     for host in raw.hosts {
         if !valid_host_name(&host.name) {
@@ -624,6 +688,26 @@ hosts:
             err("pause: {chance: 1/2, often: 1}\nhosts: [{name: a, processes: [p]}]")
                 .contains("run file")
         );
+    }
+
+    #[test]
+    fn pct() {
+        let m = parse(
+            "scheduler: pct\npct: {depth: 4, horizon: 10s, starve: 5ms}\nhosts: [{name: a, processes: [p]}]",
+        )
+        .unwrap();
+        assert_eq!(m.scheduler.as_deref(), Some("pct"));
+        assert_eq!(m.pct_depth, Some(4));
+        assert_eq!(m.pct_horizon.as_deref(), Some("10s"));
+        assert_eq!(m.pct_starve.as_deref(), Some("5ms"));
+        let err = |text: &str| parse(text).unwrap_err();
+        let hosts = "\nhosts: [{name: a, processes: [p]}]";
+        assert!(err(&format!("scheduler: fifo{hosts}")).contains("random or pct"));
+        assert!(err(&format!("pct: {{depth: 0}}{hosts}")).contains("depth 0"));
+        assert!(err(&format!("pct: {{depth: 17}}{hosts}")).contains("depth 17"));
+        assert!(err(&format!("pct: {{horizon: 0}}{hosts}")).contains("bad horizon"));
+        assert!(err(&format!("pct: {{starve: soon}}{hosts}")).contains("bad starve"));
+        assert!(err(&format!("pct: {{width: 3}}{hosts}")).contains("run file"));
     }
 
     #[test]

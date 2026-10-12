@@ -78,6 +78,7 @@ fn stubs_are_slide_proof() {
         quantum: launch::DEFAULT_QUANTUM,
         stop_at_ns: 0,
         pauses: rewrite::shared::Pauses::OFF,
+        scheduler: rewrite::shared::Scheduler::RANDOM,
         wall_limit_ms: 0,
         passive: false,
         rewrite: None,

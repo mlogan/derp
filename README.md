@@ -132,6 +132,10 @@ there; the command line wins.
 | `--switch-cost T` | `10us` | `switch-cost:` | How far each baton hand-off moves the virtual clock, quantum expiries included; a clock read moves it 1µs. Threads run one at a time on one clock, so the cost is kept low: at 1ms, the old default, a run of several threaded servers with hundreds of threads between them got so little done per virtual second that their own timeouts fired. The price is that code timing its own work finds it very fast. Only a run-file run can change it. |
 | `--pause N/M` | off | `pause: {chance: N/M}` | With this chance, a scheduling choice pauses the thread it picked instead of running it, while another thread can run: the thread is passed over until its pause ends, or until nothing else is runnable. This is how a lock holder stalls in its critical section, or a writer falls behind, as a thread starved of the CPU would. `off` or `0/1` turns pauses off. |
 | `--pause-for LO..HI` | `10us..100ms` | `pause: {for: LO..HI}` | How long a pause lasts in virtual time, drawn log-uniformly: each doubling of the length is about equally likely, so short pauses in a narrow window and long starvations are both common. |
+| `--scheduler random\|pct` | `random` | `scheduler:` | How the next thread is chosen. `random` draws uniformly among the runnable threads at every choice. `pct` is PCT (Burckhardt et al., ASPLOS 2010): every thread gets a random priority, the highest runnable one runs, and at `depth - 1` random points the thread holding the baton drops below every other. A bug that needs `d` ordering constraints is found with probability at least 1/(n·k^(d-1)) per run, for `n` threads and `k` scheduling points. Pauses apply under either. |
+| `--pct-depth D` | `3` | `pct: {depth: D}` | PCT's `d`, 1 to 16. A one-sided ordering bug is depth 1, an atomicity violation or a two-lock deadlock depth 2. |
+| `--pct-horizon T` | `--stop-after` | `pct: {horizon: T}` | The span of virtual time the change points are drawn from. Priorities hold until it is over; after it the `random` pick takes over (Coyote's "fair PCT"), so a program that spins on a lower thread's progress is slow only within it. Set it to about the length of the run (`run.clock_ns` of an earlier one) or of the window of interest: a change point after the interesting part does nothing. One of it and `--stop-after` is needed. |
+| `--pct-starve T` | `50ms` | `pct: {starve: T}` | Within the horizon, a runnable thread passed over this long runs once anyway, so a thread spinning on a lower one's progress cannot stall the run. |
 | `--stop-after T` | | `stop-after:` | End the run at this virtual time: whatever still runs is killed at that point of the schedule, reported as `stopped`, and does not fail the run. For servers that never exit by themselves, and for comparing what a program did in a fixed span of virtual time. Needs the supervisor. |
 | `--wall-limit T` | | `wall-limit:` | The same at a real time. Works for `--native` runs too, which have no virtual clock: every process reports `cpu_user_ns` and `cpu_system_ns`, and `run.cpu_*` sum them, so a program's cost natively and under the supervisor can be compared over the same span. |
 | `--scratch DIR` | under the system temp dir | | Where a run file's host directories are made, fresh. An existing directory is only cleared if an earlier run made it. |
@@ -171,6 +175,8 @@ switch-cost: 10us        # virtual time a baton hand-off costs (the default)
 pause:                   # or `pause: off` (the default)
   chance: 1/200          # of each scheduling choice
   for: 10us..100ms       # log-uniform
+scheduler: pct           # or random (the default)
+pct: { depth: 3, horizon: 2s, starve: 50ms }
 stop-after: 30s          # the run is over at this virtual time (default: never)
 wall-limit: 60s          # or at this real time, native runs included
 outside-network: refuse  # or allow: connections and name lookups beyond the

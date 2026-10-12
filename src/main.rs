@@ -616,12 +616,13 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
             "pauses and the PCT scheduler need the supervisor: it makes the schedule".into(),
         );
     }
-    let has_faults = run
-        .guests
-        .iter()
-        .any(|g| g.faults.restart != rewrite::shared::RESTART_NEVER || g.faults.crash_hi_ns != 0);
+    let has_faults = run.guests.iter().any(|g| {
+        g.faults.restart != rewrite::shared::RESTART_NEVER
+            || g.faults.crash_hi_ns != 0
+            || g.faults.shutdown_hi_ns != 0
+    });
     if has_faults && (run.passive || run.dylib.is_none()) {
-        return Err("crash and restart settings need the supervisor".into());
+        return Err("crash, shutdown and restart settings need the supervisor".into());
     }
     let outcome = launch::launch_run(&run)?;
     if outcome.totals.restarts_refused > 0 {
@@ -663,6 +664,8 @@ fn print_run_report(o: &RunOutcome) {
     eprintln!("run.pct_changes={}", o.totals.pct_changes);
     eprintln!("run.pct_starved={}", o.totals.pct_starved);
     eprintln!("run.crashes_injected={}", o.totals.crashes_injected);
+    eprintln!("run.shutdowns_injected={}", o.totals.shutdowns_injected);
+    eprintln!("run.shutdowns_forced={}", o.totals.shutdowns_forced);
     eprintln!("run.restarts={}", o.totals.restarts);
     eprintln!("run.clock_ns={}", o.totals.clock_ns);
     if o.totals.stopped_at != 0 {

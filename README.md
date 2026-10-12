@@ -205,7 +205,8 @@ named variables on purpose. Otherwise a proxy setting or a locale would be
 an input nobody wrote down, and the environment's length even decides where
 a guest's stack starts. Single-program `derp run prog` still inherits.
 
-A process written as a map can be crashed on purpose and restarted:
+A process written as a map can be crashed or shut down on purpose, and
+restarted:
 
 ```yaml
       - argv: [server, --port, 7000]
@@ -213,9 +214,14 @@ A process written as a map can be crashed on purpose and restarted:
         restart: on-failure      # never (default) | on-failure | always
         restart-delay: 50ms..150ms   # how long it stays down (default 100ms)
         max-restarts: 10         # default: no limit
-        crash:
+        crash:                   # SIGKILL: it dies where it stands
           every: 100ms..300ms    # into each life
           times: 3               # default: no limit
+        shutdown:                # as for an upgrade: a signal, then a crash
+          every: 2s..10s         # into each life
+          times: 3               # default: no limit
+          signal: TERM           # TERM (default), INT, QUIT, HUP, USR1, USR2
+          grace: 5s              # crashed if still alive then (default 10s)
 ```
 
 All times are virtual and drawn from the seed, so a seed crashes the same
@@ -229,6 +235,15 @@ last life. The report counts `run.crashes_injected` and `run.restarts`,
 and `p<i>.entry` says which run-file entry process `i` was a life of;
 `p<i>.program` and `p<i>.image` say what it ran, children a guest started
 included.
+
+A shutdown sends its signal as another guest's `kill` would: every
+blocked thread of the process is woken, the handler runs at a point of the
+schedule and ends a `sleep`, `poll` or `kevent` with `EINTR`, and with no
+handler the signal ends the process. If the process is still alive when
+its grace period is over, it is crashed. A life that was sent its shutdown
+signal is restarted under `on-failure` however it ends, exit 0 included:
+it was stopped to come back. The report counts `run.shutdowns_injected`,
+and `run.shutdowns_forced` for the ones that ran out of grace.
 
 `restart-delay` may not be zero, and it and `max-restarts` need a restart
 policy. Only run-file entries are restarted, not a guest's own children. A

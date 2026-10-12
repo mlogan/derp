@@ -87,6 +87,7 @@ struct RawFull {
     #[serde(rename = "max-restarts")]
     max_restarts: Option<u32>,
     crash: Option<RawCrash>,
+    shutdown: Option<RawShutdown>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,6 +119,15 @@ struct RawPct {
     depth: Option<u32>,
     horizon: Option<Scalar>,
     starve: Option<Scalar>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawShutdown {
+    every: Scalar,
+    times: Option<u32>,
+    signal: Option<String>,
+    grace: Option<Scalar>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +180,23 @@ pub struct Process {
 /// How long a process stays down when `restart-delay` is not given. Not
 /// zero: a restart is never instantaneous.
 const DEFAULT_RESTART_DELAY_NS: u64 = 100_000_000;
+
+/// How long a shut-down process has to exit before it is crashed
+const DEFAULT_GRACE_NS: u64 = 10_000_000_000;
+
+/// The signals a shutdown may send, by name with or without `SIG`
+fn shutdown_signal(name: &str) -> Option<u8> {
+    let sig = match name.strip_prefix("SIG").unwrap_or(name) {
+        "TERM" => libc::SIGTERM,
+        "INT" => libc::SIGINT,
+        "QUIT" => libc::SIGQUIT,
+        "HUP" => libc::SIGHUP,
+        "USR1" => libc::SIGUSR1,
+        "USR2" => libc::SIGUSR2,
+        _ => return None,
+    };
+    Some(sig as u8)
+}
 
 /// A year
 const MAX_DURATION_NS: u64 = 365 * 24 * 3600 * 1_000_000_000;
@@ -285,6 +312,24 @@ fn faults_of(full: &RawFull) -> Result<Faults, String> {
             (lo, hi, c.times.unwrap_or(shared::NO_LIMIT))
         }
     };
+    let mut shutdown = Faults::default();
+    if let Some(sd) = &full.shutdown {
+        let (lo, hi) = parse_duration_range(&sd.every.text())
+            .filter(|&(lo, _)| lo > 0)
+            .ok_or(format!("run file: bad shutdown every {}", sd.every.text()))?;
+        let signal = sd.signal.as_deref().unwrap_or("TERM");
+        shutdown.shutdown_signal = shutdown_signal(signal).ok_or(format!(
+            "run file: shutdown signal {signal} (TERM, INT, QUIT, HUP, USR1 or USR2)"
+        ))?;
+        shutdown.grace_ns = match &sd.grace {
+            None => DEFAULT_GRACE_NS,
+            Some(g) => parse_duration_ns(&g.text())
+                .filter(|&ns| ns > 0)
+                .ok_or(format!("run file: bad shutdown grace {}", g.text()))?,
+        };
+        (shutdown.shutdown_lo_ns, shutdown.shutdown_hi_ns) = (lo, hi);
+        shutdown.shutdowns_left = sd.times.unwrap_or(shared::NO_LIMIT);
+    }
     Ok(Faults {
         restart,
         restart_delay_lo_ns: delay_lo,
@@ -297,7 +342,7 @@ fn faults_of(full: &RawFull) -> Result<Faults, String> {
         crash_lo_ns: crash_lo,
         crash_hi_ns: crash_hi,
         crashes_left: crashes,
-        ..Faults::default()
+        ..shutdown
     })
 }
 
@@ -710,6 +755,50 @@ hosts:
         assert!(err(&format!("pct: {{horizon: 0}}{hosts}")).contains("bad horizon"));
         assert!(err(&format!("pct: {{starve: soon}}{hosts}")).contains("bad starve"));
         assert!(err(&format!("pct: {{width: 3}}{hosts}")).contains("run file"));
+    }
+
+    #[test]
+    fn shutdowns() {
+        let m = parse(
+            "hosts:
+  - name: a
+    processes:
+      - argv: [server]
+        restart: on-failure
+        shutdown: { every: 2s..10s, times: 3, signal: INT, grace: 5s }
+      - argv: [other]
+        shutdown: { every: 1s }
+",
+        )
+        .unwrap();
+        let f = m.processes[0].faults;
+        assert_eq!(
+            (f.shutdown_lo_ns, f.shutdown_hi_ns),
+            (2_000_000_000, 10_000_000_000)
+        );
+        assert_eq!(f.shutdowns_left, 3);
+        assert_eq!(i32::from(f.shutdown_signal), libc::SIGINT);
+        assert_eq!(f.grace_ns, 5_000_000_000);
+        assert_eq!(f.crash_hi_ns, 0);
+        let f = m.processes[1].faults;
+        assert_eq!(i32::from(f.shutdown_signal), libc::SIGTERM);
+        assert_eq!(f.grace_ns, DEFAULT_GRACE_NS);
+        assert_eq!(f.shutdowns_left, shared::NO_LIMIT);
+        assert_eq!(f.restart, shared::RESTART_NEVER);
+        let err = |sd: &str| {
+            parse(&format!(
+                "hosts: [{{name: a, processes: [{{argv: [p], shutdown: {sd}}}]}}]"
+            ))
+            .unwrap_err()
+        };
+        assert!(err("{every: 0}").contains("bad shutdown every"));
+        assert!(err("{every: 1s, signal: KILL}").contains("shutdown signal KILL"));
+        assert!(err("{every: 1s, grace: 0}").contains("bad shutdown grace"));
+        assert!(err("{every: 1s, after: 2s}").contains("run file"));
+        assert!(parse(
+            "hosts: [{name: a, processes: [{argv: [p], shutdown: {every: 1s, signal: SIGHUP}}]}]"
+        )
+        .is_ok());
     }
 
     #[test]

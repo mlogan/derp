@@ -1847,3 +1847,31 @@ fn the_outside_network_is_refused_unless_allowed() {
         r.stdout[0]
     );
 }
+
+/// Signals between guests arrive as sent: a child asleep in `sleep` is
+/// woken by them, its handler runs and ends the sleep (`EINTR`), and one
+/// without a handler dies of the signal. What each mode prints natively is
+/// what it must print here, the promptness of the death included.
+#[test]
+fn signals_between_guests_behave_as_they_do_natively() {
+    let dir = common::scratch_dir("peer_signal");
+    let exe = common::build_c("peer_signal", &dir, &[]);
+    for mode in ["int", "term", "handler", "ignore"] {
+        let native = Command::new(&exe).arg(mode).output().unwrap();
+        assert!(native.status.success(), "{mode} natively");
+        let manifest = dir.join(format!("{mode}.yaml"));
+        std::fs::write(
+            &manifest,
+            format!("hosts:\n  - name: a\n    processes:\n      - peer_signal {mode}\n"),
+        )
+        .unwrap();
+        for seed in 1..=3 {
+            let r = run_manifest(&manifest, &dir.join("scratch"), seed, 1);
+            assert_eq!(
+                r.stdout[0],
+                String::from_utf8_lossy(&native.stdout),
+                "{mode}, seed {seed}"
+            );
+        }
+    }
+}

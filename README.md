@@ -376,10 +376,15 @@ Results: `docs/REWRITE_RESULTS.md` (single process) and
   virtual deadline: its SIGALRM is pending from that moment of the
   schedule and wakes a blocked thread of the process, instead of landing
   on a parked thread at a real moment (Postgres times statements so).
-- A signal one guest sends another (`kill` with anything but SIGTERM and
-  SIGKILL, which end the target) is delivered when the target next takes
-  the baton up, on that thread, so its handler runs at a point of the
-  schedule; `kill(pid, 0)` says whether a guest lives. A kqueue watch on
+- A signal one guest sends another (`kill` with anything but SIGKILL,
+  which ends the target where it stands) is delivered when a thread of the
+  target next takes the baton up, so its handler runs at a point of the
+  schedule. Every blocked thread of the target is woken to take it, and a
+  handler that runs during `sleep`, `nanosleep`, `usleep`, `poll`,
+  `select` or `kevent` ends the wait with `EINTR` once nothing is ready, as
+  natively. A signal with no handler whose default is to terminate ends
+  the target at that point (SIGTERM included, so a server can be shut
+  down gracefully); `kill(pid, 0)` says whether a guest lives. A kqueue watch on
   a guest's pid (`EVFILT_PROC`) or on a signal (`EVFILT_SIGNAL`) is the
   run's too: Postgres's children watch the postmaster and its latches are
   SIGURG.
@@ -475,6 +480,9 @@ that closes a source of nondeterminism adds a row here.
 | A signal a guest sends itself went to whichever thread the kernel picked, at a real moment | `kill(getpid(), sig)` is delivered with `pthread_kill` to the calling thread, so the handler runs there with the baton. |
 | `SIGCHLD` arrived from the kernel at a real moment | The guest's handler is kept by the supervisor, the kernel's delivery is dropped, and the handler runs on the parent's next thread to take the baton up after the death is recorded, with the child's pid and status in `siginfo`, `SA_RESETHAND` honoured, and a blocked signal left for a thread that takes it. |
 | Signals between guests were dropped (Postgres's latches are SIGURG, its procsignals SIGUSR1) | A signal to another guest is recorded against the target and raised on the target's next thread to take the baton up; `kill(pid, 0)` answers whether the guest lives. |
+| A signal to another guest reached it only when one of its threads happened to run: a guest asleep or blocked on a lock went on waiting, natively it is interrupted at once | Every blocked thread of the target is woken when the signal is sent, and the first to take the baton up without the signal blocked takes it. |
+| A handler that ran during `sleep`, `nanosleep`, `usleep`, `poll`, `select` or `kevent` did not end the wait: the guest slept on to its deadline, natively the call returns `EINTR` | Each thread counts the handlers run on it; these waits return `EINTR` (with the time left) when the count moved and nothing is ready. |
+| SIGTERM from one guest to another was turned into SIGKILL, so a handler for it never ran and a graceful shutdown was a crash | SIGTERM is delivered like any other signal; with no handler it ends the target at the point of the schedule where it is raised, with the signal as its status. |
 
 ### Processes
 

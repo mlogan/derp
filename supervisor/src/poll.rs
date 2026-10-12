@@ -8,7 +8,6 @@
 use std::ffi::c_int;
 
 use crate::sched::{self, my_id};
-use crate::shared;
 use crate::shared::netstate::{KIND_DGRAM, S_CLOSED, S_CONNECTED};
 
 /// Events a virtual socket has now, limited to what was asked for (plus
@@ -66,10 +65,15 @@ unsafe fn wait(fds: &mut [libc::pollfd], timeout_ns: Option<u64>) -> c_int {
         .iter()
         .zip(&socks)
         .any(|(p, sock)| p.fd >= 0 && sock.is_none() && !crate::io::is_guest_object(p.fd));
+    let handled = sched::handlers_run();
     loop {
         let ready = scan(fds, &socks);
         if ready != 0 || timeout_ns == Some(0) {
             return ready;
+        }
+        // Only once nothing is ready: what the signal made ready counts
+        if sched::handlers_run() != handled {
+            return crate::errno::fail(libc::EINTR);
         }
         if outside {
             crate::io::note_outside_in_wait();
@@ -80,9 +84,13 @@ unsafe fn wait(fds: &mut [libc::pollfd], timeout_ns: Option<u64>) -> c_int {
     }
 }
 
-/// A block may end early without a wake (see `ProcRec::outside_wakes`).
-fn sleep_until(deadline: u64) {
-    while !sched::block_until(shared::SLEEP_KEY, Some(deadline)) {}
+/// A sleep that a signal handler can end: 0, or -1 with `EINTR`.
+fn sleep_until(deadline: u64) -> c_int {
+    if crate::interpose::sleep_ns(deadline.saturating_sub(sched::now())) == 0 {
+        0
+    } else {
+        crate::errno::fail(libc::EINTR)
+    }
 }
 
 /// Whether the set is ours to wait on: some descriptor's readiness must
@@ -104,8 +112,7 @@ pub unsafe extern "C" fn my_poll(fds: *mut libc::pollfd, n: libc::nfds_t, timeou
     };
     if my_id().is_some() && set.is_empty() && timeout > 0 {
         // A sleep in disguise
-        sleep_until(sched::now().saturating_add(timeout as u64 * 1_000_000));
-        return 0;
+        return sleep_until(sched::now().saturating_add(timeout as u64 * 1_000_000));
     }
     if !between_guests(set) {
         return libc::poll(fds, n, timeout);
@@ -153,14 +160,15 @@ pub unsafe extern "C" fn my_select(
         .then(|| (*timeout).tv_sec as u64 * 1_000_000_000 + (*timeout).tv_usec as u64 * 1000);
     if my_id().is_some() && fds.is_empty() {
         if let Some(ns) = timeout_ns.filter(|&ns| ns > 0) {
-            sleep_until(sched::now().saturating_add(ns));
-            return 0;
+            return sleep_until(sched::now().saturating_add(ns));
         }
     }
     if !between_guests(&fds) {
         return libc::select(nfds, readfds, writefds, errorfds, timeout);
     }
-    wait(&mut fds, timeout_ns);
+    if wait(&mut fds, timeout_ns) < 0 {
+        return -1;
+    }
     if fds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
         *libc::__error() = libc::EBADF;
         return -1;

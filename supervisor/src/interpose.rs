@@ -538,10 +538,17 @@ fn timed_out(
     fail
 }
 
-/// Sleep for `ns` of virtual time: a wait nothing but the deadline ends.
-fn sleep_ns(ns: u64) {
+/// Sleep for `ns` of virtual time, until the deadline or a signal handler
+/// runs on this thread. Returns what was left (0: slept it all).
+pub fn sleep_ns(ns: u64) -> u64 {
     let deadline = sched::now().saturating_add(ns);
-    while !sched::block_until(shared::SLEEP_KEY, Some(deadline)) {}
+    let handled = sched::handlers_run();
+    while !sched::block_until(shared::SLEEP_KEY, Some(deadline)) {
+        if sched::handlers_run() != handled {
+            return deadline.saturating_sub(sched::now()).max(1);
+        }
+    }
+    0
 }
 
 fn ulock_is_wide(op: u32) -> bool {
@@ -857,14 +864,18 @@ extern "C" fn my_nanosleep(req: *const libc::timespec, rem: *mut libc::timespec)
     }
     count(C_YIELD);
     let ns = unsafe { sched::timespec_ns(req) };
-    sleep_ns(ns);
+    let left = sleep_ns(ns);
     if !rem.is_null() {
         unsafe {
-            (*rem).tv_sec = 0;
-            (*rem).tv_nsec = 0;
+            (*rem).tv_sec = (left / 1_000_000_000) as libc::time_t;
+            (*rem).tv_nsec = (left % 1_000_000_000) as libc::c_long;
         }
     }
-    0
+    if left == 0 {
+        0
+    } else {
+        crate::errno::fail(libc::EINTR)
+    }
 }
 
 extern "C" fn my_usleep(us: u32) -> c_int {
@@ -873,8 +884,11 @@ extern "C" fn my_usleep(us: u32) -> c_int {
         return unsafe { libc::usleep(us) };
     }
     count(C_YIELD);
-    sleep_ns(u64::from(us) * 1000);
-    0
+    if sleep_ns(u64::from(us) * 1000) == 0 {
+        0
+    } else {
+        crate::errno::fail(libc::EINTR)
+    }
 }
 
 extern "C" fn my_sleep(s: u32) -> u32 {
@@ -882,8 +896,8 @@ extern "C" fn my_sleep(s: u32) -> u32 {
         return unsafe { libc::sleep(s) };
     }
     count(C_YIELD);
-    sleep_ns(u64::from(s) * 1_000_000_000);
-    0
+    // The seconds left, rounded up, as natively
+    sleep_ns(u64::from(s) * 1_000_000_000).div_ceil(1_000_000_000) as u32
 }
 
 interposers! {

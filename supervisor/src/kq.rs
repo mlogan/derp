@@ -525,6 +525,7 @@ pub unsafe extern "C" fn my_kevent(
     let out = std::slice::from_raw_parts_mut(events, nevents as usize);
     let timeout_ns = (!timeout.is_null()).then(|| sched::timespec_ns(timeout));
     let deadline = timeout_ns.map(|t| sched::now() + t);
+    let handled = sched::handlers_run();
     loop {
         let mut n = {
             let mut kqs = KQS.lock();
@@ -574,6 +575,11 @@ pub unsafe extern "C" fn my_kevent(
                 sched::trace_line(&format!("kq {kq} returns {n} timeout={timeout_ns:?}"));
             }
             return n as c_int;
+        }
+        // Only once nothing is ready: an `EVFILT_SIGNAL` event the signal
+        // made counts, as natively
+        if sched::handlers_run() != handled {
+            return crate::errno::fail(libc::EINTR);
         }
         if outside {
             crate::io::note_outside_in_wait();

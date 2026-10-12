@@ -286,6 +286,9 @@ pub struct ThreadRec {
     /// Virtual time until which the scheduler passes this thread over while
     /// another can run (0: not paused)
     pub paused_until: u64,
+    /// Signal handlers run on this thread, so a wait can tell that one
+    /// interrupted it (`EINTR`)
+    pub handlers_run: u64,
     /// PCT: higher runs first. Drawn above `MAX_PCT_DEPTH` at creation; a
     /// change point sets it to its own number, below every drawn one.
     pub priority: u64,
@@ -1036,6 +1039,22 @@ impl State {
     pub fn wake_io(&mut self) {
         for t in self.live() {
             if t.state == T_BLOCKED && t.key == IO_KEY {
+                t.state = T_RUNNABLE;
+            }
+        }
+    }
+
+    /// Another guest sent `sig` to `pid`: pending until a thread of it
+    /// that does not block the signal takes the baton up. Every blocked
+    /// thread of it is woken to look, as the kernel interrupts whichever
+    /// thread takes a signal; waits that the signal does not end go back
+    /// to waiting. A life still down before its restart is left alone.
+    pub fn post_signal(&mut self, pid: u32, sig: c_int) {
+        let p = &mut self.procs[pid as usize];
+        p.sig_pending |= 1 << sig;
+        p.sig_counts[sig as usize] += 1;
+        for t in self.live() {
+            if t.pid == pid && t.state == T_BLOCKED && t.key != RESTART_KEY {
                 t.state = T_RUNNABLE;
             }
         }

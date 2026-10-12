@@ -135,7 +135,8 @@ pub struct Scheduler {
     /// PCT's d: it finds a bug that needs d ordering constraints with
     /// probability at least 1/(n * k^(d-1)) per run
     pub pct_depth: u32,
-    /// The change points fall in `[0, horizon)` of virtual time
+    /// The change points fall in `[0, horizon)` of virtual time, and
+    /// priorities hold until it is over
     pub pct_horizon_ns: u64,
     /// A runnable thread passed over for this long runs once anyway, so a
     /// thread spinning on a lower one's progress cannot livelock the run
@@ -399,6 +400,10 @@ pub struct State {
     pub scheduler: u8,
     pct_rng: Rng,
     pct_starve_ns: u64,
+    /// Past it the uniform pick takes over, as in Coyote's fair PCT: a
+    /// program that spins on a lower thread's progress would otherwise go
+    /// at the pace of the starvation bound for the rest of the run
+    pct_horizon_ns: u64,
     /// Virtual times of the change points, ascending; the first
     /// `pct_points` are valid and `pct_next` is the next to come
     pct_change_at: [u64; MAX_PCT_DEPTH as usize],
@@ -1231,6 +1236,7 @@ impl State {
             return;
         }
         self.pct_starve_ns = sched.pct_starve_ns;
+        self.pct_horizon_ns = sched.pct_horizon_ns.max(1);
         let n = sched.pct_depth.clamp(1, MAX_PCT_DEPTH) - 1;
         for i in 0..n as usize {
             self.pct_change_at[i] = self.pct_rng.below(sched.pct_horizon_ns.max(1));
@@ -1260,7 +1266,7 @@ impl State {
     /// The next holder among the `count` runnable threads (paused ones
     /// passed over when `honour_pauses`).
     fn choose_candidate(&mut self, honour_pauses: bool, count: usize) -> usize {
-        if self.scheduler != SCHED_PCT {
+        if self.scheduler != SCHED_PCT || self.clock_ns >= self.pct_horizon_ns {
             return self.nth_candidate(honour_pauses, count);
         }
         let now = self.clock_ns;
@@ -1665,7 +1671,7 @@ mod tests {
 
     #[test]
     fn pct_runs_the_highest_priority_thread_until_a_change_point() {
-        let s = pct_state(4, 3, 1, 0);
+        let s = pct_state(4, 3, 1, 10_000_000_000);
         let top = (0..3).max_by_key(|&i| s.threads[i].priority).unwrap();
         assert!((0..3).all(|i| s.threads[i].priority > u64::from(MAX_PCT_DEPTH)));
         assert!(pct_picks(s, 100).iter().all(|&t| t == top));
@@ -1683,6 +1689,8 @@ mod tests {
     fn a_change_point_drops_the_holder_below_everyone() {
         // Depth 2: one change point somewhere in the first millisecond
         let s = pct_state(4, 3, 2, 1_000_000);
+        // Priorities hold past the span the change point was drawn from
+        s.pct_horizon_ns = u64::MAX;
         let top = (0..3).max_by_key(|&i| s.threads[i].priority).unwrap();
         let picks = pct_picks(s, 200);
         assert_eq!(s.pct_changes, 1);
@@ -1696,7 +1704,7 @@ mod tests {
 
     #[test]
     fn a_thread_passed_over_too_long_runs_once() {
-        let s = pct_state(4, 2, 1, 0);
+        let s = pct_state(4, 2, 1, 10_000_000_000);
         let top = (0..2).max_by_key(|&i| s.threads[i].priority).unwrap();
         let low = 1 - top;
         // 50ms of 10µs hand-offs: the low thread runs once per bound
@@ -1711,15 +1719,28 @@ mod tests {
     }
 
     #[test]
+    fn past_the_horizon_the_uniform_pick_takes_over() {
+        // Depth 1, horizon 1ms: 100 picks of priorities, then uniform
+        let s = pct_state(4, 3, 1, 1_000_000);
+        let top = (0..3).max_by_key(|&i| s.threads[i].priority).unwrap();
+        let picks = pct_picks(s, 1000);
+        assert!(picks[..99].iter().all(|&t| t == top));
+        for t in 0..3 {
+            let n = picks[100..].iter().filter(|&&p| p == t).count();
+            assert!((200..400).contains(&n), "t{t} ran {n} of 900");
+        }
+    }
+
+    #[test]
     fn pct_is_a_function_of_the_seed_and_leaves_the_quantum_stream_alone() {
         let run = |seed| {
-            let s = pct_state(seed, 5, 4, 2_000_000);
+            let s = pct_state(seed, 5, 4, 10_000_000);
             (pct_picks(s, 2000), s.pct_changes, s.trace_hash)
         };
         assert_eq!(run(21), run(21));
         assert_ne!(run(21).0, run(22).0);
         // The random scheduler draws from the run's stream; PCT does not
-        let s = pct_state(21, 3, 3, 1_000_000);
+        let s = pct_state(21, 3, 3, 10_000_000_000);
         pct_picks(s, 500);
         let mut rng = Rng::seed_from_u64(21);
         assert_eq!(s.rng.next_u64(), rng.next_u64());

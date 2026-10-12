@@ -29,6 +29,10 @@ directory and point `PYTHONPATH` at it.
   hashes, a queue and deletes. Redis reads the CPU's counter register for
   its monotonic clock and seeds its hash tables from `/dev/urandom`; both
   are the run's now.
+  `redis/upgrade.yaml` stops the server twice for an upgrade (`shutdown:`)
+  while a client writes one key at a time: Redis saves on SIGTERM and the
+  next life loads the save, so no acknowledged write is lost. With
+  `crash:` in its place, the writes since the last save are.
 - `postgres/`: a server (its data directory prepared natively, since
   `initdb` shells out) and a four-thread client doing updates, deletes
   and inserts in transactions. Postgres is many processes that signal

@@ -130,7 +130,7 @@ there; the command line wins.
 | `--manifest FILE` | | | The run file, in YAML (below). Hosts get `10.0.0.1` upward in the order listed and are reachable by name. |
 | `--net-latency T` | `0` | `net-latency:` | Virtual-time delay of traffic between different hosts, such as `5ms`, `250us` or `1s`. |
 | `--switch-cost T` | `10us` | `switch-cost:` | How far each baton hand-off moves the virtual clock, quantum expiries included; a clock read moves it 1µs. Threads run one at a time on one clock, so the cost is kept low: at 1ms, the old default, a run of several threaded servers with hundreds of threads between them got so little done per virtual second that their own timeouts fired. The price is that code timing its own work finds it very fast. Only a run-file run can change it. |
-| `--pause N/M` | off | `pause: {chance: N/M}` | With this chance, a scheduling choice pauses the thread it picked instead of running it, while another thread can run: the thread is passed over until its pause ends, or until nothing else is runnable. This is how a lock holder stalls in its critical section, or a writer falls behind, as a thread starved of the CPU would. `off` or `0/1` turns pauses off. |
+| `--pause N/M` | `1/200` | `pause: {chance: N/M}` | With this chance, a scheduling choice pauses the thread it picked instead of running it, while another thread can run: the thread is passed over until its pause ends, or until nothing else is runnable. This is how a lock holder stalls in its critical section, or a writer falls behind, as a thread starved of the CPU would. `off` or `0/1` turns pauses off. In measurements (`docs/CHAOS_RESULTS.md`) their cost was within the noise, and they found a write after a lease ran out in 21 of 50 seeds where the uniform pick found it in none. |
 | `--pause-for LO..HI` | `10us..100ms` | `pause: {for: LO..HI}` | How long a pause lasts in virtual time, drawn log-uniformly: each doubling of the length is about equally likely, so short pauses in a narrow window and long starvations are both common. |
 | `--scheduler random\|pct` | `random` | `scheduler:` | How the next thread is chosen. `random` draws uniformly among the runnable threads at every choice. `pct` is PCT (Burckhardt et al., ASPLOS 2010): every thread gets a random priority, the highest runnable one runs, and at `depth - 1` random points the thread holding the baton drops below every other. A bug that needs `d` ordering constraints is found with probability at least 1/(n·k^(d-1)) per run, for `n` threads and `k` scheduling points. Pauses apply under either. |
 | `--pct-depth D` | `3` | `pct: {depth: D}` | PCT's `d`, 1 to 16. A one-sided ordering bug is depth 1, an atomicity violation or a two-lock deadlock depth 2. |
@@ -172,8 +172,8 @@ heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
 switch-cost: 10us        # virtual time a baton hand-off costs (the default)
-pause:                   # or `pause: off` (the default)
-  chance: 1/200          # of each scheduling choice
+pause:                   # or `pause: off`
+  chance: 1/200          # of each scheduling choice (the default)
   for: 10us..100ms       # log-uniform
 scheduler: pct           # or random (the default)
 pct: { depth: 3, horizon: 2s, starve: 50ms }

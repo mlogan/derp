@@ -65,7 +65,7 @@ fn pauses_find_a_write_after_the_lease_ran_out() {
     let dir = common::scratch_dir("chaos_lease");
     let exe = common::build_c("lease", &dir, &[]);
     for seed in 1..=10 {
-        let (out, r) = derp_run(&exe, seed, &[]);
+        let (out, r) = derp_run(&exe, seed, &["--pause", "off"]);
         assert_eq!(unfenced(&out), 0, "seed {seed} without pauses");
         assert_eq!(r.u64("pauses"), 0);
     }
@@ -189,4 +189,18 @@ fn pct_needs_a_horizon_and_a_run_file_can_choose_it() {
         random.fields["run.schedule_hash"],
         a.fields["run.schedule_hash"]
     );
+}
+
+#[test]
+fn pauses_are_on_by_default() {
+    let dir = common::scratch_dir("chaos_default");
+    let exe = common::build_c("lease", &dir, &[]);
+    let found = (1..=10)
+        .filter(|&seed| {
+            let (out, r) = derp_run(&exe, seed, &[]);
+            assert!(r.u64("pauses") > 0, "seed {seed}");
+            unfenced(&out) > 0
+        })
+        .count();
+    assert!(found > 0);
 }

@@ -128,6 +128,13 @@ impl Pauses {
         lo_ns: 10_000,
         hi_ns: 100_000_000,
     };
+    /// What `derp` runs with unless told otherwise: in measurements their
+    /// cost was within the noise of a run's wall time
+    pub const DEFAULT: Pauses = Pauses {
+        num: 1,
+        den: 200,
+        ..Pauses::OFF
+    };
 }
 
 /// The uniform pick: each choice draws among the runnable threads

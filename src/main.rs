@@ -58,7 +58,7 @@ options:
                                        5ms, 250us or 1s (default 0)
   --switch-cost T                      virtual time each baton hand-off costs (default 10us)
   --pause N/M                          pause the thread a scheduling choice picks with this
-                                       chance, while another can run (default off)
+                                       chance, while another can run (default 1/200; off)
   --pause-for LO..HI                   how long, drawn log-uniformly (default 10us..100ms)
   --scheduler random|pct               how the next thread is chosen (default random)
   --pct-depth D                        PCT: D-1 priority change points (default 3)
@@ -196,6 +196,10 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(t), true) = (&m.wall_limit, from_file("wall-limit")) {
         cli.wall_limit_ms = parse_stop_after(t)? / 1_000_000;
     }
+    if m.pause_chance.is_some() {
+        // Asked for: a run without the scheduler refuses it
+        cli.given.push("pause");
+    }
     Ok(cli)
 }
 
@@ -232,6 +236,16 @@ fn scheduler_of(cli: &Cli) -> Result<rewrite::shared::Scheduler, String> {
     Ok(s)
 }
 
+/// Pauses are on by default, but a run without the scheduler has nothing to
+/// pause: off unless asked for, which is then an error.
+fn pauses_of(cli: &Cli) -> rewrite::shared::Pauses {
+    if cli.supervisor && !cli.native || cli.given.contains(&"pause") {
+        cli.pauses
+    } else {
+        rewrite::shared::Pauses::OFF
+    }
+}
+
 fn parse_chance(v: &str) -> Result<(u32, u32), String> {
     manifest::parse_chance(v).ok_or(format!("bad pause chance {v} (off, or N/M)"))
 }
@@ -259,7 +273,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         capture_stderr: false,
         net_latency_ns: 0,
         switch_ns: rewrite::shared::DEFAULT_SWITCH_NS,
-        pauses: rewrite::shared::Pauses::OFF,
+        pauses: rewrite::shared::Pauses::DEFAULT,
         scheduler: rewrite::shared::Scheduler::RANDOM,
         heap_size: launch::DEFAULT_HEAP,
         stop_after_ns: 0,
@@ -419,7 +433,7 @@ fn run_guest(
         seed: cli.opts.seed,
         quantum: cli.quantum,
         stop_at_ns: cli.stop_after_ns,
-        pauses: cli.pauses,
+        pauses: pauses_of(cli),
         scheduler: scheduler_of(cli)?,
         wall_limit_ms: cli.wall_limit_ms,
         passive: !cli.supervisor,
@@ -599,7 +613,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
         switch_ns: cli.switch_ns,
-        pauses: cli.pauses,
+        pauses: pauses_of(cli),
         scheduler: scheduler_of(cli)?,
         reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
         stop_at_ns: cli.stop_after_ns,

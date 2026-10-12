@@ -29,9 +29,11 @@ fn two_loops_processes_share_one_schedule() {
     .unwrap();
     let scratch = dir.join("scratch");
 
+    // A pause would let one process run alone for a while
+    let off = ["--pause", "off"];
     let mut hashes = Vec::new();
     for seed in 1..=3u64 {
-        let r = run_manifest(&manifest, &scratch, seed, 2);
+        let r = run_manifest_with(&manifest, &scratch, seed, 2, &off);
         assert_eq!(
             r.stdout,
             [expected.clone(), expected.clone()],
@@ -42,7 +44,7 @@ fn two_loops_processes_share_one_schedule() {
         // switches with both processes consuming hooks.
         assert!(r.u64("run.switches") > 100, "{:?}", r.fields);
         assert!(r.u64("p0.hooks") > 0 && r.u64("p1.hooks") > 0);
-        let again = run_manifest(&manifest, &scratch, seed, 2);
+        let again = run_manifest_with(&manifest, &scratch, seed, 2, &off);
         assert_eq!(
             r.fields["run.schedule_hash"], again.fields["run.schedule_hash"],
             "seed {seed} not repeatable"
@@ -1734,11 +1736,19 @@ fn the_switch_cost_is_what_a_hand_off_adds_to_the_clock() {
         .unwrap();
     };
     let scratch = dir.join("scratch");
+    // Pauses are virtual time too, so they would move the schedule
+    let off = ["--pause", "off"];
     write("");
-    let fast = run_manifest(&manifest, &scratch, 1, 1);
-    let slow = run_manifest_with(&manifest, &scratch, 1, 1, &["--switch-cost", "1ms"]);
+    let fast = run_manifest_with(&manifest, &scratch, 1, 1, &off);
+    let slow = run_manifest_with(
+        &manifest,
+        &scratch,
+        1,
+        1,
+        &["--switch-cost", "1ms", "--pause", "off"],
+    );
     write("switch-cost: 1ms\n");
-    let from_file = run_manifest(&manifest, &scratch, 1, 1);
+    let from_file = run_manifest_with(&manifest, &scratch, 1, 1, &off);
     assert_eq!(slow.stdout, fast.stdout);
     assert_eq!(slow.u64("run.switches"), fast.u64("run.switches"));
     assert!(

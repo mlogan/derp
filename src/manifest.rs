@@ -96,6 +96,22 @@ struct RawCrash {
     times: Option<u32>,
 }
 
+/// `pause: off`, or how often and how long
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawPause {
+    Off(String),
+    Full(RawPauseFull),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPauseFull {
+    chance: Scalar,
+    #[serde(rename = "for")]
+    length: Option<Scalar>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawHost {
@@ -117,6 +133,7 @@ struct RawRun {
     heap_size: Option<Scalar>,
     stop_after: Option<Scalar>,
     wall_limit: Option<Scalar>,
+    pause: Option<RawPause>,
     outside_network: Option<String>,
     #[serde(default)]
     allow: Vec<String>,
@@ -176,6 +193,27 @@ pub fn parse_duration_ns(s: &str) -> Option<u64> {
     let ns = digits.parse::<u64>().ok()?.checked_mul(scale)?;
     // Far from overflowing the virtual clock when added to it
     (ns <= MAX_DURATION_NS).then_some(ns)
+}
+
+/// How often a scheduling choice pauses a thread: `off`, or `N/M`
+#[must_use]
+pub fn parse_chance(s: &str) -> Option<(u32, u32)> {
+    if s == "off" {
+        return Some((0, 1));
+    }
+    let (num, den) = s.split_once('/')?;
+    let (num, den) = (
+        num.trim().parse::<u32>().ok()?,
+        den.trim().parse::<u32>().ok()?,
+    );
+    (den > 0 && num <= den).then_some((num, den))
+}
+
+/// How long a pause lasts: a range whose low end is not zero, since the
+/// lengths are drawn log-uniformly
+#[must_use]
+pub fn parse_pause_for(s: &str) -> Option<(u64, u64)> {
+    parse_duration_range(s).filter(|&(lo, _)| lo > 0)
 }
 
 /// `50ms..200ms`, or one duration for both ends
@@ -254,6 +292,9 @@ pub struct Manifest {
     pub stop_after: Option<String>,
     /// Real time after which the run is over, whatever still runs
     pub wall_limit: Option<String>,
+    /// As on the command line: `off` or `1/200`, and `10us..100ms`
+    pub pause_chance: Option<String>,
+    pub pause_for: Option<String>,
     /// Whether a guest may connect to addresses outside the virtual
     /// network (what comes back is input the run cannot repeat); refused
     /// with `ENETUNREACH` unless the run file says `outside-network: allow`
@@ -319,12 +360,35 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         heap_size: raw.heap_size.as_ref().map(Scalar::text),
         stop_after: raw.stop_after.as_ref().map(Scalar::text),
         wall_limit: raw.wall_limit.as_ref().map(Scalar::text),
+        pause_chance: match &raw.pause {
+            None => None,
+            Some(RawPause::Off(s)) => Some(s.clone()),
+            Some(RawPause::Full(p)) => Some(p.chance.text()),
+        },
+        pause_for: match &raw.pause {
+            Some(RawPause::Full(p)) => p.length.as_ref().map(Scalar::text),
+            _ => None,
+        },
         outside_network,
         allow: raw.allow,
         env: raw.env.iter().map(|(k, v)| (k.clone(), v.text())).collect(),
         pass_env: raw.pass_env,
         ..Manifest::default()
     };
+    if let Some(c) = m
+        .pause_chance
+        .as_deref()
+        .filter(|c| parse_chance(c).is_none())
+    {
+        return Err(format!("run file: pause: bad chance {c} (off, or N/M)"));
+    }
+    if let Some(f) = m
+        .pause_for
+        .as_deref()
+        .filter(|f| parse_pause_for(f).is_none())
+    {
+        return Err(format!("run file: pause: bad for {f} (a range above zero)"));
+    }
     for host in raw.hosts {
         if !valid_host_name(&host.name) {
             return Err(format!(
@@ -532,6 +596,34 @@ hosts:
     fn the_switch_cost_is_read_as_given() {
         let m = parse("switch-cost: 50us\nhosts: [{name: a, processes: [p]}]\n").unwrap();
         assert_eq!(m.switch_cost.as_deref(), Some("50us"));
+    }
+
+    #[test]
+    fn pauses() {
+        let m =
+            parse("pause: {chance: 1/200, for: 10us..100ms}\nhosts: [{name: a, processes: [p]}]")
+                .unwrap();
+        assert_eq!(m.pause_chance.as_deref(), Some("1/200"));
+        assert_eq!(m.pause_for.as_deref(), Some("10us..100ms"));
+        let m = parse("pause: off\nhosts: [{name: a, processes: [p]}]").unwrap();
+        assert_eq!(m.pause_chance.as_deref(), Some("off"));
+        assert_eq!(m.pause_for, None);
+        assert_eq!(parse_chance("off"), Some((0, 1)));
+        assert_eq!(parse_chance("3/1000"), Some((3, 1000)));
+        assert_eq!(parse_chance("2/1"), None);
+        assert_eq!(parse_chance("1/0"), None);
+        assert_eq!(parse_pause_for("1ms"), Some((1_000_000, 1_000_000)));
+        assert_eq!(parse_pause_for("0..1ms"), None);
+        let err = |text: &str| parse(text).unwrap_err();
+        assert!(err("pause: sometimes\nhosts: [{name: a, processes: [p]}]").contains("bad chance"));
+        assert!(
+            err("pause: {chance: 1/2, for: 0}\nhosts: [{name: a, processes: [p]}]")
+                .contains("bad for")
+        );
+        assert!(
+            err("pause: {chance: 1/2, often: 1}\nhosts: [{name: a, processes: [p]}]")
+                .contains("run file")
+        );
     }
 
     #[test]

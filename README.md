@@ -130,6 +130,8 @@ there; the command line wins.
 | `--manifest FILE` | | | The run file, in YAML (below). Hosts get `10.0.0.1` upward in the order listed and are reachable by name. |
 | `--net-latency T` | `0` | `net-latency:` | Virtual-time delay of traffic between different hosts, such as `5ms`, `250us` or `1s`. |
 | `--switch-cost T` | `10us` | `switch-cost:` | How far each baton hand-off moves the virtual clock, quantum expiries included; a clock read moves it 1µs. Threads run one at a time on one clock, so the cost is kept low: at 1ms, the old default, a run of several threaded servers with hundreds of threads between them got so little done per virtual second that their own timeouts fired. The price is that code timing its own work finds it very fast. Only a run-file run can change it. |
+| `--pause N/M` | off | `pause: {chance: N/M}` | With this chance, a scheduling choice pauses the thread it picked instead of running it, while another thread can run: the thread is passed over until its pause ends, or until nothing else is runnable. This is how a lock holder stalls in its critical section, or a writer falls behind, as a thread starved of the CPU would. `off` or `0/1` turns pauses off. |
+| `--pause-for LO..HI` | `10us..100ms` | `pause: {for: LO..HI}` | How long a pause lasts in virtual time, drawn log-uniformly: each doubling of the length is about equally likely, so short pauses in a narrow window and long starvations are both common. |
 | `--stop-after T` | | `stop-after:` | End the run at this virtual time: whatever still runs is killed at that point of the schedule, reported as `stopped`, and does not fail the run. For servers that never exit by themselves, and for comparing what a program did in a fixed span of virtual time. Needs the supervisor. |
 | `--wall-limit T` | | `wall-limit:` | The same at a real time. Works for `--native` runs too, which have no virtual clock: every process reports `cpu_user_ns` and `cpu_system_ns`, and `run.cpu_*` sum them, so a program's cost natively and under the supervisor can be compared over the same span. |
 | `--scratch DIR` | under the system temp dir | | Where a run file's host directories are made, fresh. An existing directory is only cleared if an earlier run made it. |
@@ -166,6 +168,9 @@ heap-size: 32G           # address space of each guest's heap (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
 switch-cost: 10us        # virtual time a baton hand-off costs (the default)
+pause:                   # or `pause: off` (the default)
+  chance: 1/200          # of each scheduling choice
+  for: 10us..100ms       # log-uniform
 stop-after: 30s          # the run is over at this virtual time (default: never)
 wall-limit: 60s          # or at this real time, native runs included
 outside-network: refuse  # or allow: connections and name lookups beyond the

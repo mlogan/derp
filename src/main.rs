@@ -57,6 +57,9 @@ options:
   --net-latency T                      virtual-time delay between different hosts, such as
                                        5ms, 250us or 1s (default 0)
   --switch-cost T                      virtual time each baton hand-off costs (default 10us)
+  --pause N/M                          pause the thread a scheduling choice picks with this
+                                       chance, while another can run (default off)
+  --pause-for LO..HI                   how long, drawn log-uniformly (default 10us..100ms)
   --stop-after T                       the run is over at this virtual time: what still runs
                                        is killed there, reported as stopped, and does not
                                        fail the run (for servers that never exit)
@@ -69,6 +72,7 @@ run file:
   mem-hook-rate: 1/16
   net-latency: 5ms
   switch-cost: 10us
+  pause: { chance: 1/200, for: 10us..100ms }   or pause: off
   heap-size: 32G
   stop-after: 30s
   wall-limit: 60s
@@ -105,6 +109,7 @@ struct Cli {
     capture_stderr: bool,
     net_latency_ns: u64,
     switch_ns: u64,
+    pauses: rewrite::shared::Pauses,
     heap_size: u64,
     /// Virtual time at which the run is over (0: when its processes are)
     stop_after_ns: u64,
@@ -155,6 +160,12 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(c), true) = (&m.switch_cost, from_file("switch-cost")) {
         cli.switch_ns = parse_switch_cost(c)?;
     }
+    if let (Some(c), true) = (&m.pause_chance, from_file("pause")) {
+        (cli.pauses.num, cli.pauses.den) = parse_chance(c)?;
+    }
+    if let (Some(f), true) = (&m.pause_for, from_file("pause-for")) {
+        (cli.pauses.lo_ns, cli.pauses.hi_ns) = parse_pause_for(f)?;
+    }
     if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
         cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
     }
@@ -165,6 +176,14 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
         cli.wall_limit_ms = parse_stop_after(t)? / 1_000_000;
     }
     Ok(cli)
+}
+
+fn parse_chance(v: &str) -> Result<(u32, u32), String> {
+    manifest::parse_chance(v).ok_or(format!("bad pause chance {v} (off, or N/M)"))
+}
+
+fn parse_pause_for(v: &str) -> Result<(u64, u64), String> {
+    manifest::parse_pause_for(v).ok_or(format!("bad pause length {v} (a range above zero)"))
 }
 
 fn parse_stop_after(v: &str) -> Result<u64, String> {
@@ -186,6 +205,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         capture_stderr: false,
         net_latency_ns: 0,
         switch_ns: rewrite::shared::DEFAULT_SWITCH_NS,
+        pauses: rewrite::shared::Pauses::OFF,
         heap_size: launch::DEFAULT_HEAP,
         stop_after_ns: 0,
         wall_limit_ms: 0,
@@ -233,6 +253,14 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             "--switch-cost" => {
                 cli.switch_ns = parse_switch_cost(&take_value(&mut args)?)?;
                 cli.given.push("switch-cost");
+            }
+            "--pause" => {
+                (cli.pauses.num, cli.pauses.den) = parse_chance(&take_value(&mut args)?)?;
+                cli.given.push("pause");
+            }
+            "--pause-for" => {
+                (cli.pauses.lo_ns, cli.pauses.hi_ns) = parse_pause_for(&take_value(&mut args)?)?;
+                cli.given.push("pause-for");
             }
             "--heap-size" => {
                 let v = take_value(&mut args)?;
@@ -318,6 +346,7 @@ fn run_guest(
         seed: cli.opts.seed,
         quantum: cli.quantum,
         stop_at_ns: cli.stop_after_ns,
+        pauses: cli.pauses,
         wall_limit_ms: cli.wall_limit_ms,
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
@@ -496,6 +525,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         rewrite: (!cli.native).then(|| cli.opts.clone()),
         net_latency_ns: cli.net_latency_ns,
         switch_ns: cli.switch_ns,
+        pauses: cli.pauses,
         reseed: cli.reseed_at.map(|at| (at, cli.reseed)),
         stop_at_ns: cli.stop_after_ns,
         wall_limit_ms: cli.wall_limit_ms,
@@ -503,6 +533,9 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
     };
     if run.stop_at_ns != 0 && (run.passive || run.dylib.is_none()) {
         return Err("stop-after needs the supervisor: it is a virtual time".into());
+    }
+    if run.pauses.num != 0 && (run.passive || run.dylib.is_none()) {
+        return Err("pauses need the supervisor: it makes the schedule".into());
     }
     let has_faults = run
         .guests
@@ -526,7 +559,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
 }
 
 /// Fields every guest reports but that describe the whole run
-const RUN_WIDE: [&str; 3] = ["switches", "expiries", "schedule_hash"];
+const RUN_WIDE: [&str; 4] = ["switches", "expiries", "schedule_hash", "pauses"];
 
 /// The aggregated report: run-wide totals, then each process's own fields.
 fn print_run_report(o: &RunOutcome) {
@@ -540,6 +573,7 @@ fn print_run_report(o: &RunOutcome) {
     eprintln!("run.net_dropped={}", o.totals.net_dropped);
     eprintln!("run.net_bytes={}", o.totals.net_bytes);
     eprintln!("run.net_passthrough={}", o.totals.net_passthrough);
+    eprintln!("run.pauses={}", o.totals.pauses);
     eprintln!("run.crashes_injected={}", o.totals.crashes_injected);
     eprintln!("run.restarts={}", o.totals.restarts);
     eprintln!("run.clock_ns={}", o.totals.clock_ns);
@@ -635,6 +669,10 @@ fn replay_of(
         format!("{}ns", cli.switch_ns),
         "--heap-size".to_string(),
         cli.heap_size.to_string(),
+        "--pause".to_string(),
+        format!("{}/{}", cli.pauses.num, cli.pauses.den),
+        "--pause-for".to_string(),
+        format!("{}ns..{}ns", cli.pauses.lo_ns, cli.pauses.hi_ns),
     ];
     if cli.stop_after_ns != 0 {
         pass.push("--stop-after".to_string());

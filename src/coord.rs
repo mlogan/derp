@@ -32,6 +32,7 @@ pub struct Totals {
     pub net_bytes: u64,
     pub net_passthrough: u64,
     pub crashes_injected: u64,
+    pub pauses: u64,
     pub restarts: u64,
     pub restarts_refused: u64,
     /// The virtual clock at the end of the run
@@ -124,6 +125,10 @@ impl Coordinator {
     /// Virtual time each baton hand-off costs.
     pub fn set_switch_cost(&self, ns: u64) {
         self.shared.lock().switch_ns = ns;
+    }
+
+    pub fn set_pauses(&self, p: shared::Pauses) {
+        self.shared.lock().set_pauses(p);
     }
 
     /// End the run when the virtual clock reaches `ns` (0: never).
@@ -287,6 +292,7 @@ impl Coordinator {
             net_bytes: s.net.bytes,
             net_passthrough: s.net.passthrough,
             crashes_injected: s.crashes_injected,
+            pauses: s.pauses,
             restarts: s.restarts,
             restarts_refused: s.restarts_refused,
             clock_ns: s.clock_ns,

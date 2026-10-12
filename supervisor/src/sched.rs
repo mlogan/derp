@@ -1366,13 +1366,22 @@ pub fn report(out: &mut String) {
         let _ = writeln!(out, "mem_sites={}", info.mem_sites);
         let _ = writeln!(out, "hooks={}", HOOKS.load(Ordering::Relaxed));
     }
-    let (threads, expiries, switches, hash) =
-        with(|s, pid| (s.threads_of(pid), s.expiries, s.switches, s.trace_hash)).unwrap();
+    let (threads, expiries, switches, hash, pauses) = with(|s, pid| {
+        (
+            s.threads_of(pid),
+            s.expiries,
+            s.switches,
+            s.trace_hash,
+            s.pauses,
+        )
+    })
+    .unwrap();
     let _ = writeln!(out, "proc={}", pid());
     let _ = writeln!(out, "threads={threads}");
     let _ = writeln!(out, "expiries={expiries}");
     let _ = writeln!(out, "switches={switches}");
     let _ = writeln!(out, "schedule_hash={hash:016x}");
+    let _ = writeln!(out, "pauses={pauses}");
     let _ = writeln!(out, "paths_refused={}", crate::hostfs::refused());
     let _ = writeln!(
         out,

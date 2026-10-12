@@ -47,6 +47,18 @@ impl Rng {
     pub fn range_inclusive(&mut self, lo: u32, hi: u32) -> u32 {
         lo + self.below(u64::from(hi - lo) + 1) as u32
     }
+
+    /// Value in `[lo, hi]` (`0 < lo <= hi`) whose every octave above `lo` is
+    /// about equally likely, so short and long values are both common.
+    /// Integer arithmetic only: floating-point `ln`/`exp` may differ between
+    /// library versions, and a draw must not.
+    pub fn log_uniform(&mut self, lo: u64, hi: u64) -> u64 {
+        let octaves = u64::from((hi / lo).ilog2());
+        let k = self.below(octaves + 1);
+        let from = lo << k;
+        let to = hi.min((lo << (k + 1)) - 1);
+        from + self.below(to - from + 1)
+    }
 }
 
 #[cfg(test)]
@@ -77,6 +89,25 @@ mod tests {
             assert!((100..=200).contains(&v));
         }
         assert_eq!(r.range_inclusive(5, 5), 5);
+    }
+
+    #[test]
+    fn log_uniform_spreads_over_octaves() {
+        let mut r = Rng::seed_from_u64(3);
+        let (lo, hi) = (10_000, 100_000_000);
+        let mut below_100us = 0;
+        let mut above_10ms = 0;
+        for _ in 0..10_000 {
+            let v = r.log_uniform(lo, hi);
+            assert!((lo..=hi).contains(&v));
+            below_100us += u32::from(v < 100_000);
+            above_10ms += u32::from(v > 10_000_000);
+        }
+        // About a quarter each; a uniform draw would give 0.1% and 90%
+        assert!((1500..4000).contains(&below_100us), "{below_100us}");
+        assert!((1000..4000).contains(&above_10ms), "{above_10ms}");
+        assert_eq!(r.log_uniform(5, 5), 5);
+        assert!((5..=9).contains(&r.log_uniform(5, 9)));
     }
 
     /// First `SplitMix64` output for seed 0 is a well-known reference value

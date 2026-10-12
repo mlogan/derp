@@ -18,6 +18,12 @@ use crate::rng::Rng;
 pub mod netstate;
 
 pub const MAGIC: u64 = 0x0031_4448_5357_5252;
+
+/// What each secondary random stream's seed is the run's seed xored with
+const FAULT_STREAM: u64 = 0xFA17_FA17_FA17_FA17;
+const PAUSE_STREAM: u64 = 0x9A05_E9A0_5E9A_05E9;
+/// Mixed into the trace hash with the id of a thread that is paused
+const PAUSE_MARK: u64 = 0x9A05_E000;
 /// Slots are never reused, so these bound what a whole run may create. A
 /// server with a thread per request gets through a thousand quickly.
 pub const MAX_THREADS: usize = 16384;
@@ -90,6 +96,26 @@ pub struct Faults {
     pub crash_hi_ns: u64,
     /// `NO_LIMIT`, or how many crashes are left to inject
     pub crashes_left: u32,
+}
+
+/// How often the scheduler pauses the thread it chose, and for how long
+/// (virtual time, drawn log-uniformly from the range)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pauses {
+    /// `num / den` of scheduling choices; `num` 0: never
+    pub num: u32,
+    pub den: u32,
+    pub lo_ns: u64,
+    pub hi_ns: u64,
+}
+
+impl Pauses {
+    pub const OFF: Pauses = Pauses {
+        num: 0,
+        den: 1,
+        lo_ns: 10_000,
+        hi_ns: 100_000_000,
+    };
 }
 
 pub const DEBUG_PATH_LEN: usize = 1024;
@@ -223,6 +249,9 @@ pub struct ThreadRec {
     /// Set while the thread is in `Shared::park`: it is not running, so a
     /// lock it holds stays held until the scheduler picks it again
     pub in_park: AtomicU32,
+    /// Virtual time until which the scheduler passes this thread over while
+    /// another can run (0: not paused)
+    pub paused_until: u64,
 }
 
 #[repr(C)]
@@ -317,6 +346,17 @@ pub struct State {
     /// Crash times come from their own stream, so that adding faults to a
     /// run does not shift the choice of threads
     fault_rng: Rng,
+    /// Pauses come from their own stream too: with pauses off, the run is
+    /// the one it was before they existed
+    pause_rng: Rng,
+    /// A scheduling choice pauses the chosen thread with probability
+    /// `pause_num / pause_den` (`pause_num` 0: never), for a time drawn
+    /// log-uniformly from `pause_lo_ns..=pause_hi_ns`
+    pub pause_num: u32,
+    pub pause_den: u32,
+    pub pause_lo_ns: u64,
+    pub pause_hi_ns: u64,
+    pub pauses: u64,
     /// Seed bisection: one more than the virtual time (0: never) from whose
     /// first hand-off on every stream starts over from `reseed_with`. Until
     /// then the run is the plain run of its seed.
@@ -487,7 +527,8 @@ impl Shared {
         let shared = &*mem;
         let mut s = shared.lock();
         s.rng = Rng::seed_from_u64(seed);
-        s.fault_rng = Rng::seed_from_u64(seed ^ 0xFA17_FA17_FA17_FA17);
+        s.fault_rng = Rng::seed_from_u64(seed ^ FAULT_STREAM);
+        s.pause_rng = Rng::seed_from_u64(seed ^ PAUSE_STREAM);
         s.quantum_lo = quantum_lo;
         s.quantum_hi = quantum_hi;
         s.switch_ns = DEFAULT_SWITCH_NS;
@@ -1062,7 +1103,8 @@ impl State {
         if self.reseed_at != 0 && !self.reseeded && self.clock_ns + 1 >= self.reseed_at {
             self.reseeded = true;
             self.rng = Rng::seed_from_u64(self.reseed_with);
-            self.fault_rng = Rng::seed_from_u64(self.reseed_with ^ 0xFA17_FA17_FA17_FA17);
+            self.fault_rng = Rng::seed_from_u64(self.reseed_with ^ FAULT_STREAM);
+            self.pause_rng = Rng::seed_from_u64(self.reseed_with ^ PAUSE_STREAM);
         }
         if self.pending_stop().is_some_and(|at| self.clock_ns >= at) {
             self.stop_run();
@@ -1099,13 +1141,53 @@ impl State {
             self.fire_alarms();
             runnable = self.live().iter().filter(|t| t.state == T_RUNNABLE).count();
         }
-        let n = self.rng.below(runnable as u64) as usize;
+        // A pause holds a thread back only while another can run
+        let now = self.clock_ns;
+        let unpaused = self
+            .live()
+            .iter()
+            .filter(|t| t.state == T_RUNNABLE && t.paused_until <= now)
+            .count();
+        if unpaused == 0 {
+            return Some(self.nth_candidate(false, runnable));
+        }
+        let chosen = self.nth_candidate(true, unpaused);
+        if unpaused == 1 || !self.draw_pause() {
+            return Some(chosen);
+        }
+        let until = now
+            + self
+                .pause_rng
+                .log_uniform(self.pause_lo_ns, self.pause_hi_ns);
+        self.threads[chosen].paused_until = until;
+        self.pauses += 1;
+        self.trace_hash = fnv(fnv(self.trace_hash, PAUSE_MARK), chosen as u64);
+        Some(self.nth_candidate(true, unpaused - 1))
+    }
+
+    pub fn set_pauses(&mut self, p: Pauses) {
+        (self.pause_num, self.pause_den) = (p.num, p.den);
+        (self.pause_lo_ns, self.pause_hi_ns) = (p.lo_ns, p.hi_ns);
+    }
+
+    /// Whether this choice pauses the chosen thread
+    fn draw_pause(&mut self) -> bool {
+        self.pause_num != 0
+            && self.pause_rng.below(u64::from(self.pause_den)) < u64::from(self.pause_num)
+    }
+
+    /// One of the `count` runnable threads, drawn uniformly; paused ones
+    /// are passed over when `honour_pauses`.
+    fn nth_candidate(&mut self, honour_pauses: bool, count: usize) -> usize {
+        let now = self.clock_ns;
+        let n = self.rng.below(count as u64) as usize;
         self.live()
             .iter()
             .enumerate()
-            .filter(|(_, t)| t.state == T_RUNNABLE)
+            .filter(|(_, t)| t.state == T_RUNNABLE && (!honour_pauses || t.paused_until <= now))
             .nth(n)
             .map(|(i, _)| i)
+            .expect("as many candidates as counted")
     }
 
     /// Record the caller's new state and pass the baton. `from` is None
@@ -1232,6 +1314,10 @@ mod tests {
 
     /// A shared mapping with a lock in it, as the run's state is
     fn shared_mapping() -> &'static Shared {
+        shared_mapping_seeded(1)
+    }
+
+    fn shared_mapping_seeded(seed: u64) -> &'static Shared {
         let mem = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1243,7 +1329,7 @@ mod tests {
             )
         };
         assert_ne!(mem, libc::MAP_FAILED);
-        unsafe { Shared::init(mem.cast(), 1, 1000, 10000) }
+        unsafe { Shared::init(mem.cast(), seed, 1000, 10000) }
     }
 
     #[test]
@@ -1326,6 +1412,94 @@ mod tests {
         drop(guard);
         assert_eq!(unsafe { &*sh.state.get() }.threads[id].state, T_RUNNABLE);
         assert_eq!(sh.lock.load(Ordering::Relaxed), 0);
+    }
+
+    /// A run's state with `threads` runnable threads in one process
+    fn state_with_threads(seed: u64, threads: usize) -> &'static mut State {
+        let sh = shared_mapping_seeded(seed);
+        let s = unsafe { &mut *sh.state.get() };
+        let p = s.add_proc(0, NO_PROC);
+        for _ in 0..threads {
+            s.add_thread(p);
+        }
+        s
+    }
+
+    /// Picks, with the clock moving 10µs before each as a hand-off moves it
+    fn picks(s: &mut State, n: usize) -> Vec<usize> {
+        (0..n)
+            .map(|_| {
+                s.clock_ns += 10_000;
+                s.pick().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn without_pauses_the_choice_is_a_uniform_draw_from_the_run_stream() {
+        let s = state_with_threads(5, 3);
+        let mut rng = Rng::seed_from_u64(5);
+        let expected: Vec<usize> = (0..200).map(|_| rng.below(3) as usize).collect();
+        assert_eq!(picks(s, 200), expected);
+        assert_eq!(s.pauses, 0);
+    }
+
+    #[test]
+    fn a_lone_runnable_thread_is_never_paused() {
+        let s = state_with_threads(5, 1);
+        (s.pause_num, s.pause_den, s.pause_lo_ns, s.pause_hi_ns) = (1, 1, 1_000_000, 1_000_000);
+        assert!(picks(s, 50).iter().all(|&t| t == 0));
+        assert_eq!(s.pauses, 0);
+    }
+
+    #[test]
+    fn a_paused_thread_is_passed_over_until_its_pause_ends() {
+        let s = state_with_threads(9, 3);
+        (s.pause_num, s.pause_den, s.pause_lo_ns, s.pause_hi_ns) = (1, 4, 50_000, 5_000_000);
+        let mut paused_seen = 0;
+        for _ in 0..2000 {
+            s.clock_ns += 10_000;
+            let before = s.pauses;
+            let now = s.clock_ns;
+            let unpaused: Vec<usize> = (0..3)
+                .filter(|&i| s.threads[i].paused_until <= now)
+                .collect();
+            let chosen = s.pick().unwrap();
+            if unpaused.is_empty() {
+                continue;
+            }
+            assert!(
+                s.threads[chosen].paused_until <= now,
+                "t{chosen} is paused while {unpaused:?} were not"
+            );
+            if s.pauses > before {
+                paused_seen += 1;
+                assert!(unpaused.len() > 1, "paused the only candidate");
+            }
+        }
+        assert!(paused_seen > 20, "{paused_seen}");
+        assert_eq!(s.pauses, paused_seen);
+    }
+
+    #[test]
+    fn with_every_thread_paused_one_still_runs() {
+        let s = state_with_threads(9, 2);
+        s.threads[0].paused_until = u64::MAX;
+        s.threads[1].paused_until = u64::MAX;
+        (s.pause_num, s.pause_den, s.pause_lo_ns, s.pause_hi_ns) = (1, 1, 1_000, 1_000);
+        assert_eq!(picks(s, 20).len(), 20);
+        assert_eq!(s.pauses, 0);
+    }
+
+    #[test]
+    fn pauses_are_a_function_of_the_seed() {
+        let run = |seed| {
+            let s = state_with_threads(seed, 4);
+            (s.pause_num, s.pause_den, s.pause_lo_ns, s.pause_hi_ns) = (1, 10, 10_000, 100_000_000);
+            (picks(s, 3000), s.pauses, s.trace_hash)
+        };
+        assert_eq!(run(11), run(11));
+        assert_ne!(run(11).0, run(12).0);
     }
 
     #[test]

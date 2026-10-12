@@ -22,8 +22,11 @@ pub const MAGIC: u64 = 0x0031_4448_5357_5252;
 /// What each secondary random stream's seed is the run's seed xored with
 const FAULT_STREAM: u64 = 0xFA17_FA17_FA17_FA17;
 const PAUSE_STREAM: u64 = 0x9A05_E9A0_5E9A_05E9;
-/// Mixed into the trace hash with the id of a thread that is paused
+const PCT_STREAM: u64 = 0x0C70_0C70_0C70_0C70;
+/// Mixed into the trace hash with the id of a thread that is paused, or
+/// that a PCT change point demotes
 const PAUSE_MARK: u64 = 0x9A05_E000;
+const PCT_MARK: u64 = 0x0C70_0000;
 /// Slots are never reused, so these bound what a whole run may create. A
 /// server with a thread per request gets through a thousand quickly.
 pub const MAX_THREADS: usize = 16384;
@@ -115,6 +118,36 @@ impl Pauses {
         den: 1,
         lo_ns: 10_000,
         hi_ns: 100_000_000,
+    };
+}
+
+/// The uniform pick: each choice draws among the runnable threads
+pub const SCHED_RANDOM: u8 = 0;
+/// PCT (Burckhardt et al., ASPLOS 2010): the runnable thread of highest
+/// priority runs; at `depth - 1` points the holder drops below everyone
+pub const SCHED_PCT: u8 = 1;
+pub const MAX_PCT_DEPTH: u32 = 16;
+
+/// How the next baton holder is chosen
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scheduler {
+    pub kind: u8,
+    /// PCT's d: it finds a bug that needs d ordering constraints with
+    /// probability at least 1/(n * k^(d-1)) per run
+    pub pct_depth: u32,
+    /// The change points fall in `[0, horizon)` of virtual time
+    pub pct_horizon_ns: u64,
+    /// A runnable thread passed over for this long runs once anyway, so a
+    /// thread spinning on a lower one's progress cannot livelock the run
+    pub pct_starve_ns: u64,
+}
+
+impl Scheduler {
+    pub const RANDOM: Scheduler = Scheduler {
+        kind: SCHED_RANDOM,
+        pct_depth: 3,
+        pct_horizon_ns: 0,
+        pct_starve_ns: 50_000_000,
     };
 }
 
@@ -252,6 +285,12 @@ pub struct ThreadRec {
     /// Virtual time until which the scheduler passes this thread over while
     /// another can run (0: not paused)
     pub paused_until: u64,
+    /// PCT: higher runs first. Drawn above `MAX_PCT_DEPTH` at creation; a
+    /// change point sets it to its own number, below every drawn one.
+    pub priority: u64,
+    /// PCT: since when this runnable thread has been passed over (0: it
+    /// was chosen last time, or has not been runnable since)
+    pub waiting_since: u64,
 }
 
 #[repr(C)]
@@ -357,6 +396,16 @@ pub struct State {
     pub pause_lo_ns: u64,
     pub pause_hi_ns: u64,
     pub pauses: u64,
+    pub scheduler: u8,
+    pct_rng: Rng,
+    pct_starve_ns: u64,
+    /// Virtual times of the change points, ascending; the first
+    /// `pct_points` are valid and `pct_next` is the next to come
+    pct_change_at: [u64; MAX_PCT_DEPTH as usize],
+    pct_points: u32,
+    pct_next: u32,
+    pub pct_changes: u64,
+    pub pct_starved: u64,
     /// Seed bisection: one more than the virtual time (0: never) from whose
     /// first hand-off on every stream starts over from `reseed_with`. Until
     /// then the run is the plain run of its seed.
@@ -529,6 +578,7 @@ impl Shared {
         s.rng = Rng::seed_from_u64(seed);
         s.fault_rng = Rng::seed_from_u64(seed ^ FAULT_STREAM);
         s.pause_rng = Rng::seed_from_u64(seed ^ PAUSE_STREAM);
+        s.pct_rng = Rng::seed_from_u64(seed ^ PCT_STREAM);
         s.quantum_lo = quantum_lo;
         s.quantum_hi = quantum_hi;
         s.switch_ns = DEFAULT_SWITCH_NS;
@@ -930,9 +980,15 @@ impl State {
         let id = self.nthreads as usize;
         assert!(id < MAX_THREADS, "too many threads in one run");
         self.nthreads += 1;
+        let priority = if self.scheduler == SCHED_PCT {
+            u64::from(MAX_PCT_DEPTH) + 1 + (self.pct_rng.next_u64() >> 1)
+        } else {
+            0
+        };
         let t = &mut self.threads[id];
         t.state = T_RUNNABLE;
         t.pid = pid;
+        t.priority = priority;
         id
     }
 
@@ -1105,6 +1161,7 @@ impl State {
             self.rng = Rng::seed_from_u64(self.reseed_with);
             self.fault_rng = Rng::seed_from_u64(self.reseed_with ^ FAULT_STREAM);
             self.pause_rng = Rng::seed_from_u64(self.reseed_with ^ PAUSE_STREAM);
+            self.pct_rng = Rng::seed_from_u64(self.reseed_with ^ PCT_STREAM);
         }
         if self.pending_stop().is_some_and(|at| self.clock_ns >= at) {
             self.stop_run();
@@ -1148,10 +1205,11 @@ impl State {
             .iter()
             .filter(|t| t.state == T_RUNNABLE && t.paused_until <= now)
             .count();
+        self.pct_change_points();
         if unpaused == 0 {
-            return Some(self.nth_candidate(false, runnable));
+            return Some(self.choose_candidate(false, runnable));
         }
-        let chosen = self.nth_candidate(true, unpaused);
+        let chosen = self.choose_candidate(true, unpaused);
         if unpaused == 1 || !self.draw_pause() {
             return Some(chosen);
         }
@@ -1162,7 +1220,81 @@ impl State {
         self.threads[chosen].paused_until = until;
         self.pauses += 1;
         self.trace_hash = fnv(fnv(self.trace_hash, PAUSE_MARK), chosen as u64);
-        Some(self.nth_candidate(true, unpaused - 1))
+        Some(self.choose_candidate(true, unpaused - 1))
+    }
+
+    /// Before a run's first thread: PCT's change points are drawn over the
+    /// horizon, and threads added from now on get priorities.
+    pub fn set_scheduler(&mut self, sched: Scheduler) {
+        self.scheduler = sched.kind;
+        if sched.kind != SCHED_PCT {
+            return;
+        }
+        self.pct_starve_ns = sched.pct_starve_ns;
+        let n = sched.pct_depth.clamp(1, MAX_PCT_DEPTH) - 1;
+        for i in 0..n as usize {
+            self.pct_change_at[i] = self.pct_rng.below(sched.pct_horizon_ns.max(1));
+        }
+        self.pct_change_at[..n as usize].sort_unstable();
+        self.pct_points = n;
+        self.pct_next = 0;
+    }
+
+    /// Change points the clock has reached: the thread that last held the
+    /// baton drops to the point's number, below every drawn priority. Later
+    /// points give higher numbers, as in PCT.
+    fn pct_change_points(&mut self) {
+        while self.pct_next < self.pct_points
+            && self.pct_change_at[self.pct_next as usize] <= self.clock_ns
+        {
+            self.pct_next += 1;
+            let holder = self.current as usize;
+            if holder < self.nthreads as usize {
+                self.threads[holder].priority = u64::from(self.pct_next);
+                self.pct_changes += 1;
+                self.trace_hash = fnv(fnv(self.trace_hash, PCT_MARK), holder as u64);
+            }
+        }
+    }
+
+    /// The next holder among the `count` runnable threads (paused ones
+    /// passed over when `honour_pauses`).
+    fn choose_candidate(&mut self, honour_pauses: bool, count: usize) -> usize {
+        if self.scheduler != SCHED_PCT {
+            return self.nth_candidate(honour_pauses, count);
+        }
+        let now = self.clock_ns;
+        let starve = self.pct_starve_ns;
+        let eligible =
+            |t: &ThreadRec| t.state == T_RUNNABLE && (!honour_pauses || t.paused_until <= now);
+        let live = &self.threads[..self.nthreads as usize];
+        // The longest passed over, if past the bound; else the highest
+        // priority. Ties go to the lowest id.
+        let starved = live
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| eligible(t) && t.waiting_since != 0 && now - t.waiting_since >= starve)
+            .min_by_key(|(i, t)| (t.waiting_since, *i))
+            .map(|(i, _)| i);
+        let chosen = starved.unwrap_or_else(|| {
+            live.iter()
+                .enumerate()
+                .filter(|(_, t)| eligible(t))
+                .max_by_key(|(i, t)| (t.priority, std::cmp::Reverse(*i)))
+                .map(|(i, _)| i)
+                .expect("a candidate")
+        });
+        if starved.is_some() {
+            self.pct_starved += 1;
+        }
+        for (i, t) in self.live().iter_mut().enumerate() {
+            if i == chosen {
+                t.waiting_since = 0;
+            } else if t.state == T_RUNNABLE && t.waiting_since == 0 {
+                t.waiting_since = now.max(1);
+            }
+        }
+        chosen
     }
 
     pub fn set_pauses(&mut self, p: Pauses) {
@@ -1500,6 +1632,97 @@ mod tests {
         };
         assert_eq!(run(11), run(11));
         assert_ne!(run(11).0, run(12).0);
+    }
+
+    /// PCT over `threads` threads of one process, change points as given
+    fn pct_state(seed: u64, threads: usize, depth: u32, horizon_ns: u64) -> &'static mut State {
+        let sh = shared_mapping_seeded(seed);
+        let s = unsafe { &mut *sh.state.get() };
+        s.set_scheduler(Scheduler {
+            kind: SCHED_PCT,
+            pct_depth: depth,
+            pct_horizon_ns: horizon_ns,
+            pct_starve_ns: 50_000_000,
+        });
+        let p = s.add_proc(0, NO_PROC);
+        for _ in 0..threads {
+            s.add_thread(p);
+        }
+        s
+    }
+
+    /// `pick` as `choose` uses it: the chosen thread becomes the holder
+    fn pct_picks(s: &mut State, n: usize) -> Vec<usize> {
+        (0..n)
+            .map(|_| {
+                s.clock_ns += 10_000;
+                let t = s.pick().unwrap();
+                s.current = t as u32;
+                t
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pct_runs_the_highest_priority_thread_until_a_change_point() {
+        let s = pct_state(4, 3, 1, 0);
+        let top = (0..3).max_by_key(|&i| s.threads[i].priority).unwrap();
+        assert!((0..3).all(|i| s.threads[i].priority > u64::from(MAX_PCT_DEPTH)));
+        assert!(pct_picks(s, 100).iter().all(|&t| t == top));
+        assert_eq!(s.pct_changes, 0);
+        // The holder blocks: the next one down runs
+        s.threads[top].state = T_BLOCKED;
+        let second = (0..3)
+            .filter(|&i| i != top)
+            .max_by_key(|&i| s.threads[i].priority)
+            .unwrap();
+        assert!(pct_picks(s, 10).iter().all(|&t| t == second));
+    }
+
+    #[test]
+    fn a_change_point_drops_the_holder_below_everyone() {
+        // Depth 2: one change point somewhere in the first millisecond
+        let s = pct_state(4, 3, 2, 1_000_000);
+        let top = (0..3).max_by_key(|&i| s.threads[i].priority).unwrap();
+        let picks = pct_picks(s, 200);
+        assert_eq!(s.pct_changes, 1);
+        assert_eq!(s.threads[top].priority, 1);
+        let switch = picks.iter().position(|&t| t != top).unwrap();
+        assert!(picks[..switch].iter().all(|&t| t == top));
+        assert!(picks[switch..].iter().all(|&t| t == picks[switch]));
+        // The change point fell where the switch is
+        assert!(switch <= 100, "{switch}");
+    }
+
+    #[test]
+    fn a_thread_passed_over_too_long_runs_once() {
+        let s = pct_state(4, 2, 1, 0);
+        let top = (0..2).max_by_key(|&i| s.threads[i].priority).unwrap();
+        let low = 1 - top;
+        // 50ms of 10µs hand-offs: the low thread runs once per bound
+        let picks = pct_picks(s, 20_000);
+        let low_runs: Vec<usize> = (0..picks.len()).filter(|&i| picks[i] == low).collect();
+        assert_eq!(low_runs.len(), 3, "{low_runs:?}");
+        assert!(
+            low_runs.windows(2).all(|w| w[1] - w[0] == 5001),
+            "{low_runs:?}"
+        );
+        assert_eq!(s.pct_starved, 3);
+    }
+
+    #[test]
+    fn pct_is_a_function_of_the_seed_and_leaves_the_quantum_stream_alone() {
+        let run = |seed| {
+            let s = pct_state(seed, 5, 4, 2_000_000);
+            (pct_picks(s, 2000), s.pct_changes, s.trace_hash)
+        };
+        assert_eq!(run(21), run(21));
+        assert_ne!(run(21).0, run(22).0);
+        // The random scheduler draws from the run's stream; PCT does not
+        let s = pct_state(21, 3, 3, 1_000_000);
+        pct_picks(s, 500);
+        let mut rng = Rng::seed_from_u64(21);
+        assert_eq!(s.rng.next_u64(), rng.next_u64());
     }
 
     #[test]

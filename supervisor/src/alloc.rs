@@ -70,6 +70,9 @@ struct Heap {
     /// Seeded before the first scheduled thread allocates; None keeps the
     /// compact layout (the supervisor's own heap)
     rng: Option<crate::rng::Rng>,
+    /// Whether a seeded heap gives the pages of a freed run or window slab
+    /// back (see `give_back`)
+    release: bool,
     /// Bitmap of taken slabs, mapped when the layout is seeded (an address)
     slabs: usize,
     /// First slab and length in slabs of the pooled classes' window
@@ -104,6 +107,7 @@ impl Heap {
             size,
             guests,
             rng: None,
+            release: false,
             slabs: 0,
             window: (0, 0),
             order: [0; SLAB / 16],
@@ -207,10 +211,11 @@ fn guest_heap() -> crate::spin::Guard<'static, Heap> {
 
 /// From now on, where a guest's block lands is drawn from `seed`. Call
 /// before the first scheduled thread of the process allocates.
-pub fn seed_layout(seed: u64, size: usize) {
+pub fn seed_layout(seed: u64, size: usize, release: bool) {
     let mut h = HEAP.lock();
     if h.base == 0 {
         h.rng = Some(crate::rng::Rng::seed_from_u64(seed ^ LAYOUT_STREAM));
+        h.release = release;
         // Whole words of the slab bitmap
         h.size = (size / (64 * SLAB)).max(1) * 64 * SLAB;
     }
@@ -547,6 +552,36 @@ impl Heap {
         }
         self.free_blocks[c] -= n as u32;
         self.mark_slabs(self.window.0 + slab, 1, false);
+        self.give_back(first, SLAB);
+    }
+
+    /// The pages of a free run, back to the system. Without this a seeded
+    /// heap keeps every page it ever touched: its runs land anywhere in the
+    /// region, so a long-lived guest that churns big blocks (a database) holds
+    /// as much memory as it ever had in use, many times over. A fresh
+    /// mapping in the run's place reads as zeros, as a function of the call
+    /// sequence; `MADV_FREE` would leave the old contents or zeros at the
+    /// kernel's whim, and a guest that reads memory it never wrote would
+    /// see that.
+    fn give_back(&mut self, at: usize, len: usize) {
+        if !self.release {
+            return;
+        }
+        let p = unsafe {
+            libc::mmap(
+                at as *mut c_void,
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if p == libc::MAP_FAILED {
+            // The old pages are still mapped (the kernel replaces a range
+            // whole or not at all); from here on they stay
+            self.release = false;
+        }
     }
 
     /// Add `p` to the candidates of class `c`, which has room.
@@ -603,7 +638,11 @@ impl Heap {
                         self.release(c, class_size, slab);
                     }
                 }
-                _ => self.mark_slabs((raw - self.base) / SLAB, class_size.div_ceil(SLAB), false),
+                _ => {
+                    let n = class_size.div_ceil(SLAB);
+                    self.mark_slabs((raw - self.base) / SLAB, n, false);
+                    self.give_back(raw, n * SLAB);
+                }
             }
             return;
         }
@@ -942,6 +981,63 @@ mod tests {
         for (a, b) in again.iter().zip(again.iter().skip(1)) {
             assert!(a + 40 <= *b, "{a:#x} and {b:#x} overlap");
         }
+    }
+
+    /// Whether a freed run reads as zeros, and whether as what it held.
+    fn reused_contents(release: bool, hint: usize) -> (bool, bool) {
+        let mut h = heap(11, hint);
+        h.release = release;
+        let size = 3 << 20;
+        let p = h.alloc(size, 16) as usize;
+        unsafe { std::ptr::write_bytes(p as *mut u8, 0xa5, size) };
+        h.free(p);
+        let bytes = unsafe { std::slice::from_raw_parts(p as *const u8, size) };
+        (
+            bytes.iter().all(|&b| b == 0),
+            bytes.iter().all(|&b| b == 0xa5),
+        )
+    }
+
+    #[test]
+    fn a_released_run_reads_as_zeros_and_a_kept_one_as_it_was() {
+        assert_eq!(
+            reused_contents(true, 0x6b_0000_0000 + 130 * REGION_SIZE),
+            (true, false)
+        );
+        assert_eq!(
+            reused_contents(false, 0x6b_0000_0000 + 131 * REGION_SIZE),
+            (false, true)
+        );
+    }
+
+    /// Bytes of `h`'s region in memory: the process's resident size moves
+    /// with the tests running beside this one.
+    fn resident_bytes(h: &Heap) -> usize {
+        let mut pages = vec![0 as libc::c_char; h.size / PAGE];
+        let rc = unsafe { libc::mincore(h.base as *const c_void, h.size, pages.as_mut_ptr()) };
+        assert_eq!(rc, 0);
+        pages
+            .iter()
+            .filter(|&&p| i32::from(p) & libc::MINCORE_INCORE != 0)
+            .count()
+            * PAGE
+    }
+
+    /// Big blocks freed and allocated in turn land somewhere new each time;
+    /// their pages must not stay behind.
+    #[test]
+    fn churning_big_blocks_keeps_memory_bounded() {
+        let mut h = heap(12, 0x6c_0000_0000 + 140 * REGION_SIZE);
+        h.release = true;
+        for _ in 0..200 {
+            let p = h.alloc(4 << 20, 16);
+            assert!(!p.is_null());
+            unsafe { std::ptr::write_bytes(p.cast::<u8>(), 1, 4 << 20) };
+            h.free(p as usize);
+        }
+        // 800 MB touched in all; a few blocks' worth may stay
+        let resident = resident_bytes(&h);
+        assert!(resident < 64 << 20, "{} MB resident", resident >> 20);
     }
 
     #[test]

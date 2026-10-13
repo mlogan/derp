@@ -22,6 +22,8 @@ pub struct Launch {
     pub disable_aslr: bool,
     /// Bytes of address space for each guest's heap
     pub heap_size: u64,
+    /// Whether a seeded heap gives the pages of freed runs back
+    pub heap_release: bool,
     /// Redirect the guest's stdout to this file (created or truncated)
     pub stdout: Option<PathBuf>,
     pub stderr: Option<PathBuf>,
@@ -138,6 +140,8 @@ pub struct Run {
     pub disable_aslr: bool,
     /// Bytes of address space for each guest's heap
     pub heap_size: u64,
+    /// Whether a seeded heap gives the pages of freed runs back
+    pub heap_release: bool,
     pub seed: u64,
     pub quantum: (u32, u32),
     /// Rewritten binaries need the dylib for the region their stubs
@@ -691,6 +695,10 @@ fn guest_env(run: &Run, coord: Option<(&Coordinator, u32)>) -> Vec<(String, Stri
         "REWRITE_HEAP".to_string(),
         format!("{:016x}", run.heap_size),
     ));
+    env.push((
+        "REWRITE_HEAP_RELEASE".to_string(),
+        if run.heap_release { "1" } else { "0" }.to_string(),
+    ));
     if run.passive {
         env.push((PASSIVE_VAR.into(), "1".into()));
     }
@@ -1024,6 +1032,7 @@ pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
         inherit_env: true,
         disable_aslr: cfg.disable_aslr,
         heap_size: cfg.heap_size,
+        heap_release: cfg.heap_release,
         seed: cfg.seed,
         quantum: cfg.quantum,
         passive: cfg.passive,

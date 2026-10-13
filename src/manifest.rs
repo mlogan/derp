@@ -5,6 +5,7 @@
 //! seed: 7                  # optional; the command line overrides these
 //! quantum: 1000..10000
 //! heap-size: 32G           # address space of each guest's heap
+//! heap-release: on         # freed runs' pages go back to the system
 //! mem-hook-rate: 1/16
 //! net-latency: 5ms
 //! switch-cost: 10us        # virtual time a baton hand-off costs
@@ -149,6 +150,7 @@ struct RawRun {
     net_latency: Option<Scalar>,
     switch_cost: Option<Scalar>,
     heap_size: Option<Scalar>,
+    heap_release: Option<Scalar>,
     stop_after: Option<Scalar>,
     wall_limit: Option<Scalar>,
     pause: Option<RawPause>,
@@ -365,6 +367,8 @@ pub struct Manifest {
     /// Virtual time a baton hand-off costs
     pub switch_cost: Option<String>,
     pub heap_size: Option<String>,
+    /// `on` or `off`
+    pub heap_release: Option<String>,
     /// Virtual time at which the run is over, whatever still runs
     pub stop_after: Option<String>,
     /// Real time after which the run is over, whatever still runs
@@ -440,6 +444,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         net_latency: raw.net_latency.as_ref().map(Scalar::text),
         switch_cost: raw.switch_cost.as_ref().map(Scalar::text),
         heap_size: raw.heap_size.as_ref().map(Scalar::text),
+        heap_release: raw.heap_release.as_ref().map(Scalar::text),
         stop_after: raw.stop_after.as_ref().map(Scalar::text),
         wall_limit: raw.wall_limit.as_ref().map(Scalar::text),
         pause_chance: match &raw.pause {

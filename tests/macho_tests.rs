@@ -16,6 +16,7 @@ fn run_capture(
         dylib,
         disable_aslr: true,
         heap_size: rewrite::launch::DEFAULT_HEAP,
+        heap_release: true,
         stdout: Some(out_path.clone()),
         stderr: None,
         seed: 0,

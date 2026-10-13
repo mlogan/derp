@@ -16,6 +16,8 @@ pub struct Config {
     pub seed: u64,
     /// Bytes of address space for the guest's heap
     pub heap_size: usize,
+    /// Whether the seeded heap gives freed runs' pages back
+    pub heap_release: bool,
     pub quantum_lo: u32,
     pub quantum_hi: u32,
 }
@@ -40,9 +42,11 @@ impl Config {
             .ok()
             .and_then(|v| usize::from_str_radix(&v, 16).ok())
             .unwrap_or(crate::alloc::DEFAULT_SIZE);
+        let heap_release = std::env::var("REWRITE_HEAP_RELEASE").map_or(true, |v| v != "0");
         Config {
             seed,
             heap_size,
+            heap_release,
             quantum_lo: lo,
             quantum_hi: hi,
         }
@@ -558,7 +562,11 @@ pub fn init(info: Option<Info>, cfg: &Config) {
     open_trace();
     load_mask();
     // Its own stream, per process; a `fork` child carries its parent's on
-    crate::alloc::seed_layout(process_seed(cfg.seed, pid()), cfg.heap_size);
+    crate::alloc::seed_layout(
+        process_seed(cfg.seed, pid()),
+        cfg.heap_size,
+        cfg.heap_release,
+    );
     set_my_id(me);
     wait_for_baton(me);
     // With the baton: only its holder talks to the launcher

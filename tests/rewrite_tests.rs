@@ -72,6 +72,7 @@ fn stubs_are_slide_proof() {
         dylib: Some(common::supervisor_dylib()),
         disable_aslr: false,
         heap_size: rewrite::launch::DEFAULT_HEAP,
+        heap_release: true,
         stdout: None,
         stderr: None,
         seed: 0,

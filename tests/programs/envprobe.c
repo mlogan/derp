@@ -24,7 +24,8 @@ int main(void) {
         if (strncmp(names[i], "REWRITE_", 8) != 0 && strncmp(names[i], "DYLD_", 5) != 0)
             printf("%s ", names[i]);
     printf("\n");
-    printf("PATH=%s LANG=%s TZ=%s USER=%s\n", value("PATH"), value("LANG"), value("TZ"), value("USER"));
+    printf("PATH=%s LANG=%s TZ=%s USER=%s OS_ACTIVITY_MODE=%s\n", value("PATH"), value("LANG"), value("TZ"),
+           value("USER"), value("OS_ACTIVITY_MODE"));
     printf("AMBIENT=%s PASSED=%s FROM_FILE=%s MINE=%s\n", value("AMBIENT"), value("PASSED"),
            value("FROM_FILE"), value("MINE"));
     printf("stack=%p\n", (void *)&local);

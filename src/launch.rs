@@ -694,6 +694,13 @@ fn guest_env(run: &Run, coord: Option<(&Coordinator, u32)>) -> Vec<(String, Stri
     if run.passive {
         env.push((PASSIVE_VAR.into(), "1".into()));
     }
+    // libsystem_trace reads its preferences in a library initializer
+    // whenever logging's state has changed machine-wide (a `log stream`,
+    // Console): file calls that move every later quantum. A run file's
+    // own `OS_ACTIVITY_MODE` comes first and wins.
+    if run.dylib.is_some() {
+        env.push(("OS_ACTIVITY_MODE".into(), "disable".into()));
+    }
     env.push((shared::EXTERNAL_VAR.into(), external_objects()));
     if let Some((coord, proc_index)) = coord {
         env.push((

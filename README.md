@@ -204,6 +204,8 @@ every process, `env:` on a process, or `pass-env: [NAME, ...]` to inherit
 named variables on purpose. Otherwise a proxy setting or a locale would be
 an input nobody wrote down, and the environment's length even decides where
 a guest's stack starts. Single-program `derp run prog` still inherits.
+Every guest, either way, gets `OS_ACTIVITY_MODE=disable` (`os_log` off)
+unless the run sets it: see "Processes" below.
 
 A process written as a map can be crashed or shut down on purpose, and
 restarted:
@@ -508,6 +510,7 @@ that closes a source of nondeterminism adds a row here.
 | A guest killed by another guest was dead to the run only when the launcher noticed | The whole death happens under the scheduler lock at the moment of the `kill`; its peers see EOF from then. |
 | Guests outlived a dead launcher | A guest whose launcher is gone exits within a second. |
 | A guest's own children were invisible to the tools | Every process reports its program once it first holds the baton, and the launcher keeps the rewritten-to-original mapping. |
+| Whenever logging's state had changed anywhere on the machine (a `log stream`, Console), libsystem_trace re-read its preferences plist in a library initializer of every new process. Its open, stat and read are interposed and count as hook events, so every later quantum ended elsewhere: a Sui cluster's schedule changed from the first switch | Guests run with `OS_ACTIVITY_MODE=disable`, which turns `os_log` off and the reads with it. A run file can set it otherwise. |
 
 ### Files and IPC
 

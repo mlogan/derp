@@ -1040,11 +1040,11 @@ hosts:
     let lines: Vec<&str> = first.lines().collect();
     assert_eq!(
         lines[0],
-        "FROM_FILE HOME LANG LC_ALL LOGNAME MINE PASSED PATH PWD TMPDIR TZ USER "
+        "FROM_FILE HOME LANG LC_ALL LOGNAME MINE OS_ACTIVITY_MODE PASSED PATH PWD TMPDIR TZ USER "
     );
     assert_eq!(
         lines[1],
-        "PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C TZ=UTC USER=guest"
+        "PATH=/usr/bin:/bin:/usr/sbin:/sbin LANG=C TZ=UTC USER=guest OS_ACTIVITY_MODE=disable"
     );
     assert_eq!(
         lines[2],

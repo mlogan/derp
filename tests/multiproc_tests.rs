@@ -1592,6 +1592,30 @@ fn the_heap_size_is_the_runs_to_set() {
     assert_eq!(large.stdout[0], roomy);
 }
 
+/// A freed run's pages go back to the system and read as zeros after,
+/// unless the run file or the command line, which wins, says
+/// `heap-release: off`.
+#[test]
+fn freed_runs_go_back_unless_the_run_says_not_to() {
+    let dir = common::scratch_dir("heap_release");
+    common::build_c("heap_release", &dir, &[]);
+    let scratch = dir.join("scratch");
+    let manifest = dir.join("release.yaml");
+    let processes = "hosts:\n  - name: a\n    processes:\n      - heap_release\n";
+    let given = "resident: bounded\nfreed block: zeros\n";
+    let kept = "resident: grew\nfreed block: old contents\n";
+
+    std::fs::write(&manifest, processes).unwrap();
+    assert_eq!(run_manifest(&manifest, &scratch, 1, 1).stdout[0], given);
+    let off = run_manifest_with(&manifest, &scratch, 1, 1, &["--heap-release", "off"]);
+    assert_eq!(off.stdout[0], kept);
+
+    std::fs::write(&manifest, format!("heap-release: off\n{processes}")).unwrap();
+    assert_eq!(run_manifest(&manifest, &scratch, 1, 1).stdout[0], kept);
+    let on = run_manifest_with(&manifest, &scratch, 1, 1, &["--heap-release", "on"]);
+    assert_eq!(on.stdout[0], given);
+}
+
 /// A signal handler runs on a parked thread at a moment of real time and
 /// may interrupt the thread inside the scheduler lock; it must not wait
 /// for itself. And a thread killed by `execve` may be inside the lock: the

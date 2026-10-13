@@ -127,6 +127,7 @@ there; the command line wins.
 | `--quantum LO..HI` | `1000..10000` | `quantum:` | Hook events per scheduling quantum, drawn from this range. The default finds races in short programs and costs about 57% on two compute-bound processes; `10000..100000` costs about 10% and misses races in short programs. |
 | `--mem-hook-rate R` | `0` | `mem-hook-rate:` | `0`, `1` or a fraction like `1/16`: hooks a sparse, seeded set of memory accesses. Races on plain memory need it; races through files and sockets do not. |
 | `--heap-size N` | `32G` | `heap-size:` | Address space of each guest's heap, such as `512M` or `4T`. Only touched pages cost memory. |
+| `--heap-release on\|off` | `on` | `heap-release:` | Whether the pages of a freed block of 64 KB or more, and of a slab of small blocks that are all free, go back to the system. A seeded layout puts each new big block somewhere new, so without this a guest holds every page its heap ever touched: a Sui validator grew past 11 GB. Released memory reads as zeros, and kept memory as it was; a guest that reads memory it never wrote sees the one or the other, the same on every run. `off` is for telling whether a run that does not repeat is doing so because of this. |
 | `--manifest FILE` | | | The run file, in YAML (below). Hosts get `10.0.0.1` upward in the order listed and are reachable by name. |
 | `--net-latency T` | `0` | `net-latency:` | Virtual-time delay of traffic between different hosts, such as `5ms`, `250us` or `1s`. |
 | `--switch-cost T` | `10us` | `switch-cost:` | How far each baton hand-off moves the virtual clock, quantum expiries included; a clock read moves it 1µs. Threads run one at a time on one clock, so the cost is kept low: at 1ms, the old default, a run of several threaded servers with hundreds of threads between them got so little done per virtual second that their own timeouts fired. The price is that code timing its own work finds it very fast. Only a run-file run can change it. |
@@ -169,6 +170,7 @@ Host isolation is extremely primitive, and does little besides telling hosts on 
 seed: 7                  # optional; the command line overrides these
 quantum: 1000..10000
 heap-size: 32G           # address space of each guest's heap (the default)
+heap-release: on         # freed big blocks' pages go back (the default)
 mem-hook-rate: 1/16
 net-latency: 5ms
 switch-cost: 10us        # virtual time a baton hand-off costs (the default)
@@ -351,6 +353,8 @@ Results: `docs/REWRITE_RESULTS.md` (single process) and
   cost memory. `heap-size: 128G` in the run file or `--heap-size` changes
   it (64 MB to 4 TB). A seeded layout scatters blocks, so leave it roomy:
   a quarter holds the small size classes and the rest the large blocks.
+  The pages of a freed block of 64 KB or more go back to the system
+  (`heap-release`, above).
 - Go programs are supported in part. Build with the external linker
   (`go build -ldflags=-linkmode=external`: Go's own emits no
   `LC_FUNCTION_STARTS`) and set `GODEBUG=netdns=cgo` in the run file so
@@ -460,6 +464,7 @@ that closes a source of nondeterminism adds a row here.
 | `malloc` addresses vary between runs | The malloc family is interposed and served from a heap in a fixed region. |
 | The heap layout was the same for every seed, so pointer-order bugs never showed | Where blocks land and whether a freed block is reused at once are drawn from the seed and the process index. |
 | A fixed 4 GB heap ran out under a scattered layout | The heap is 32 GB of address space by default and the run file sets it. |
+| A seeded heap never gave memory back, and new big blocks landed on untouched pages, so a long run held every page it had ever used. `MADV_FREE` would return them, but whether a page then reads as zeros or as before depends on memory pressure | A freed run, and a window slab whose blocks are all free, is mapped over with `MAP_FIXED`, which returns its pages and makes them read as zeros. `heap-release: off` turns this off. |
 | `mmap` hints for the supervisor's regions were not honoured. The kernel ignores hints in some ranges and low addresses vary between launches | The regions are reserved with `mach_vm_allocate` at fixed addresses and mapped over with `MAP_FIXED`. |
 | Threads outside the schedule allocated from the deterministic heap | Their allocations go to libmalloc, and a block they free is counted as leaked rather than reused. |
 | The kernel placed thread stacks first-fit around GCD workers' stacks, and `pthread_self` is a stack address that RocksDB hashes | Scheduled threads' `mach_vm_map`, `mach_vm_allocate` and `mmap` requests without an address are placed in a reserved region in schedule order. |

@@ -42,6 +42,9 @@ options:
                                        bisect does at each probe
   --heap-size N                        address space of each guest's heap: 32G (default), 512M,
                                        4T. Only touched pages cost memory
+  --heap-release on|off                give a freed run's pages back to the system, where it
+                                       reads as zeros (default on); off keeps every page the
+                                       heap ever touched, with its old contents
   --jobs J                             bisect, suspects: runs at a time (default 4)
   --resolution T                       bisect: stop at an interval this short (default 2ms)
   --no-supervisor                      no scheduling: the dylib only provides the stubs' counter
@@ -82,6 +85,7 @@ run file:
   scheduler: pct
   pct: { depth: 3, horizon: 10s, starve: 50ms }
   heap-size: 32G
+  heap-release: on
   stop-after: 30s
   wall-limit: 60s
   env: { LOG_LEVEL: debug }            for every process
@@ -120,6 +124,7 @@ struct Cli {
     pauses: rewrite::shared::Pauses,
     scheduler: rewrite::shared::Scheduler,
     heap_size: u64,
+    heap_release: bool,
     /// Virtual time at which the run is over (0: when its processes are)
     stop_after_ns: u64,
     /// Real time after which it is over (0: never)
@@ -190,6 +195,9 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
         cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
     }
+    if let (Some(r), true) = (&m.heap_release, from_file("heap-release")) {
+        cli.heap_release = parse_on_off("heap release", r)?;
+    }
     if let (Some(t), true) = (&m.stop_after, from_file("stop-after")) {
         cli.stop_after_ns = parse_stop_after(t)?;
     }
@@ -201,6 +209,14 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
         cli.given.push("pause");
     }
     Ok(cli)
+}
+
+fn parse_on_off(what: &str, v: &str) -> Result<bool, String> {
+    match v {
+        "on" | "true" => Ok(true),
+        "off" | "false" => Ok(false),
+        _ => Err(format!("bad {what} {v} (on or off)")),
+    }
 }
 
 fn parse_scheduler(v: &str) -> Result<u8, String> {
@@ -276,6 +292,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         pauses: rewrite::shared::Pauses::DEFAULT,
         scheduler: rewrite::shared::Scheduler::RANDOM,
         heap_size: launch::DEFAULT_HEAP,
+        heap_release: true,
         stop_after_ns: 0,
         wall_limit_ms: 0,
         reseed_at: None,
@@ -354,6 +371,10 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
                 cli.heap_size = manifest::parse_size(&v).ok_or(format!("bad heap size {v}"))?;
                 cli.given.push("heap-size");
             }
+            "--heap-release" => {
+                cli.heap_release = parse_on_off("heap release", &take_value(&mut args)?)?;
+                cli.given.push("heap-release");
+            }
             "--wall-limit" => {
                 cli.wall_limit_ms = parse_stop_after(&take_value(&mut args)?)? / 1_000_000;
                 cli.given.push("wall-limit");
@@ -428,6 +449,7 @@ fn run_guest(
         dylib: dylib_for(cli)?,
         disable_aslr: cli.disable_aslr,
         heap_size: cli.heap_size,
+        heap_release: cli.heap_release,
         stdout,
         stderr: None,
         seed: cli.opts.seed,
@@ -607,6 +629,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         inherit_env: false,
         disable_aslr: cli.disable_aslr,
         heap_size: cli.heap_size,
+        heap_release: cli.heap_release,
         seed: cli.opts.seed,
         quantum: cli.quantum,
         passive: !cli.supervisor,
@@ -774,6 +797,8 @@ fn replay_of(
         format!("{}ns", cli.switch_ns),
         "--heap-size".to_string(),
         cli.heap_size.to_string(),
+        "--heap-release".to_string(),
+        if cli.heap_release { "on" } else { "off" }.to_string(),
         "--pause".to_string(),
         format!("{}/{}", cli.pauses.num, cli.pauses.den),
         "--pause-for".to_string(),

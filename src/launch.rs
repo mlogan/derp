@@ -8,6 +8,7 @@ use std::ffi::{CString, OsString};
 use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::coord::{Coordinator, Totals};
 use crate::shared;
@@ -393,10 +394,25 @@ enum Event {
     Socket,
     /// The real-time limit
     Timer,
+    /// A signal meant to end us
+    Signal(libc::c_int),
 }
 
 const SOCKET_UDATA: usize = usize::MAX;
 const TIMER_UDATA: usize = usize::MAX - 1;
+const SIGNAL_UDATA: usize = usize::MAX - 2;
+
+/// The pipe `on_signal` reports on: read end, write end
+static SIGNAL_PIPE: [AtomicI32; 2] = [AtomicI32::new(-1), AtomicI32::new(-1)];
+
+extern "C" fn on_signal(sig: libc::c_int) {
+    let byte = sig as u8;
+    let fd = SIGNAL_PIPE[1].load(Ordering::Relaxed);
+    unsafe { libc::write(fd, (&raw const byte).cast(), 1) };
+}
+
+/// The signals that end a launcher from outside
+const ENDING_SIGNALS: [libc::c_int; 3] = [libc::SIGTERM, libc::SIGHUP, libc::SIGINT];
 
 impl Events {
     fn new() -> io::Result<Self> {
@@ -460,6 +476,30 @@ impl Events {
         }
     }
 
+    /// SIGTERM, SIGHUP and SIGINT become events, so that the run's guests
+    /// end with us: one blocked in a real read never looks for its
+    /// launcher, and a native guest has nothing that would. Handlers go
+    /// back to the default in a spawned guest.
+    fn watch_ending_signals(&self) -> io::Result<()> {
+        if SIGNAL_PIPE[0].load(Ordering::Relaxed) < 0 {
+            let mut fds = [0; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            for fd in fds {
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            }
+            SIGNAL_PIPE[0].store(fds[0], Ordering::Relaxed);
+            SIGNAL_PIPE[1].store(fds[1], Ordering::Relaxed);
+            for sig in ENDING_SIGNALS {
+                unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
+            }
+        }
+        let fd = SIGNAL_PIPE[0].load(Ordering::Relaxed);
+        self.add(fd as usize, libc::EVFILT_READ, 0, SIGNAL_UDATA);
+        Ok(())
+    }
+
     fn unwatch_socket(&self, fd: libc::c_int) {
         let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
         ev.ident = fd as usize;
@@ -502,6 +542,12 @@ impl Events {
             }
             if ev.udata as usize == TIMER_UDATA {
                 return Ok(Event::Timer);
+            }
+            if ev.udata as usize == SIGNAL_UDATA {
+                let mut byte = 0u8;
+                let fd = SIGNAL_PIPE[0].load(Ordering::Relaxed);
+                unsafe { libc::read(fd, (&raw mut byte).cast(), 1) };
+                return Ok(Event::Signal(libc::c_int::from(byte)));
             }
             if ev.fflags & libc::NOTE_EXIT != 0 {
                 return Ok(Event::Exited {
@@ -838,6 +884,7 @@ fn rewritten_path(run: &Run, payload: &[u8]) -> Result<Vec<u8>, i32> {
 /// Returns whether the run ended in a deadlock.
 fn supervise(run: &Run, coord: Option<&Coordinator>, procs: &mut Vec<Tracked>) -> io::Result<bool> {
     let events = Events::new()?;
+    events.watch_ending_signals()?;
     if run.wall_limit_ms != 0 {
         events.watch_timer(run.wall_limit_ms);
     }
@@ -925,6 +972,14 @@ fn supervise_started(
             }
             if std::mem::take(&mut ch.closed) {
                 events.unwatch_socket(ch.fd);
+            }
+        }
+        if let Event::Signal(sig) = event {
+            end_run(procs);
+            // Ended by it, as we would have been without the handler
+            unsafe {
+                libc::signal(sig, libc::SIG_DFL);
+                libc::raise(sig);
             }
         }
         if let Event::Timer = event {

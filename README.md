@@ -268,9 +268,12 @@ A process written as a map may also say `daemon: true`: a server that never
 exits. When every other process of the run file has exited, the launcher
 kills what is left and the run is over.
 
-Guests do not outlive the launcher. One whose launcher is gone (killed,
-crashed) exits with status 70 within about a second: nobody is left to
-hand it the baton, end the run or release a lock the launcher held.
+Guests do not outlive the launcher. Ended by SIGTERM, SIGHUP or SIGINT, the
+launcher kills the run's guests, native ones and those blocked in a real
+read included, then dies of that signal. A guest whose launcher is gone
+otherwise (`kill -9`, a crash) exits with status 70 within about a second
+of entering the scheduler: nobody is left to hand it the baton, end the run
+or release a lock the launcher held.
 
 Processes start in file order. `argv[0]` names the program, relative to the
 run file, and reaches the guest exactly as written. Numbers and booleans in

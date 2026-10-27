@@ -107,3 +107,56 @@ fn one_program_is_reported_as_a_run_and_a_signal_is_named() {
     assert!(fields.contains_key("run.clock_ns"), "{err}");
     assert_eq!(fields["p0.status"], "signal 6");
 }
+
+/// A guest blocked reading a pipe from outside never enters the scheduler
+/// to find its launcher gone; the launcher takes it along when signalled.
+#[test]
+fn a_signalled_launcher_ends_a_guest_blocked_in_a_real_read() {
+    use std::io::Read;
+    use std::process::Stdio;
+    let dir = common::scratch_dir("cli_signalled");
+    common::build_c_source(
+        "reads_stdin",
+        "#include <stdio.h>\nint main(void) { puts(\"reading\"); fflush(stdout); \
+         return getchar() == EOF; }\n",
+        &dir,
+    );
+    let manifest = dir.join("reads.yaml");
+    std::fs::write(
+        &manifest,
+        "hosts: [{name: a, processes: [./reads_stdin]}]\n",
+    )
+    .unwrap();
+    common::supervisor_dylib();
+    let mut child = Command::new(common::derp_bin())
+        .args(["run", "--scratch"])
+        .arg(dir.join("scratch"))
+        .arg("--manifest")
+        .arg(&manifest)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Held open: `wait` would close it, and the guest would read its end
+    let _stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut first = [0u8; 8];
+    stdout.read_exact(&mut first).unwrap();
+    assert_eq!(&first, b"reading\n");
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&child.wait().unwrap()),
+        Some(libc::SIGTERM)
+    );
+    // The guest holds the pipe too: end of file once it has gone as well
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut rest = Vec::new();
+        let _ = stdout.read_to_end(&mut rest);
+        let _ = tx.send(());
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+        "the guest outlived its launcher"
+    );
+}

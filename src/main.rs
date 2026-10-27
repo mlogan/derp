@@ -12,7 +12,7 @@ const USAGE: &str = "\
 usage:
   derp copy <in> <out>                 round-trip a binary through the writer and re-sign it
   derp scan [opts] <prog>              print what the rewriter would hook
-  derp rewrite [opts] <in> <out>       rewrite and sign
+  derp rewrite [opts] <in> <out>       rewrite and sign; the output runs only under derp run
   derp run [opts] <prog> [args…]       rewrite (cached), then launch under the supervisor
   derp bench [opts] <prog> [args…]     time native vs rewritten (no supervisor)
   derp repeat [opts] <prog> [args…]    run N times; exit status, stdout and schedule hash must agree
@@ -30,10 +30,13 @@ usage:
                                        rooms for them in its text (README, Big programs)
   derp cc <linker args…>               the linker driver `derp cargo` installs
   derp rooms <prog>                    the rooms `derp cc` would give <prog>, and why
-options:
+  derp --help | --version
+options (before the program; -- ends them). Times are written 5ms, 250us, 10ns or 1s; a
+bare number is milliseconds. An option the command would not use is refused.
   -v, --verbose                        run, rewrite: say what was rewritten and print the
                                        run's report (key=value lines) on stderr
-  --runs N                             repetitions for repeat (default 100)
+  --runs N                             repeat: repetitions (default 100); bisect: futures
+                                       per probe (default 20)
   --seed S                             run seed (default 0)
   --mem-hook-rate R                    0, 1 or a fraction like 1/16 (default 0)
   --quantum LO..HI                     hook events per quantum (default 1000..10000)
@@ -52,16 +55,18 @@ options:
   --native                             run the original binary without the dylib
   --manifest FILE                      run file (YAML): hosts and their processes
   --scratch DIR                        where a run file's host directories are made, fresh
-                                       (default: a directory under the system temp dir)
+                                       (default: a directory under the system temp dir,
+                                       removed after the run unless output was captured)
   --capture                            manifest run: each guest's stdout goes to stdout.<index>
                                        in the scratch directory instead of ours
   --capture-stderr                     and its stderr to stderr.<index>, with the supervisor's
                                        messages about it
-  --net-latency T                      virtual-time delay between different hosts, such as
-                                       5ms, 250us or 1s (default 0)
-  --switch-cost T                      virtual time each baton hand-off costs (default 10us)
-  --pause N/M                          pause the thread a scheduling choice picks with this
-                                       chance, while another can run (default 1/200; off)
+  --net-latency T                      run file: virtual-time delay between different hosts
+                                       (default 0)
+  --switch-cost T                      run file: virtual time each baton hand-off costs
+                                       (default 10us)
+  --pause N/M|off                      pause the thread a scheduling choice picks with this
+                                       chance, while another can run (default 1/200)
   --pause-for LO..HI                   how long, drawn log-uniformly (default 10us..100ms)
   --scheduler random|pct               how the next thread is chosen (default random)
   --pct-depth D                        PCT: D-1 priority change points (default 3)
@@ -98,7 +103,17 @@ run file:
         - client alpha 8080            or a line, split on whitespace
         - argv: [worker]               or a map, with an environment
           env: { MODE: fast }
+          daemon: true                 never exits: killed when the others are done
+          restart: on-failure          never (default), on-failure or always
+          restart-delay: 50ms..150ms
+          max-restarts: 10
+          crash: { every: 100ms..300ms, times: 3 }
+          shutdown: { every: 2s..10s, times: 3, signal: TERM, grace: 5s }
+  outside-network: refuse              or allow: lookups and connections beyond the hosts
+  allow: [/opt/site-content]           paths outside its directory every host may touch
   Program paths are relative to the run file. See README.md.
+exit status: the program's (a run file's first failing entry's); 128+N if a guest was
+killed by signal N; 2 for derp's own errors.
 ";
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
@@ -715,6 +730,20 @@ fn layered(layers: &[&[(String, String)]]) -> Vec<(String, String)> {
     out
 }
 
+/// The default scratch directory is the run's alone: removed when it is
+/// over, unless it holds captured output, which is then pointed at.
+fn leave_scratch(cli: &Cli, captured: bool) {
+    if cli.scratch.is_some() {
+        return;
+    }
+    let dir = scratch_dir(cli);
+    if captured && dir.exists() {
+        eprintln!("derp: captured output is in {}", dir.display());
+    } else {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 fn stdout_file(scratch: &Path, index: usize) -> PathBuf {
     scratch.join(format!("stdout.{index}"))
 }
@@ -1206,6 +1235,7 @@ fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
     if let Some((_, out)) = &single {
         let _ = std::fs::remove_file(out);
     }
+    leave_scratch(cli, false);
     if result.is_ok() {
         println!("{} runs identical", cli.runs);
     }
@@ -1437,7 +1467,9 @@ fn main() -> ExitCode {
         }
         Some("run") if rest.is_empty() && cli.manifest.is_some() => {
             let manifest = cli.manifest.clone().unwrap();
-            run_manifest(&cli, &manifest, &scratch_dir(&cli), cli.capture).map(|o| {
+            let result = run_manifest(&cli, &manifest, &scratch_dir(&cli), cli.capture);
+            leave_scratch(&cli, cli.capture || cli.capture_stderr);
+            result.map(|o| {
                 if cli.verbose {
                     print_run_report(&o);
                 }
@@ -1460,10 +1492,14 @@ fn main() -> ExitCode {
                 })
         }
         Some("bisect") if rest.is_empty() && cli.manifest.is_some() => {
-            bisect(&cli).map(|()| ExitCode::SUCCESS)
+            let result = bisect(&cli);
+            leave_scratch(&cli, false);
+            result.map(|()| ExitCode::SUCCESS)
         }
         Some("suspects") if rest.is_empty() && cli.manifest.is_some() => {
-            suspects(&cli).map(|()| ExitCode::SUCCESS)
+            let result = suspects(&cli);
+            leave_scratch(&cli, false);
+            result.map(|()| ExitCode::SUCCESS)
         }
         Some("bench") if !rest.is_empty() => bench(cli, &rest).map(|()| ExitCode::SUCCESS),
         Some("rooms") if rest.len() == 1 => {

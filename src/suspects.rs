@@ -141,7 +141,11 @@ fn ddmin(r: &Runner, all: Vec<Key>, progress: &mut impl FnMut(&str)) -> Vec<Key>
             n = (2 * n).min(current.len());
             continue;
         }
-        progress(&format!("  still fails with {} sites", current.len()));
+        let n = current.len();
+        progress(&format!(
+            "  still fails with {n} site{}",
+            if n == 1 { "" } else { "s" }
+        ));
     }
     current
 }

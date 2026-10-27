@@ -604,15 +604,14 @@ fn dylib_for(cli: &Cli) -> Fallible<Option<PathBuf>> {
         .ok_or_else(|| "supervisor dylib not found next to the derp binary".into())
 }
 
-fn run_guest(
+fn single_launch(
     exe: PathBuf,
     cli: &Cli,
     args: Vec<OsString>,
-    quiet: bool,
     stdout: Option<PathBuf>,
-) -> Fallible<launch::Outcome> {
+) -> Fallible<Launch> {
     check_supervised(cli, false)?;
-    let cfg = Launch {
+    Ok(Launch {
         exe,
         args,
         dylib: dylib_for(cli)?,
@@ -629,12 +628,35 @@ fn run_guest(
         wall_limit_ms: cli.wall_limit_ms,
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
-    };
-    let outcome = launch::launch(&cfg)?;
-    if !quiet {
-        for (k, v) in &outcome.report.fields {
-            eprintln!("{k}={v}");
-        }
+    })
+}
+
+fn run_guest(
+    exe: PathBuf,
+    cli: &Cli,
+    args: Vec<OsString>,
+    stdout: Option<PathBuf>,
+) -> Fallible<launch::Outcome> {
+    Ok(launch::launch(&single_launch(exe, cli, args, stdout)?)?)
+}
+
+/// One program as a run of its own, reported as a run file's would be.
+fn run_single(exe: PathBuf, cli: &Cli, args: Vec<OsString>) -> Fallible<RunOutcome> {
+    let run = Run::single(&single_launch(exe, cli, args, None)?);
+    finished(launch::launch_run(&run)?)
+}
+
+/// What every run checks of its outcome before reporting it
+fn finished(outcome: RunOutcome) -> Fallible<RunOutcome> {
+    if outcome.totals.restarts_refused > 0 {
+        return Err(format!(
+            "the run's process table is full: {} restarts were not made",
+            outcome.totals.restarts_refused
+        )
+        .into());
+    }
+    if outcome.deadlock {
+        return Err("deadlock: every guest thread was blocked; the run was killed".into());
     }
     Ok(outcome)
 }
@@ -830,18 +852,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
              host names do not resolve and every host is this machine"
         );
     }
-    let outcome = launch::launch_run(&run)?;
-    if outcome.totals.restarts_refused > 0 {
-        return Err(format!(
-            "the run's process table is full: {} restarts were not made",
-            outcome.totals.restarts_refused
-        )
-        .into());
-    }
-    if outcome.deadlock {
-        return Err("deadlock: every guest thread was blocked; the run was killed".into());
-    }
-    Ok(outcome)
+    finished(launch::launch_run(&run)?)
 }
 
 /// Fields every guest reports but that describe the whole run
@@ -1057,11 +1068,37 @@ fn bisect(cli: &Cli) -> Fallible<()> {
     Ok(())
 }
 
+fn signal_name(s: i32) -> &'static str {
+    match s {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGSYS => "SIGSYS",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGUSR2 => "SIGUSR2",
+        _ => "?",
+    }
+}
+
 fn exit_from(outcome: &launch::Outcome) -> ExitCode {
     match (outcome.stopped, outcome.exit_code(), outcome.signal()) {
         (true, ..) => ExitCode::SUCCESS,
         (_, Some(c), _) => ExitCode::from(c as u8),
-        (_, None, Some(s)) => fail(format!("guest killed by signal {s}")),
+        // As a shell reports it, apart from derp's own errors (2)
+        (_, None, Some(s)) => {
+            eprintln!("derp: guest killed by signal {s} ({})", signal_name(s));
+            ExitCode::from(128 + (s as u8 & 0x7f))
+        }
         _ => fail("guest ended abnormally"),
     }
 }
@@ -1078,7 +1115,7 @@ fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
         let mut best = f64::INFINITY;
         for _ in 0..3 {
             let t = Instant::now();
-            let o = run_guest(exe.to_path_buf(), plain, rest[1..].to_vec(), true, None)?;
+            let o = run_guest(exe.to_path_buf(), plain, rest[1..].to_vec(), None)?;
             if o.exit_code() != Some(0) {
                 return Err(format!("{} failed", exe.display()).into());
             }
@@ -1107,7 +1144,6 @@ fn observe_single(cli: &Cli, exe: &Path, args: &[OsString], out: &Path) -> Falli
         exe.to_path_buf(),
         cli,
         args.to_vec(),
-        true,
         Some(out.to_path_buf()),
     )?;
     let text = std::fs::read_to_string(out).unwrap_or_default();
@@ -1415,8 +1451,13 @@ fn main() -> ExitCode {
             } else {
                 rewritten(&prog, &cli)
             };
-            exe.and_then(|exe| run_guest(exe, &cli, rest[1..].to_vec(), !cli.verbose, None))
-                .map(|o| exit_from(&o))
+            exe.and_then(|exe| run_single(exe, &cli, rest[1..].to_vec()))
+                .map(|o| {
+                    if cli.verbose {
+                        print_run_report(&o);
+                    }
+                    exit_from_run(&o)
+                })
         }
         Some("bisect") if rest.is_empty() && cli.manifest.is_some() => {
             bisect(&cli).map(|()| ExitCode::SUCCESS)

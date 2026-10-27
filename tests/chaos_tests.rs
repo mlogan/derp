@@ -67,7 +67,7 @@ fn pauses_find_a_write_after_the_lease_ran_out() {
     for seed in 1..=10 {
         let (out, r) = derp_run(&exe, seed, &["--pause", "off"]);
         assert_eq!(unfenced(&out), 0, "seed {seed} without pauses");
-        assert_eq!(r.u64("pauses"), 0);
+        assert_eq!(r.u64("run.pauses"), 0);
     }
     let pauses = ["--pause", "1/100", "--pause-for", "10us..100ms"];
     let found: Vec<u64> = (1..=10)
@@ -80,9 +80,12 @@ fn pauses_find_a_write_after_the_lease_ran_out() {
     let (b, rb) = derp_run(&exe, seed, &pauses);
     assert_eq!(a, b);
     assert!(unfenced(&a) > 0);
-    assert_eq!(ra.fields["schedule_hash"], rb.fields["schedule_hash"]);
-    assert_eq!(ra.u64("pauses"), rb.u64("pauses"));
-    assert!(ra.u64("pauses") > 0);
+    assert_eq!(
+        ra.fields["run.schedule_hash"],
+        rb.fields["run.schedule_hash"]
+    );
+    assert_eq!(ra.u64("run.pauses"), rb.u64("run.pauses"));
+    assert!(ra.u64("run.pauses") > 0);
 }
 
 #[test]
@@ -145,8 +148,11 @@ fn pct_finds_an_atomicity_violation_with_a_horizon_the_length_of_the_run() {
     let (a, ra) = derp_run(&exe, found[0], &pct);
     let (b, rb) = derp_run(&exe, found[0], &pct);
     assert_eq!(a, b);
-    assert_eq!(ra.fields["schedule_hash"], rb.fields["schedule_hash"]);
-    assert_eq!(ra.u64("pct_changes"), 1);
+    assert_eq!(
+        ra.fields["run.schedule_hash"],
+        rb.fields["run.schedule_hash"]
+    );
+    assert_eq!(ra.u64("run.pct_changes"), 1);
     // A horizon far past the run's end puts no change point in it
     let late = [
         "--scheduler",
@@ -198,7 +204,7 @@ fn pauses_are_on_by_default() {
     let found = (1..=10)
         .filter(|&seed| {
             let (out, r) = derp_run(&exe, seed, &[]);
-            assert!(r.u64("pauses") > 0, "seed {seed}");
+            assert!(r.u64("run.pauses") > 0, "seed {seed}");
             unfenced(&out) > 0
         })
         .count();

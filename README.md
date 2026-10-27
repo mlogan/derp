@@ -7,6 +7,9 @@ Thread scheduling, syscalls, hardware counters, heap layout, network traffic, an
 ```sh
 cargo build --release --workspace         # builds derp and, next to it, the supervisor dylib
 target/release/derp run --seed 42 ./my-program arg1 arg2
+# A race on plain memory, rather than through locks, files or sockets, needs its loads and
+# stores hooked too:
+target/release/derp run --seed 42 --mem-hook-rate 1 ./my-program arg1 arg2
 ```
 
 ![a racy counter run natively and twice under derp with the same seed](docs/demo/demo.gif)
@@ -117,8 +120,9 @@ Only arm64 Mach-O on macOS is supported. Other operating systems or executable f
 
 ## Options
 
-Options come before the program. Those marked "run file" can also be set
-there; the command line wins.
+Options come before the program (`--` ends them). Those marked "run file" can also be set
+there; the command line wins. An option the command would not use, such as `--net-latency`
+without a run file, is refused rather than ignored. `derp --help` lists them too.
 
 | Option | Default | Run file | What it does |
 | --- | --- | --- | --- |
@@ -129,7 +133,7 @@ there; the command line wins.
 | `--heap-size N` | `32G` | `heap-size:` | Address space of each guest's heap, such as `512M` or `4T`. Only touched pages cost memory. |
 | `--heap-release on\|off` | `on` | `heap-release:` | Whether the pages of a freed block of 64 KB or more, and of a slab of small blocks that are all free, go back to the system. A seeded layout puts each new big block somewhere new, so without this a guest holds every page its heap ever touched: a Sui validator grew past 11 GB. Released memory reads as zeros, and kept memory as it was; a guest that reads memory it never wrote sees the one or the other, the same on every run. `off` is for telling whether a run that does not repeat is doing so because of this. |
 | `--manifest FILE` | | | The run file, in YAML (below). Hosts get `10.0.0.1` upward in the order listed and are reachable by name. |
-| `--net-latency T` | `0` | `net-latency:` | Virtual-time delay of traffic between different hosts, such as `5ms`, `250us` or `1s`. |
+| `--net-latency T` | `0` | `net-latency:` | Virtual-time delay of traffic between different hosts, such as `5ms`, `250us` or `1s`. Run-file runs only. |
 | `--switch-cost T` | `10us` | `switch-cost:` | How far each baton hand-off moves the virtual clock, quantum expiries included; a clock read moves it 1µs. Threads run one at a time on one clock, so the cost is kept low: at 1ms, the old default, a run of several threaded servers with hundreds of threads between them got so little done per virtual second that their own timeouts fired. The price is that code timing its own work finds it very fast. Only a run-file run can change it. |
 | `--pause N/M` | `1/200` | `pause: {chance: N/M}` | With this chance, a scheduling choice pauses the thread it picked instead of running it, while another thread can run: the thread is passed over until its pause ends, or until nothing else is runnable. This is how a lock holder stalls in its critical section, or a writer falls behind, as a thread starved of the CPU would. `off` or `0/1` turns pauses off. In measurements (`docs/CHAOS_RESULTS.md`) their cost was within the noise, and they found a write after a lease ran out in 21 of 50 seeds where the uniform pick found it in none. |
 | `--pause-for LO..HI` | `10us..100ms` | `pause: {for: LO..HI}` | How long a pause lasts in virtual time, drawn log-uniformly: each doubling of the length is about equally likely, so short pauses in a narrow window and long starvations are both common. |
@@ -139,7 +143,7 @@ there; the command line wins.
 | `--pct-starve T` | `50ms` | `pct: {starve: T}` | Within the horizon, a runnable thread passed over this long runs once anyway, so a thread spinning on a lower one's progress cannot stall the run. |
 | `--stop-after T` | | `stop-after:` | End the run at this virtual time: whatever still runs is killed at that point of the schedule, reported as `stopped`, and does not fail the run. For servers that never exit by themselves, and for comparing what a program did in a fixed span of virtual time. Needs the supervisor. |
 | `--wall-limit T` | | `wall-limit:` | The same at a real time. Works for `--native` runs too, which have no virtual clock: every process reports `cpu_user_ns` and `cpu_system_ns`, and `run.cpu_*` sum them, so a program's cost natively and under the supervisor can be compared over the same span. |
-| `--scratch DIR` | under the system temp dir | | Where a run file's host directories are made, fresh. An existing directory is only cleared if an earlier run made it. |
+| `--scratch DIR` | under the system temp dir | | Where a run file's host directories are made, fresh. An existing directory is only cleared if an earlier run made it. Run-file runs (and `bisect`, `suspects`) only. |
 | `--capture` | off | | Run-file runs: each guest's stdout goes to `stdout.<index>` in the scratch directory instead of ours. |
 | `--capture-stderr` | off | | And its stderr to `stderr.<index>`, the supervisor's messages about that guest included; without it they come out on ours. |
 | `--runs N` | `100` (`repeat`), `20` (`bisect`) | | Repetitions for `repeat`; futures per probe for `bisect`. |
@@ -150,7 +154,12 @@ there; the command line wins.
 | `--native` | | | Run the original binary, without the rewriter or the dylib. |
 | `--aslr` | off | | Leave ASLR on. |
 
-With `-v`, the report goes to stderr: `run.*` totals, then `p<index>.*` per process.
+With `-v`, the report goes to stderr: `run.*` totals, then `p<index>.*` per process; one
+program without a run file is a run of one process, `p0`.
+
+`derp run` exits with the program's status: for a run file, that of the first entry that
+failed. A guest killed by signal N gives 128+N, as a shell would, and `derp`'s own errors,
+such as a bad option, give 2.
 
 Two environment variables help with debugging:
 

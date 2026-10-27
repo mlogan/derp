@@ -1021,41 +1021,48 @@ fn handle_frame(
 
 /// Run one guest to completion.
 pub fn launch(cfg: &Launch) -> io::Result<Outcome> {
-    let run = Run {
-        guests: vec![Guest {
-            exe: cfg.exe.clone(),
-            argv0: None,
-            args: cfg.args.clone(),
-            host: 0,
-            env: Vec::new(),
-            stdout: cfg.stdout.clone(),
-            stderr: cfg.stderr.clone(),
-            cwd: None,
-            daemon: false,
-            faults: shared::Faults::default(),
-        }],
-        hosts: vec!["h0".into()],
-        dylib: cfg.dylib.clone(),
-        inherit_env: true,
-        disable_aslr: cfg.disable_aslr,
-        heap_size: cfg.heap_size,
-        heap_release: cfg.heap_release,
-        seed: cfg.seed,
-        quantum: cfg.quantum,
-        passive: cfg.passive,
-        rewrite: cfg.rewrite.clone(),
-        net_latency_ns: 0,
-        switch_ns: crate::shared::DEFAULT_SWITCH_NS,
-        pauses: cfg.pauses,
-        scheduler: cfg.scheduler,
-        reseed: None,
-        stop_at_ns: cfg.stop_at_ns,
-        wall_limit_ms: cfg.wall_limit_ms,
-        // A single program inherits our environment anyway
-        outside_network: true,
-    };
-    let mut out = launch_run(&run)?;
+    let mut out = launch_run(&Run::single(cfg))?;
     Ok(out.guests.remove(0))
+}
+
+impl Run {
+    /// The run of one program on one host, in our environment
+    #[must_use]
+    pub fn single(cfg: &Launch) -> Run {
+        Run {
+            guests: vec![Guest {
+                exe: cfg.exe.clone(),
+                argv0: None,
+                args: cfg.args.clone(),
+                host: 0,
+                env: Vec::new(),
+                stdout: cfg.stdout.clone(),
+                stderr: cfg.stderr.clone(),
+                cwd: None,
+                daemon: false,
+                faults: shared::Faults::default(),
+            }],
+            hosts: vec!["h0".into()],
+            dylib: cfg.dylib.clone(),
+            inherit_env: true,
+            disable_aslr: cfg.disable_aslr,
+            heap_size: cfg.heap_size,
+            heap_release: cfg.heap_release,
+            seed: cfg.seed,
+            quantum: cfg.quantum,
+            passive: cfg.passive,
+            rewrite: cfg.rewrite.clone(),
+            net_latency_ns: 0,
+            switch_ns: crate::shared::DEFAULT_SWITCH_NS,
+            pauses: cfg.pauses,
+            scheduler: cfg.scheduler,
+            reseed: None,
+            stop_at_ns: cfg.stop_at_ns,
+            wall_limit_ms: cfg.wall_limit_ms,
+            // A single program inherits our environment anyway
+            outside_network: true,
+        }
+    }
 }
 
 /// Where the supervisor dylib lives: next to the running `derp` binary.

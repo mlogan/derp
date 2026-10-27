@@ -90,3 +90,20 @@ fn rewrite_refuses_to_overwrite_its_input() {
     assert!(stderr(&out).contains("other than the input"));
     assert_eq!(std::fs::read(&prog).unwrap(), before);
 }
+
+#[test]
+fn one_program_is_reported_as_a_run_and_a_signal_is_named() {
+    let dir = common::scratch_dir("cli_single_report");
+    let prog = common::build_c_source(
+        "aborts",
+        "#include <stdlib.h>\nint main(void) { abort(); }\n",
+        &dir,
+    );
+    let out = derp(&["run", "-v", prog.to_str().unwrap()], &dir);
+    assert_eq!(out.status.code(), Some(128 + libc::SIGABRT));
+    let err = stderr(&out);
+    assert!(err.contains("guest killed by signal 6 (SIGABRT)"), "{err}");
+    let fields = common::report_fields(&err);
+    assert!(fields.contains_key("run.clock_ns"), "{err}");
+    assert_eq!(fields["p0.status"], "signal 6");
+}

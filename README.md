@@ -149,7 +149,7 @@ without a run file, is refused rather than ignored. `derp --help` lists them too
 | `--runs N` | `100` (`repeat`), `20` (`bisect`) | | Repetitions for `repeat`; futures per probe for `bisect`. |
 | `--jobs J` | `4` | | `bisect`, `suspects`: runs at a time. |
 | `--resolution T` | `2ms` | | `bisect`: stop at an interval this short. |
-| `--reseed-at T --reseed N` | | | From virtual time `T` on, every random stream (schedule, faults, heap layout, entropy) starts over from `N`. This is what `bisect` does at each probe. `--reseed` needs `--reseed-at`. |
+| `--reseed-at T --reseed N` | | | From virtual time `T` on, every random stream (schedule, faults, heap layout, entropy) starts over from `N`. This is what `bisect` does at each probe. Run-file runs only, and each needs the other. |
 | `--no-supervisor` | | | No scheduling: the dylib only provides the stubs' counter. |
 | `--native` | | | Run the original binary, without the rewriter or the dylib. |
 | `--aslr` | off | | Leave ASLR on. |
@@ -638,7 +638,7 @@ only as many as ever did. It measures that with `--runs` futures per probe
 (default 20, `--jobs` at a time), binary-searches `t` down to
 `--resolution` (2 ms of virtual time), and prints the probes, the interval
 in which the failure became certain, and the failing run's thread switches
-inside it. `--reseed-at T --reseed N` on `derp run` replays one such
+inside it. `--reseed-at T --reseed N` on `derp run --manifest` replays one such
 future. Every random stream starts over at `T`: thread choice and quanta,
 injected faults, where heap blocks land, and the entropy guests read. So a
 failure decided by pointer order or by a random value is found the same

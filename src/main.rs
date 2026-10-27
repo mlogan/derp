@@ -561,15 +561,21 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
     if cli.given.contains(&"reseed") && cli.reseed_at.is_none() {
         return Err("--reseed needs --reseed-at: from when?".into());
     }
+    if cli.reseed_at.is_some() && !cli.given.contains(&"reseed") {
+        return Err("--reseed-at needs --reseed: starting over from which seed?".into());
+    }
+    if cli.native && cli.given.contains(&"mem-hook-rate") {
+        return Err("--mem-hook-rate does nothing with --native: nothing is rewritten".into());
+    }
     Ok(cli)
 }
 
 /// A program named without a slash is looked for as a shell would, in
 /// `PATH`, unless the current directory has it.
-fn find_program(name: &std::ffi::OsStr) -> PathBuf {
+fn find_program(name: &std::ffi::OsStr) -> Fallible<PathBuf> {
     let path = PathBuf::from(name);
     if path.components().count() > 1 || path.exists() {
-        return path;
+        return Ok(path);
     }
     std::env::var_os("PATH")
         .and_then(|dirs| {
@@ -577,7 +583,13 @@ fn find_program(name: &std::ffi::OsStr) -> PathBuf {
                 .map(|d| d.join(name))
                 .find(|p| p.is_file())
         })
-        .unwrap_or(path)
+        .ok_or_else(|| {
+            format!(
+                "{}: not in the current directory or in PATH",
+                path.display()
+            )
+            .into()
+        })
 }
 
 /// The rewritten copy of a program the user named. A file that was
@@ -681,6 +693,11 @@ const SCRATCH_MARKER: &str = ".rewrite-scratch";
 /// Create the run's scratch directory empty. An existing directory is
 /// only cleared if an earlier run of ours marked it.
 fn prepare_scratch(dir: &Path) -> Fallible<()> {
+    prepare_scratch_unnamed(dir)
+        .map_err(|e| format!("scratch directory {}: {e}", dir.display()).into())
+}
+
+fn prepare_scratch_unnamed(dir: &Path) -> Fallible<()> {
     if dir.exists() {
         let ours = dir.join(SCRATCH_MARKER).exists();
         if !ours && std::fs::read_dir(dir)?.next().is_some() {
@@ -788,11 +805,12 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
     let mut programs = Vec::new();
     for p in &m.processes {
         let prog = std::fs::canonicalize(base.join(&p.argv[0])).map_err(|e| {
+            let dir = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
             format!(
-                "host {}: {}: {e} (looked for {})",
+                "host {}: {}: {e} (looked for {}; program paths are relative to the run file)",
                 m.hosts[p.host as usize].name,
                 p.argv[0],
-                base.join(&p.argv[0]).display()
+                dir.join(&p.argv[0]).display()
             )
         })?;
         programs.push(if cli.native {
@@ -1133,7 +1151,7 @@ fn exit_from(outcome: &launch::Outcome) -> ExitCode {
 }
 
 fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
-    let prog = find_program(&rest[0]);
+    let prog = find_program(&rest[0])?;
     let rewritten = rewritten(&prog, &cli)?;
     let mut plain = Cli {
         supervisor: false,
@@ -1146,7 +1164,7 @@ fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
             let t = Instant::now();
             let o = run_guest(exe.to_path_buf(), plain, rest[1..].to_vec(), None)?;
             if o.exit_code() != Some(0) {
-                return Err(format!("{} failed", exe.display()).into());
+                return Err(format!("{} failed: {}", exe.display(), describe_status(&o)).into());
             }
             best = best.min(t.elapsed().as_secs_f64());
         }
@@ -1206,7 +1224,7 @@ fn show(o: &Observed) -> String {
 fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
     let scratch = scratch_dir(cli);
     let single = if cli.manifest.is_none() {
-        let exe = rewritten(&find_program(&rest[0]), cli)?;
+        let exe = rewritten(&find_program(&rest[0])?, cli)?;
         let out = std::env::temp_dir().join(format!("rewrite-repeat-{}", std::process::id()));
         Some((exe, out))
     } else {
@@ -1477,12 +1495,13 @@ fn main() -> ExitCode {
             })
         }
         Some("run") if !rest.is_empty() && cli.manifest.is_none() => {
-            let prog = find_program(&rest[0]);
-            let exe = if cli.native {
-                Ok(prog)
-            } else {
-                rewritten(&prog, &cli)
-            };
+            let exe = find_program(&rest[0]).and_then(|prog| {
+                if cli.native {
+                    Ok(prog)
+                } else {
+                    rewritten(&prog, &cli)
+                }
+            });
             exe.and_then(|exe| run_single(exe, &cli, rest[1..].to_vec()))
                 .map(|o| {
                     if cli.verbose {

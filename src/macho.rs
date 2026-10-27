@@ -64,8 +64,9 @@ impl fmt::Display for Error {
             // Read little-endian: a fat header is big-endian 0xcafebabe
             Error::BadMagic(0xbeba_feca) => write!(
                 f,
-                "a universal (fat) binary: make an arm64-only copy with \
-                 lipo -thin arm64 <prog> -output <copy>"
+                "a universal (fat) binary: if it has an arm64 slice (lipo -archs), make an \
+                 arm64-only copy with lipo -thin arm64 <prog> -output <copy>; Apple's own \
+                 system programs are arm64e and cannot run under derp"
             ),
             Error::BadMagic(m) if m & 0xffff == u32::from_le_bytes([b'#', b'!', 0, 0]) => {
                 write!(f, "a script: derp runs arm64 Mach-O programs")

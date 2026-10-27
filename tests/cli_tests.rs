@@ -44,7 +44,19 @@ fn mistakes_say_what_is_wrong() {
     let prog = prog.to_str().unwrap();
     let script = dir.join("script.sh");
     std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
-    let cases: [(&[&str], &str); 13] = [
+    let cases: [(&[&str], &str); 16] = [
+        (
+            &["run", "--native", "--mem-hook-rate", "1", prog],
+            "nothing is rewritten",
+        ),
+        (
+            &["run", "--reseed-at", "1ms", "--manifest", "x.yaml"],
+            "needs --reseed",
+        ),
+        (
+            &["run", "derp-no-such-program"],
+            "not in the current directory or in PATH",
+        ),
         (&["run", "-s", "3", prog], "unknown option -s"),
         (&["run", "--seed", "x", prog], "bad seed x (a whole number"),
         (&["run", "--wall-limit", "0s", prog], "bad wall-limit 0s"),

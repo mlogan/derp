@@ -61,6 +61,15 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Truncated(what) => write!(f, "file truncated while reading {what}"),
+            // Read little-endian: a fat header is big-endian 0xcafebabe
+            Error::BadMagic(0xbeba_feca) => write!(
+                f,
+                "a universal (fat) binary: make an arm64-only copy with \
+                 lipo -thin arm64 <prog> -output <copy>"
+            ),
+            Error::BadMagic(m) if m & 0xffff == u32::from_le_bytes([b'#', b'!', 0, 0]) => {
+                write!(f, "a script: derp runs arm64 Mach-O programs")
+            }
             Error::BadMagic(m) => write!(f, "not a 64-bit little-endian Mach-O (magic {m:#x})"),
             Error::NotArm64Executable => write!(f, "not an arm64 MH_EXECUTE image"),
             Error::MissingSegment(s) => write!(f, "no {s} segment"),

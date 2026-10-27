@@ -161,7 +161,7 @@ fn a_seed_that_passes_has_nothing_to_bisect() {
         &scratch,
         &manifest,
     );
-    assert!(String::from_utf8_lossy(&out.stderr).contains("needs futures"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("bad run count 0"));
 }
 
 /// The run bisected is the run `derp run` makes of the same file: the

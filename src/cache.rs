@@ -30,15 +30,21 @@ use crate::rewrite::{self as rw, Options};
 
 pub type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 
+/// An error about a file, with its name in front
+fn named(path: &Path, e: impl std::fmt::Display) -> String {
+    format!("{}: {e}", path.display())
+}
+
 pub fn write_exe(path: &Path, image: &[u8]) -> Fallible<()> {
-    std::fs::write(path, image)?;
+    std::fs::write(path, image).map_err(|e| named(path, e))?;
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
     macho::adhoc_sign(path)?;
     Ok(())
 }
 
 pub fn read_macho(path: &Path) -> Fallible<MachO> {
-    Ok(MachO::parse(std::fs::read(path)?)?)
+    let data = std::fs::read(path).map_err(|e| named(path, e))?;
+    Ok(MachO::parse(data).map_err(|e| named(path, e))?)
 }
 
 pub fn rewrite_file(input: &Path, output: &Path, opts: &Options) -> Fallible<rw::Stats> {

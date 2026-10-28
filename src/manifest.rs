@@ -63,13 +63,33 @@ impl Scalar {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 enum RawProcess {
     /// Split on whitespace; use the list form for arguments with spaces
     Line(String),
     Argv(Vec<Scalar>),
     Full(RawFull),
+}
+
+/// By the YAML node's shape rather than `untagged`, which would answer a
+/// mistyped key in the map form with "did not match any variant".
+impl<'de> Deserialize<'de> for RawProcess {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        use serde_yaml::Value;
+        let v = Value::deserialize(d)?;
+        match v {
+            Value::String(line) => Ok(RawProcess::Line(line)),
+            Value::Sequence(_) => serde_yaml::from_value(v).map(RawProcess::Argv),
+            Value::Mapping(_) => serde_yaml::from_value(v).map(RawProcess::Full),
+            _ => {
+                return Err(D::Error::custom(
+                    "a process is a line, a list (argv) or a map with argv:",
+                ))
+            }
+        }
+        .map_err(D::Error::custom)
+    }
 }
 
 /// Its own struct so that a mistyped key is an error: `deamon: true` must
@@ -99,11 +119,27 @@ struct RawCrash {
 }
 
 /// `pause: off`, or how often and how long
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
+#[derive(Debug)]
 enum RawPause {
     Off(String),
     Full(RawPauseFull),
+}
+
+/// By shape, like `RawProcess`
+impl<'de> Deserialize<'de> for RawPause {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        use serde_yaml::Value;
+        let v = Value::deserialize(d)?;
+        match v {
+            Value::Mapping(_) => serde_yaml::from_value(v)
+                .map(RawPause::Full)
+                .map_err(D::Error::custom),
+            _ => Scalar::deserialize(v)
+                .map(|s| RawPause::Off(s.text()))
+                .map_err(D::Error::custom),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,12 +255,16 @@ pub fn parse_size(s: &str) -> Option<u64> {
     ((64 << 20)..=(4 << 40)).contains(&bytes).then_some(bytes)
 }
 
+/// How a duration is written, for error messages
+pub const DURATION_FORMAT: &str =
+    "a whole number with ns, us, ms or s, such as 250us; a bare number is milliseconds";
+
 /// `5ms`, `250us`, `10ns`, `1s`; a bare number is milliseconds.
 pub fn parse_duration_ns(s: &str) -> Option<u64> {
-    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic());
+    let digits = s.trim_end_matches(|c: char| c.is_ascii_alphabetic() || c == 'µ');
     let scale = match &s[digits.len()..] {
         "ns" => 1,
-        "us" => 1_000,
+        "us" | "µs" => 1_000,
         "" | "ms" => 1_000_000,
         "s" => 1_000_000_000,
         _ => return None,
@@ -810,6 +850,16 @@ hosts:
     fn errors_say_what_is_wrong() {
         let err = |text: &str| parse(text).unwrap_err();
         assert!(err("hosts: [{name: a}]").contains("no processes"));
+        let process = |p: &str| err(&format!("hosts: [{{name: a, processes: [{p}]}}]"));
+        assert!(process("{argv: [p], deamon: true}").contains("unknown field `deamon`"));
+        assert!(process("{argv: [p], crash: {evry: 1s}}").contains("unknown field `evry`"));
+        assert!(process("{argv: [p], crash: {times: 2}}").contains("missing field `every`"));
+        assert!(process("{env: {A: b}}").contains("missing field `argv`"));
+        assert!(process("7").contains("a line, a list"));
+        assert!(
+            err("pause: {chanse: 1/2}\nhosts: [{name: a, processes: [p]}]")
+                .contains("unknown field `chanse`")
+        );
         assert!(
             err("hosts: [{name: a, processes: [p]}, {name: a, processes: [p]}]")
                 .contains("declared twice")

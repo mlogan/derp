@@ -190,8 +190,12 @@ pub fn timeout_after(took: Duration) -> Duration {
 
 /// Virtual nanoseconds as milliseconds, for people
 #[must_use]
+/// Milliseconds, with as many decimals as it takes to show the
+/// nanoseconds, but at least three
 pub fn ms(ns: u64) -> String {
-    format!("{}.{:03} ms", ns / 1_000_000, ns / 1000 % 1000)
+    let fraction = format!("{:06}", ns % 1_000_000);
+    let fraction = fraction.trim_end_matches('0');
+    format!("{}.{fraction:0<3} ms", ns / 1_000_000)
 }
 
 /// Lines of a schedule trace as (clock, line)
@@ -207,4 +211,17 @@ pub fn trace_lines(path: &Path) -> Vec<(u64, String)> {
             ))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ms;
+
+    #[test]
+    fn ms_shows_what_tells_two_times_apart() {
+        assert_eq!(ms(12_000_000), "12.000 ms");
+        assert_eq!(ms(38_000), "0.038 ms");
+        assert_eq!(ms(38_250), "0.03825 ms");
+        assert_eq!(ms(1), "0.000001 ms");
+    }
 }

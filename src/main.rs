@@ -5,14 +5,14 @@ use std::time::Instant;
 
 use rewrite::cache::{cached_rewrite, read_macho, rewrite_file, write_exe, Fallible};
 use rewrite::launch::{self, Guest, Launch, Run, RunOutcome};
-use rewrite::manifest::{self, parse_duration_ns};
+use rewrite::manifest::{self, parse_duration_ns, DURATION_FORMAT};
 use rewrite::rewrite::{self as rw, Options};
 
 const USAGE: &str = "\
 usage:
   derp copy <in> <out>                 round-trip a binary through the writer and re-sign it
   derp scan [opts] <prog>              print what the rewriter would hook
-  derp rewrite [opts] <in> <out>       rewrite and sign
+  derp rewrite [opts] <in> <out>       rewrite and sign; the output runs only under derp run
   derp run [opts] <prog> [args…]       rewrite (cached), then launch under the supervisor
   derp bench [opts] <prog> [args…]     time native vs rewritten (no supervisor)
   derp repeat [opts] <prog> [args…]    run N times; exit status, stdout and schedule hash must agree
@@ -30,10 +30,13 @@ usage:
                                        rooms for them in its text (README, Big programs)
   derp cc <linker args…>               the linker driver `derp cargo` installs
   derp rooms <prog>                    the rooms `derp cc` would give <prog>, and why
-options:
+  derp --help | --version
+options (before the program; -- ends them). Times are written 5ms, 250us, 10ns or 1s; a
+bare number is milliseconds. An option the command would not use is refused.
   -v, --verbose                        run, rewrite: say what was rewritten and print the
                                        run's report (key=value lines) on stderr
-  --runs N                             repetitions for repeat (default 100)
+  --runs N                             repeat: repetitions (default 100); bisect: futures
+                                       per probe (default 20)
   --seed S                             run seed (default 0)
   --mem-hook-rate R                    0, 1 or a fraction like 1/16 (default 0)
   --quantum LO..HI                     hook events per quantum (default 1000..10000)
@@ -52,16 +55,18 @@ options:
   --native                             run the original binary without the dylib
   --manifest FILE                      run file (YAML): hosts and their processes
   --scratch DIR                        where a run file's host directories are made, fresh
-                                       (default: a directory under the system temp dir)
+                                       (default: a directory under the system temp dir,
+                                       removed after the run unless output was captured)
   --capture                            manifest run: each guest's stdout goes to stdout.<index>
                                        in the scratch directory instead of ours
   --capture-stderr                     and its stderr to stderr.<index>, with the supervisor's
                                        messages about it
-  --net-latency T                      virtual-time delay between different hosts, such as
-                                       5ms, 250us or 1s (default 0)
-  --switch-cost T                      virtual time each baton hand-off costs (default 10us)
-  --pause N/M                          pause the thread a scheduling choice picks with this
-                                       chance, while another can run (default 1/200; off)
+  --net-latency T                      run file: virtual-time delay between different hosts
+                                       (default 0)
+  --switch-cost T                      run file: virtual time each baton hand-off costs
+                                       (default 10us)
+  --pause N/M|off                      pause the thread a scheduling choice picks with this
+                                       chance, while another can run (default 1/200)
   --pause-for LO..HI                   how long, drawn log-uniformly (default 10us..100ms)
   --scheduler random|pct               how the next thread is chosen (default random)
   --pct-depth D                        PCT: D-1 priority change points (default 3)
@@ -98,7 +103,17 @@ run file:
         - client alpha 8080            or a line, split on whitespace
         - argv: [worker]               or a map, with an environment
           env: { MODE: fast }
+          daemon: true                 never exits: killed when the others are done
+          restart: on-failure          never (default), on-failure or always
+          restart-delay: 50ms..150ms
+          max-restarts: 10
+          crash: { every: 100ms..300ms, times: 3 }
+          shutdown: { every: 2s..10s, times: 3, signal: TERM, grace: 5s }
+  outside-network: refuse              or allow: lookups and connections beyond the hosts
+  allow: [/opt/site-content]           paths outside its directory every host may touch
   Program paths are relative to the run file. See README.md.
+exit status: the program's (a run file's first failing entry's); 128+N if a guest was
+killed by signal N; 2 for derp's own errors.
 ";
 
 fn fail(msg: impl std::fmt::Display) -> ExitCode {
@@ -137,6 +152,7 @@ struct Cli {
     native: bool,
     runs: u32,
     verbose: bool,
+    help: bool,
     rest: Vec<OsString>,
 }
 
@@ -144,7 +160,32 @@ fn parse_quantum(v: &str) -> Result<(u32, u32), String> {
     v.split_once("..")
         .and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))
         .filter(|&(lo, hi): &(u32, u32)| lo >= 1 && hi >= lo)
-        .ok_or(format!("bad quantum {v}"))
+        .ok_or(format!(
+            "bad quantum {v} (LO..HI, hook events, such as 1000..10000)"
+        ))
+}
+
+fn parse_rate(v: &str) -> Result<(u32, u32), String> {
+    rw::parse_rate(v).ok_or(format!(
+        "bad mem-hook rate {v} (0, 1 or a fraction N/M, such as 1/16)"
+    ))
+}
+
+fn parse_heap_size(v: &str) -> Result<u64, String> {
+    manifest::parse_size(v).ok_or(format!(
+        "bad heap size {v} (64M to 4T, with K, M, G or T, such as 32G)"
+    ))
+}
+
+fn parse_duration(what: &str, v: &str) -> Result<u64, String> {
+    parse_duration_ns(v).ok_or(format!("bad {what} {v} ({DURATION_FORMAT})"))
+}
+
+fn parse_count(what: &str, v: &str) -> Result<u32, String> {
+    v.parse()
+        .ok()
+        .filter(|&n| n > 0)
+        .ok_or(format!("bad {what} {v} (a whole number above zero)"))
 }
 
 /// At least a microsecond: a lone thread that computes without reading the
@@ -152,7 +193,9 @@ fn parse_quantum(v: &str) -> Result<(u32, u32), String> {
 fn parse_switch_cost(v: &str) -> Result<u64, String> {
     parse_duration_ns(v)
         .filter(|&ns| ns >= 1_000)
-        .ok_or(format!("bad switch cost {v} (at least 1us)"))
+        .ok_or(format!(
+            "bad switch cost {v} (at least 1us; {DURATION_FORMAT})"
+        ))
 }
 
 /// The run's settings: the run file's, unless the command line gave them.
@@ -166,10 +209,10 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
         cli.quantum = parse_quantum(q)?;
     }
     if let (Some(r), true) = (&m.mem_hook_rate, from_file("mem-hook-rate")) {
-        cli.opts.mem_rate = rw::parse_rate(r).ok_or(format!("bad rate {r}"))?;
+        cli.opts.mem_rate = parse_rate(r)?;
     }
     if let (Some(l), true) = (&m.net_latency, from_file("net-latency")) {
-        cli.net_latency_ns = parse_duration_ns(l).ok_or(format!("bad duration {l}"))?;
+        cli.net_latency_ns = parse_duration("net latency", l)?;
     }
     if let (Some(c), true) = (&m.switch_cost, from_file("switch-cost")) {
         cli.switch_ns = parse_switch_cost(c)?;
@@ -193,16 +236,16 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
         cli.scheduler.pct_starve_ns = parse_positive("pct starve", t)?;
     }
     if let (Some(h), true) = (&m.heap_size, from_file("heap-size")) {
-        cli.heap_size = manifest::parse_size(h).ok_or(format!("bad heap size {h}"))?;
+        cli.heap_size = parse_heap_size(h)?;
     }
     if let (Some(r), true) = (&m.heap_release, from_file("heap-release")) {
         cli.heap_release = parse_on_off("heap release", r)?;
     }
     if let (Some(t), true) = (&m.stop_after, from_file("stop-after")) {
-        cli.stop_after_ns = parse_stop_after(t)?;
+        cli.stop_after_ns = parse_positive("stop-after", t)?;
     }
     if let (Some(t), true) = (&m.wall_limit, from_file("wall-limit")) {
-        cli.wall_limit_ms = parse_stop_after(t)? / 1_000_000;
+        cli.wall_limit_ms = parse_positive("wall-limit", t)? / 1_000_000;
     }
     if m.pause_chance.is_some() {
         // Asked for: a run without the scheduler refuses it
@@ -234,7 +277,7 @@ fn parse_pct_depth(v: &str) -> Result<u32, String> {
 }
 
 fn parse_positive(what: &str, v: &str) -> Result<u64, String> {
-    manifest::parse_positive(v).ok_or(format!("bad {what} {v}"))
+    manifest::parse_positive(v).ok_or(format!("bad {what} {v} (above zero; {DURATION_FORMAT})"))
 }
 
 /// PCT's change points need a span of virtual time to fall in: its own,
@@ -267,13 +310,130 @@ fn parse_chance(v: &str) -> Result<(u32, u32), String> {
 }
 
 fn parse_pause_for(v: &str) -> Result<(u64, u64), String> {
-    manifest::parse_pause_for(v).ok_or(format!("bad pause length {v} (a range above zero)"))
+    manifest::parse_pause_for(v).ok_or(format!(
+        "bad pause length {v} (LO..HI or one duration, above zero, such as 10us..100ms)"
+    ))
 }
 
-fn parse_stop_after(v: &str) -> Result<u64, String> {
-    match parse_duration_ns(v) {
-        Some(0) | None => Err(format!("bad stop-after time {v}")),
-        Some(ns) => Ok(ns),
+/// Every option, by its long name without the dashes
+const OPTIONS: [&str; 28] = [
+    "seed",
+    "mem-hook-rate",
+    "quantum",
+    "manifest",
+    "scratch",
+    "capture",
+    "capture-stderr",
+    "net-latency",
+    "switch-cost",
+    "pause",
+    "pause-for",
+    "scheduler",
+    "pct-depth",
+    "pct-horizon",
+    "pct-starve",
+    "heap-size",
+    "heap-release",
+    "wall-limit",
+    "stop-after",
+    "reseed-at",
+    "jobs",
+    "resolution",
+    "reseed",
+    "no-supervisor",
+    "aslr",
+    "native",
+    "verbose",
+    "runs",
+];
+
+fn option_name(name: &str) -> &'static str {
+    OPTIONS.iter().find(|&&o| o == name).copied().unwrap_or("")
+}
+
+/// Settings that only the supervisor carries out are refused without it,
+/// rather than quietly dropped.
+fn check_supervised(cli: &Cli, has_faults: bool) -> Result<(), String> {
+    if cli.supervisor && !cli.native {
+        return Ok(());
+    }
+    if cli.stop_after_ns != 0 {
+        return Err(
+            "stop-after needs the supervisor: it is a virtual time (--wall-limit is a real one)"
+                .into(),
+        );
+    }
+    if pauses_of(cli).num != 0 || cli.scheduler.kind != rewrite::shared::SCHED_RANDOM {
+        return Err(
+            "pauses and the PCT scheduler need the supervisor: it makes the schedule".into(),
+        );
+    }
+    if has_faults {
+        return Err("crash, shutdown and restart settings need the supervisor".into());
+    }
+    Ok(())
+}
+
+/// Whether `cmd` acts on option `o`, given whether it runs a run file.
+/// An option a command would ignore is refused instead.
+fn takes_option(cmd: &str, run_file: bool, o: &str) -> bool {
+    let runs = matches!(cmd, "run" | "repeat");
+    let replays = matches!(cmd, "bisect" | "suspects");
+    match o {
+        "verbose" => true,
+        "seed" | "mem-hook-rate" => !matches!(cmd, "copy" | "rooms"),
+        "manifest" => runs || replays,
+        "quantum" | "pause" | "pause-for" | "scheduler" | "pct-depth" | "pct-horizon"
+        | "pct-starve" | "heap-size" | "heap-release" | "stop-after" => runs || replays,
+        "wall-limit" | "no-supervisor" | "aslr" | "native" => runs,
+        "scratch" | "net-latency" | "switch-cost" => run_file && (runs || replays),
+        "capture" | "capture-stderr" | "reseed-at" | "reseed" => run_file && runs,
+        "jobs" => replays,
+        "resolution" => cmd == "bisect",
+        "runs" => matches!(cmd, "repeat" | "bisect"),
+        _ => false,
+    }
+}
+
+const COMMANDS: [&str; 9] = [
+    "copy", "scan", "rewrite", "run", "bench", "repeat", "bisect", "suspects", "rooms",
+];
+
+fn check_options(cmd: &str, cli: &Cli) -> Result<(), String> {
+    let run_file = cli.manifest.is_some();
+    for &o in &cli.given {
+        if !takes_option(cmd, run_file, o) {
+            let without = if takes_option(cmd, true, o) {
+                " without a run file (--manifest)"
+            } else {
+                ""
+            };
+            return Err(format!("--{o} does nothing for derp {cmd}{without}"));
+        }
+    }
+    Ok(())
+}
+
+/// What a command was missing or given too much of, when its arguments do
+/// not fit it.
+fn shape_error(cmd: &str, cli: &Cli) -> String {
+    let (n, run_file) = (cli.rest.len(), cli.manifest.is_some());
+    match cmd {
+        "copy" | "rewrite" => format!("{cmd} takes an input and an output file, not {n}"),
+        "scan" | "rooms" => format!("{cmd} takes one program, not {n}"),
+        "bench" => "bench takes a program and its arguments".into(),
+        "run" | "repeat" if run_file => format!(
+            "{cmd} takes a program or --manifest FILE, not both: \
+             the run file names its programs"
+        ),
+        "run" | "repeat" => format!("{cmd} needs a program, or --manifest FILE"),
+        "bisect" | "suspects" if run_file => {
+            format!("{cmd} takes no program: the run file names them")
+        }
+        "bisect" | "suspects" => {
+            format!("{cmd} replays a failing run file: give --manifest FILE and its --seed")
+        }
+        _ => format!("unknown command {cmd} (derp --help lists them)"),
     }
 }
 
@@ -303,6 +463,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         native: false,
         runs: 100,
         verbose: false,
+        help: false,
         rest: Vec::new(),
     };
     while let Some(a) = args.first().and_then(|a| a.to_str()).map(str::to_owned) {
@@ -315,111 +476,145 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         };
         match a.as_str() {
             "--seed" => {
-                cli.opts.seed = take_value(&mut args)?.parse().map_err(|_| "bad seed")?;
-                cli.given.push("seed");
-            }
-            "--mem-hook-rate" => {
                 let v = take_value(&mut args)?;
-                cli.opts.mem_rate = rw::parse_rate(&v).ok_or(format!("bad rate {v}"))?;
-                cli.given.push("mem-hook-rate");
+                cli.opts.seed = v
+                    .parse()
+                    .map_err(|_| format!("bad seed {v} (a whole number from 0 to {})", u64::MAX))?;
             }
-            "--quantum" => {
-                cli.quantum = parse_quantum(&take_value(&mut args)?)?;
-                cli.given.push("quantum");
-            }
+            "--mem-hook-rate" => cli.opts.mem_rate = parse_rate(&take_value(&mut args)?)?,
+            "--quantum" => cli.quantum = parse_quantum(&take_value(&mut args)?)?,
             "--manifest" => cli.manifest = Some(take_value(&mut args)?.into()),
             "--scratch" => cli.scratch = Some(take_value(&mut args)?.into()),
             "--capture" => cli.capture = true,
             "--capture-stderr" => cli.capture_stderr = true,
             "--net-latency" => {
-                let v = take_value(&mut args)?;
-                cli.net_latency_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
-                cli.given.push("net-latency");
+                cli.net_latency_ns = parse_duration("net latency", &take_value(&mut args)?)?;
             }
-            "--switch-cost" => {
-                cli.switch_ns = parse_switch_cost(&take_value(&mut args)?)?;
-                cli.given.push("switch-cost");
-            }
+            "--switch-cost" => cli.switch_ns = parse_switch_cost(&take_value(&mut args)?)?,
             "--pause" => {
                 (cli.pauses.num, cli.pauses.den) = parse_chance(&take_value(&mut args)?)?;
-                cli.given.push("pause");
             }
             "--pause-for" => {
                 (cli.pauses.lo_ns, cli.pauses.hi_ns) = parse_pause_for(&take_value(&mut args)?)?;
-                cli.given.push("pause-for");
             }
-            "--scheduler" => {
-                cli.scheduler.kind = parse_scheduler(&take_value(&mut args)?)?;
-                cli.given.push("scheduler");
-            }
-            "--pct-depth" => {
-                cli.scheduler.pct_depth = parse_pct_depth(&take_value(&mut args)?)?;
-                cli.given.push("pct-depth");
-            }
+            "--scheduler" => cli.scheduler.kind = parse_scheduler(&take_value(&mut args)?)?,
+            "--pct-depth" => cli.scheduler.pct_depth = parse_pct_depth(&take_value(&mut args)?)?,
             "--pct-horizon" => {
                 let v = take_value(&mut args)?;
                 cli.scheduler.pct_horizon_ns = parse_positive("pct horizon", &v)?;
-                cli.given.push("pct-horizon");
             }
             "--pct-starve" => {
                 let v = take_value(&mut args)?;
                 cli.scheduler.pct_starve_ns = parse_positive("pct starve", &v)?;
-                cli.given.push("pct-starve");
             }
-            "--heap-size" => {
-                let v = take_value(&mut args)?;
-                cli.heap_size = manifest::parse_size(&v).ok_or(format!("bad heap size {v}"))?;
-                cli.given.push("heap-size");
-            }
+            "--heap-size" => cli.heap_size = parse_heap_size(&take_value(&mut args)?)?,
             "--heap-release" => {
                 cli.heap_release = parse_on_off("heap release", &take_value(&mut args)?)?;
-                cli.given.push("heap-release");
             }
             "--wall-limit" => {
-                cli.wall_limit_ms = parse_stop_after(&take_value(&mut args)?)? / 1_000_000;
-                cli.given.push("wall-limit");
+                cli.wall_limit_ms =
+                    parse_positive("wall-limit", &take_value(&mut args)?)? / 1_000_000;
             }
             "--stop-after" => {
-                cli.stop_after_ns = parse_stop_after(&take_value(&mut args)?)?;
-                cli.given.push("stop-after");
+                cli.stop_after_ns = parse_positive("stop-after", &take_value(&mut args)?)?;
             }
             "--reseed-at" => {
-                let v = take_value(&mut args)?;
-                cli.reseed_at = Some(parse_duration_ns(&v).ok_or(format!("bad time {v}"))?);
+                cli.reseed_at = Some(parse_duration("reseed time", &take_value(&mut args)?)?);
             }
-            "--jobs" => {
-                cli.jobs = take_value(&mut args)?
-                    .parse()
-                    .map_err(|_| "bad job count")?;
-            }
+            "--jobs" => cli.jobs = parse_count("job count", &take_value(&mut args)?)?,
             "--resolution" => {
-                let v = take_value(&mut args)?;
-                cli.resolution_ns = parse_duration_ns(&v).ok_or(format!("bad duration {v}"))?;
+                cli.resolution_ns = parse_positive("resolution", &take_value(&mut args)?)?;
             }
             "--reseed" => {
-                cli.reseed = take_value(&mut args)?
+                let v = take_value(&mut args)?;
+                cli.reseed = v
                     .parse()
-                    .map_err(|_| "bad reseed value")?;
-                cli.given.push("reseed");
+                    .map_err(|_| format!("bad reseed value {v} (a seed: a whole number)"))?;
             }
             "--no-supervisor" => cli.supervisor = false,
             "--aslr" => cli.disable_aslr = false,
             "--native" => cli.native = true,
             "-v" | "--verbose" => cli.verbose = true,
-            "--runs" => {
-                cli.runs = take_value(&mut args)?.parse().map_err(|_| "bad --runs")?;
-                cli.given.push("runs");
+            "--runs" => cli.runs = parse_count("run count", &take_value(&mut args)?)?,
+            "-h" | "--help" => {
+                cli.help = true;
+                break;
             }
-            _ if a.starts_with("--") => return Err(format!("unknown option {a}")),
+            "--" => {
+                args.remove(0);
+                break;
+            }
+            _ if a.starts_with('-') && a.len() > 1 => {
+                return Err(format!("unknown option {a} (derp --help lists them)"))
+            }
             _ => break,
         }
+        let name = a.trim_start_matches('-');
+        cli.given.push(if name == "v" {
+            "verbose"
+        } else {
+            option_name(name)
+        });
         args.remove(0);
     }
     cli.rest = args;
     if cli.given.contains(&"reseed") && cli.reseed_at.is_none() {
         return Err("--reseed needs --reseed-at: from when?".into());
     }
+    if cli.reseed_at.is_some() && !cli.given.contains(&"reseed") {
+        return Err("--reseed-at needs --reseed: starting over from which seed?".into());
+    }
+    if cli.native && cli.given.contains(&"mem-hook-rate") {
+        return Err("--mem-hook-rate does nothing with --native: nothing is rewritten".into());
+    }
     Ok(cli)
+}
+
+/// A program named without a slash is looked for as a shell would, in
+/// `PATH`, unless the current directory has it.
+fn find_program(name: &std::ffi::OsStr) -> Fallible<PathBuf> {
+    let path = PathBuf::from(name);
+    if path.components().count() > 1 || path.exists() {
+        return Ok(path);
+    }
+    std::env::var_os("PATH")
+        .and_then(|dirs| {
+            std::env::split_paths(&dirs)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        })
+        .ok_or_else(|| {
+            format!(
+                "{}: not in the current directory or in PATH",
+                path.display()
+            )
+            .into()
+        })
+}
+
+/// The rewritten copy of a program the user named. A file that was
+/// rewritten already runs as it is, with the hooks it was made with.
+fn rewritten(prog: &Path, cli: &Cli) -> Fallible<PathBuf> {
+    let exe = cached_rewrite(prog, &cli.opts)?;
+    if exe == prog && cli.given.contains(&"mem-hook-rate") {
+        eprintln!(
+            "derp: warning: {} is already rewritten, so --mem-hook-rate does not change \
+             its hooks: name the original program",
+            prog.display()
+        );
+    }
+    Ok(exe)
+}
+
+fn read_run_file(path: &Path) -> Result<String, String> {
+    std::fs::read_to_string(path).map_err(|e| format!("run file {}: {e}", path.display()))
+}
+
+fn same_file(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn copy(input: &Path, output: &Path) -> Fallible<()> {
@@ -436,14 +631,14 @@ fn dylib_for(cli: &Cli) -> Fallible<Option<PathBuf>> {
         .ok_or_else(|| "supervisor dylib not found next to the derp binary".into())
 }
 
-fn run_guest(
+fn single_launch(
     exe: PathBuf,
     cli: &Cli,
     args: Vec<OsString>,
-    quiet: bool,
     stdout: Option<PathBuf>,
-) -> Fallible<launch::Outcome> {
-    let cfg = Launch {
+) -> Fallible<Launch> {
+    check_supervised(cli, false)?;
+    Ok(Launch {
         exe,
         args,
         dylib: dylib_for(cli)?,
@@ -460,12 +655,35 @@ fn run_guest(
         wall_limit_ms: cli.wall_limit_ms,
         passive: !cli.supervisor,
         rewrite: (!cli.native).then(|| cli.opts.clone()),
-    };
-    let outcome = launch::launch(&cfg)?;
-    if !quiet {
-        for (k, v) in &outcome.report.fields {
-            eprintln!("{k}={v}");
-        }
+    })
+}
+
+fn run_guest(
+    exe: PathBuf,
+    cli: &Cli,
+    args: Vec<OsString>,
+    stdout: Option<PathBuf>,
+) -> Fallible<launch::Outcome> {
+    Ok(launch::launch(&single_launch(exe, cli, args, stdout)?)?)
+}
+
+/// One program as a run of its own, reported as a run file's would be.
+fn run_single(exe: PathBuf, cli: &Cli, args: Vec<OsString>) -> Fallible<RunOutcome> {
+    let run = Run::single(&single_launch(exe, cli, args, None)?);
+    finished(launch::launch_run(&run)?)
+}
+
+/// What every run checks of its outcome before reporting it
+fn finished(outcome: RunOutcome) -> Fallible<RunOutcome> {
+    if outcome.totals.restarts_refused > 0 {
+        return Err(format!(
+            "the run's process table is full: {} restarts were not made",
+            outcome.totals.restarts_refused
+        )
+        .into());
+    }
+    if outcome.deadlock {
+        return Err("deadlock: every guest thread was blocked; the run was killed".into());
     }
     Ok(outcome)
 }
@@ -475,6 +693,11 @@ const SCRATCH_MARKER: &str = ".rewrite-scratch";
 /// Create the run's scratch directory empty. An existing directory is
 /// only cleared if an earlier run of ours marked it.
 fn prepare_scratch(dir: &Path) -> Fallible<()> {
+    prepare_scratch_unnamed(dir)
+        .map_err(|e| format!("scratch directory {}: {e}", dir.display()).into())
+}
+
+fn prepare_scratch_unnamed(dir: &Path) -> Fallible<()> {
     if dir.exists() {
         let ours = dir.join(SCRATCH_MARKER).exists();
         if !ours && std::fs::read_dir(dir)?.next().is_some() {
@@ -524,6 +747,20 @@ fn layered(layers: &[&[(String, String)]]) -> Vec<(String, String)> {
     out
 }
 
+/// The default scratch directory is the run's alone: removed when it is
+/// over, unless it holds captured output, which is then pointed at.
+fn leave_scratch(cli: &Cli, captured: bool) {
+    if cli.scratch.is_some() {
+        return;
+    }
+    let dir = scratch_dir(cli);
+    if captured && dir.exists() {
+        eprintln!("derp: captured output is in {}", dir.display());
+    } else {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 fn stdout_file(scratch: &Path, index: usize) -> PathBuf {
     scratch.join(format!("stdout.{index}"))
 }
@@ -560,19 +797,26 @@ fn allowed_paths(base: &Path, allow: &[String]) -> Fallible<Vec<String>> {
 /// Start the manifest's processes under one scheduler. With `capture`,
 /// each guest's stdout goes to `stdout.<index>` in the scratch directory.
 fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallible<RunOutcome> {
-    let m = manifest::parse(&std::fs::read_to_string(path)?)?;
+    let m = manifest::parse(&read_run_file(path)?)?;
     let cli = &with_run_file_settings(cli, &m)?;
     let base = path.parent().unwrap_or(Path::new("."));
     // Programs first: a run file that names a missing one should fail
     // before anything is created.
     let mut programs = Vec::new();
     for p in &m.processes {
-        let prog = std::fs::canonicalize(base.join(&p.argv[0]))
-            .map_err(|e| format!("{}: {e}", p.argv[0]))?;
+        let prog = std::fs::canonicalize(base.join(&p.argv[0])).map_err(|e| {
+            let dir = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+            format!(
+                "host {}: {}: {e} (looked for {}; program paths are relative to the run file)",
+                m.hosts[p.host as usize].name,
+                p.argv[0],
+                dir.join(&p.argv[0]).display()
+            )
+        })?;
         programs.push(if cli.native {
             prog
         } else {
-            cached_rewrite(&prog, &cli.opts)?
+            rewritten(&prog, cli)?
         });
     }
     let allow = allowed_paths(base, &m.allow)?;
@@ -643,36 +887,19 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         wall_limit_ms: cli.wall_limit_ms,
         outside_network: m.outside_network,
     };
-    if run.stop_at_ns != 0 && (run.passive || run.dylib.is_none()) {
-        return Err("stop-after needs the supervisor: it is a virtual time".into());
-    }
-    if (run.pauses.num != 0 || run.scheduler.kind != rewrite::shared::SCHED_RANDOM)
-        && (run.passive || run.dylib.is_none())
-    {
-        return Err(
-            "pauses and the PCT scheduler need the supervisor: it makes the schedule".into(),
-        );
-    }
     let has_faults = run.guests.iter().any(|g| {
         g.faults.restart != rewrite::shared::RESTART_NEVER
             || g.faults.crash_hi_ns != 0
             || g.faults.shutdown_hi_ns != 0
     });
-    if has_faults && (run.passive || run.dylib.is_none()) {
-        return Err("crash, shutdown and restart settings need the supervisor".into());
+    check_supervised(cli, has_faults)?;
+    if (run.passive || run.dylib.is_none()) && m.hosts.len() > 1 {
+        eprintln!(
+            "derp: warning: without the supervisor there is no virtual network: \
+             host names do not resolve and every host is this machine"
+        );
     }
-    let outcome = launch::launch_run(&run)?;
-    if outcome.totals.restarts_refused > 0 {
-        return Err(format!(
-            "the run's process table is full: {} restarts were not made",
-            outcome.totals.restarts_refused
-        )
-        .into());
-    }
-    if outcome.deadlock {
-        return Err("deadlock: every guest thread was blocked; the run was killed".into());
-    }
-    Ok(outcome)
+    finished(launch::launch_run(&run)?)
 }
 
 /// Fields every guest reports but that describe the whole run
@@ -782,7 +1009,7 @@ fn replay_of(
         .into());
     }
     let path = cli.manifest.clone().unwrap();
-    let m = manifest::parse(&std::fs::read_to_string(&path)?)?;
+    let m = manifest::parse(&read_run_file(&path)?)?;
     let cli = with_run_file_settings(cli, &m)?;
     let mut pass = vec![
         "--seed".to_string(),
@@ -888,18 +1115,44 @@ fn bisect(cli: &Cli) -> Fallible<()> {
     Ok(())
 }
 
+fn signal_name(s: i32) -> &'static str {
+    match s {
+        libc::SIGHUP => "SIGHUP",
+        libc::SIGINT => "SIGINT",
+        libc::SIGQUIT => "SIGQUIT",
+        libc::SIGILL => "SIGILL",
+        libc::SIGTRAP => "SIGTRAP",
+        libc::SIGABRT => "SIGABRT",
+        libc::SIGFPE => "SIGFPE",
+        libc::SIGKILL => "SIGKILL",
+        libc::SIGBUS => "SIGBUS",
+        libc::SIGSEGV => "SIGSEGV",
+        libc::SIGSYS => "SIGSYS",
+        libc::SIGPIPE => "SIGPIPE",
+        libc::SIGALRM => "SIGALRM",
+        libc::SIGTERM => "SIGTERM",
+        libc::SIGUSR1 => "SIGUSR1",
+        libc::SIGUSR2 => "SIGUSR2",
+        _ => "?",
+    }
+}
+
 fn exit_from(outcome: &launch::Outcome) -> ExitCode {
     match (outcome.stopped, outcome.exit_code(), outcome.signal()) {
         (true, ..) => ExitCode::SUCCESS,
         (_, Some(c), _) => ExitCode::from(c as u8),
-        (_, None, Some(s)) => fail(format!("guest killed by signal {s}")),
+        // As a shell reports it, apart from derp's own errors (2)
+        (_, None, Some(s)) => {
+            eprintln!("derp: guest killed by signal {s} ({})", signal_name(s));
+            ExitCode::from(128 + (s as u8 & 0x7f))
+        }
         _ => fail("guest ended abnormally"),
     }
 }
 
 fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
-    let prog = PathBuf::from(&rest[0]);
-    let rewritten = cached_rewrite(&prog, &cli.opts)?;
+    let prog = find_program(&rest[0])?;
+    let rewritten = rewritten(&prog, &cli)?;
     let mut plain = Cli {
         supervisor: false,
         native: true,
@@ -909,9 +1162,9 @@ fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
         let mut best = f64::INFINITY;
         for _ in 0..3 {
             let t = Instant::now();
-            let o = run_guest(exe.to_path_buf(), plain, rest[1..].to_vec(), true, None)?;
+            let o = run_guest(exe.to_path_buf(), plain, rest[1..].to_vec(), None)?;
             if o.exit_code() != Some(0) {
-                return Err(format!("{} failed", exe.display()).into());
+                return Err(format!("{} failed: {}", exe.display(), describe_status(&o)).into());
             }
             best = best.min(t.elapsed().as_secs_f64());
         }
@@ -938,7 +1191,6 @@ fn observe_single(cli: &Cli, exe: &Path, args: &[OsString], out: &Path) -> Falli
         exe.to_path_buf(),
         cli,
         args.to_vec(),
-        true,
         Some(out.to_path_buf()),
     )?;
     let text = std::fs::read_to_string(out).unwrap_or_default();
@@ -972,7 +1224,7 @@ fn show(o: &Observed) -> String {
 fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
     let scratch = scratch_dir(cli);
     let single = if cli.manifest.is_none() {
-        let exe = cached_rewrite(Path::new(&rest[0]), &cli.opts)?;
+        let exe = rewritten(&find_program(&rest[0])?, cli)?;
         let out = std::env::temp_dir().join(format!("rewrite-repeat-{}", std::process::id()));
         Some((exe, out))
     } else {
@@ -1001,6 +1253,7 @@ fn repeat(cli: &Cli, rest: &[OsString]) -> Fallible<()> {
     if let Some((_, out)) = &single {
         let _ = std::fs::remove_file(out);
     }
+    leave_scratch(cli, false);
     if result.is_ok() {
         println!("{} runs identical", cli.runs);
     }
@@ -1175,6 +1428,17 @@ fn main() -> ExitCode {
         return fail(USAGE);
     }
     let cmd = args.remove(0);
+    match cmd.to_str() {
+        Some("-h" | "--help" | "help") => {
+            print!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        Some("-V" | "--version" | "version") => {
+            println!("derp {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
     // Their arguments are cargo's and the linker's, not ours
     match cmd.to_str() {
         Some("cargo") => return rooms_cargo(args).unwrap_or_else(fail),
@@ -1185,6 +1449,17 @@ fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => return fail(e),
     };
+    if cli.help {
+        print!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    let cmd_name = cmd.to_string_lossy();
+    if !COMMANDS.contains(&&*cmd_name) {
+        return fail(shape_error(&cmd_name, &cli));
+    }
+    if let Err(e) = check_options(&cmd_name, &cli) {
+        return fail(e);
+    }
     rewrite::cache::set_verbose(cli.verbose);
     let rest = cli.rest.clone();
     let result: Fallible<ExitCode> = match cmd.to_str() {
@@ -1197,6 +1472,9 @@ fn main() -> ExitCode {
                 println!("{stats}");
                 ExitCode::SUCCESS
             }),
+        Some("rewrite") if rest.len() == 2 && same_file(&rest[0], &rest[1]) => {
+            Err("rewrite writes a new file: give an output other than the input".into())
+        }
         Some("rewrite") if rest.len() == 2 => {
             rewrite_file(Path::new(&rest[0]), Path::new(&rest[1]), &cli.opts).map(|stats| {
                 if cli.verbose {
@@ -1207,7 +1485,9 @@ fn main() -> ExitCode {
         }
         Some("run") if rest.is_empty() && cli.manifest.is_some() => {
             let manifest = cli.manifest.clone().unwrap();
-            run_manifest(&cli, &manifest, &scratch_dir(&cli), cli.capture).map(|o| {
+            let result = run_manifest(&cli, &manifest, &scratch_dir(&cli), cli.capture);
+            leave_scratch(&cli, cli.capture || cli.capture_stderr);
+            result.map(|o| {
                 if cli.verbose {
                     print_run_report(&o);
                 }
@@ -1215,20 +1495,30 @@ fn main() -> ExitCode {
             })
         }
         Some("run") if !rest.is_empty() && cli.manifest.is_none() => {
-            let prog = PathBuf::from(&rest[0]);
-            let exe = if cli.native {
-                Ok(prog)
-            } else {
-                cached_rewrite(&prog, &cli.opts)
-            };
-            exe.and_then(|exe| run_guest(exe, &cli, rest[1..].to_vec(), !cli.verbose, None))
-                .map(|o| exit_from(&o))
+            let exe = find_program(&rest[0]).and_then(|prog| {
+                if cli.native {
+                    Ok(prog)
+                } else {
+                    rewritten(&prog, &cli)
+                }
+            });
+            exe.and_then(|exe| run_single(exe, &cli, rest[1..].to_vec()))
+                .map(|o| {
+                    if cli.verbose {
+                        print_run_report(&o);
+                    }
+                    exit_from_run(&o)
+                })
         }
         Some("bisect") if rest.is_empty() && cli.manifest.is_some() => {
-            bisect(&cli).map(|()| ExitCode::SUCCESS)
+            let result = bisect(&cli);
+            leave_scratch(&cli, false);
+            result.map(|()| ExitCode::SUCCESS)
         }
         Some("suspects") if rest.is_empty() && cli.manifest.is_some() => {
-            suspects(&cli).map(|()| ExitCode::SUCCESS)
+            let result = suspects(&cli);
+            leave_scratch(&cli, false);
+            result.map(|()| ExitCode::SUCCESS)
         }
         Some("bench") if !rest.is_empty() => bench(cli, &rest).map(|()| ExitCode::SUCCESS),
         Some("rooms") if rest.len() == 1 => {
@@ -1237,7 +1527,7 @@ fn main() -> ExitCode {
         Some("repeat") if rest.is_empty() != cli.manifest.is_none() => {
             repeat(&cli, &rest).map(|()| ExitCode::SUCCESS)
         }
-        _ => return fail(USAGE),
+        _ => return fail(shape_error(&cmd_name, &cli)),
     };
     result.unwrap_or_else(fail)
 }

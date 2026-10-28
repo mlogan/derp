@@ -110,6 +110,15 @@ pub fn bisect(cfg: &mut Config, mut progress: impl FnMut(&str)) -> Result<Found,
     if reference.failure_at == 0 {
         return Err("the report does not say when the failing process died".into());
     }
+    if reference.failure_at <= cfg.resolution_ns * 2 {
+        return Err(format!(
+            "the failing run lasts {}, too short to narrow down to --resolution {}: \
+             give a smaller one, such as {}us",
+            ms(reference.failure_at),
+            ms(cfg.resolution_ns),
+            (reference.failure_at / 100_000).max(1)
+        ));
+    }
     progress(&format!(
         "reference: seed {} fails (entry {entry}: {status}) at {}",
         cfg.seed,

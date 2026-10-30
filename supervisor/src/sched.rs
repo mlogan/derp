@@ -116,27 +116,44 @@ fn give_entry_stack(id: usize) {
     }
 }
 
-thread_local! {
-    /// Depth of pass-through sections: while positive, interposed calls on
-    /// this thread go straight to libSystem (used around calls that block
-    /// on something only the kernel wakes, such as the real `pthread_join`).
-    static RAW: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+/// Depth of pass-through sections: while positive, interposed calls on
+/// this thread go straight to libSystem (used around calls that block on
+/// something only the kernel wakes, such as the real `pthread_join`). It is
+/// a pthread key, not a Rust thread-local, because `my_id` runs inside
+/// interposed lock waits: dyld creates a thread-local on first use with
+/// `malloc`, whose lock wait would reenter `my_id` until the stack overflows.
+static RAW_KEY: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+fn raw_depth() -> usize {
+    let key = RAW_KEY.load(Ordering::Relaxed);
+    if key == usize::MAX {
+        return 0;
+    }
+    unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) as usize }
+}
+
+fn set_raw_depth(depth: usize) {
+    let key = RAW_KEY.load(Ordering::Relaxed);
+    if key != usize::MAX {
+        unsafe { libc::pthread_setspecific(key as libc::pthread_key_t, depth as *const c_void) };
+    }
 }
 
 pub fn with_passthrough<T>(f: impl FnOnce() -> T) -> T {
-    RAW.with(|r| r.set(r.get() + 1));
+    let depth = raw_depth();
+    set_raw_depth(depth + 1);
     let out = f();
-    RAW.with(|r| r.set(r.get() - 1));
+    set_raw_depth(depth);
     out
 }
 
 pub fn my_id() -> Option<usize> {
     let key = ID_KEY.load(Ordering::Relaxed);
-    if key == usize::MAX || RAW.with(std::cell::Cell::get) > 0 {
+    if key == usize::MAX {
         return None;
     }
     let v = unsafe { libc::pthread_getspecific(key as libc::pthread_key_t) } as usize;
-    (v != 0).then(|| (v & ID_MASK) - 1)
+    (v != 0 && raw_depth() == 0).then(|| (v & ID_MASK) - 1)
 }
 
 /// The key's value is the id plus one; above it, how many rounds of key
@@ -543,6 +560,10 @@ pub fn init(info: Option<Info>, cfg: &Config) {
         unsafe { libc::pthread_key_create(&raw mut key, Some(crate::interpose::thread_teardown)) };
     assert_eq!(rc, 0, "pthread_key_create failed");
     ID_KEY.store(key as usize, Ordering::Relaxed);
+    let mut raw_key: libc::pthread_key_t = 0;
+    let rc = unsafe { libc::pthread_key_create(&raw mut raw_key, None) };
+    assert_eq!(rc, 0, "pthread_key_create failed");
+    RAW_KEY.store(raw_key as usize, Ordering::Relaxed);
 
     let (sh, me) = match std::env::var(shared::SHARED_VAR) {
         Ok(path) => {

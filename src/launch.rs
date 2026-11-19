@@ -89,6 +89,10 @@ pub struct Outcome {
     pub program: Option<PathBuf>,
     /// Killed because the run reached its stop time: not a failure
     pub stopped: bool,
+    /// Ended by the run rather than by itself or another guest: an injected
+    /// crash or shutdown, the stop time, the real-time limit, or the end of
+    /// the run with only daemons left
+    pub ended_by_run: bool,
 }
 
 impl Outcome {
@@ -169,6 +173,8 @@ pub struct Run {
     pub wall_limit_ms: u64,
     /// Whether guests may connect outside the virtual network
     pub outside_network: bool,
+    /// Any death the run did not cause fails it, not only last lives'
+    pub fail_on_death: bool,
 }
 
 #[derive(Debug)]
@@ -188,6 +194,7 @@ pub struct RunOutcome {
     pub wall_limited: bool,
     /// The survivors were killed because every thread was blocked
     pub deadlock: bool,
+    pub fail_on_death: bool,
 }
 
 /// A process of the run as the launcher sees it, indexed like the shared
@@ -201,6 +208,8 @@ struct Tracked {
     cpu: Option<(u64, u64)>,
     /// Killed by the real-time limit
     wall_limited: bool,
+    /// Still alive when the launcher ended the run
+    killed_at_end: bool,
     report: String,
     /// What it ran, once it said (`MSG_IMAGE`): the executable, and the
     /// original that was rewritten into it
@@ -342,6 +351,7 @@ impl Tracked {
             status: None,
             cpu: None,
             wall_limited: false,
+            killed_at_end: false,
             report: String::new(),
             image: None,
             program: None,
@@ -676,6 +686,7 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
         .map(|(i, c)| {
             let mut report = Report::parse(&c.report);
             let stopped = totals.stopped.get(i).copied().unwrap_or(false) || c.wall_limited;
+            let faulted = totals.faulted.get(i).copied().unwrap_or(false);
             if let Some((user, system)) = c.cpu {
                 report.fields.insert("cpu_user_ns".into(), user.to_string());
                 report
@@ -709,6 +720,7 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
                 image: c.image,
                 program: c.program,
                 stopped,
+                ended_by_run: stopped || faulted || c.killed_at_end,
             }
         })
         .collect();
@@ -720,6 +732,7 @@ pub fn launch_run(run: &Run) -> io::Result<RunOutcome> {
         specs,
         totals,
         deadlock,
+        fail_on_death: run.fail_on_death,
     })
 }
 
@@ -829,6 +842,9 @@ fn stop_or_end(
 const STOP_GRACE_MS: u64 = 5000;
 
 fn end_run(procs: &mut [Tracked]) {
+    for p in procs.iter_mut() {
+        p.killed_at_end |= p.status.is_none();
+    }
     kill_all(procs);
     for p in procs.iter_mut() {
         p.status.get_or_insert(libc::SIGKILL);
@@ -1116,6 +1132,7 @@ impl Run {
             wall_limit_ms: cfg.wall_limit_ms,
             // A single program inherits our environment anyway
             outside_network: true,
+            fail_on_death: false,
         }
     }
 }

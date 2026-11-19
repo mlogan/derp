@@ -107,7 +107,7 @@ Only arm64 Mach-O on macOS is supported. Other operating systems or executable f
 | --- | --- |
 | `derp run [opts] prog args…` | Rewrite (cached), then launch under the supervisor. |
 | `derp run [opts] --manifest FILE` | Several processes on virtual hosts under one scheduler (see the run file, below). |
-| `derp repeat [opts] prog args…` | Run `--runs` times; exit status, stdout and schedule hash must agree. Also takes `--manifest`. |
+| `derp repeat [opts] prog args…` | Run `--runs` times; exit status, stdout and schedule hash must agree. Also takes `--manifest`, where what failed the run must agree too. |
 | `derp bench [opts] prog args…` | Time native against rewritten, without scheduling. |
 | `derp bisect [opts] --manifest FILE` | When was the failing seed's failure decided? See "When did a failing run go wrong?". |
 | `derp suspects [opts] --manifest FILE` | Which loads and stores does the failing seed need? See "Which lines does a failing run need?". |
@@ -143,6 +143,7 @@ without a run file, is refused rather than ignored. `derp --help` lists them too
 | `--pct-starve T` | `50ms` | `pct: {starve: T}` | Within the horizon, a runnable thread passed over this long runs once anyway, so a thread spinning on a lower one's progress cannot stall the run. |
 | `--stop-after T` | | `stop-after:` | End the run at this virtual time: whatever still runs is killed at that point of the schedule, reported as `stopped`, and does not fail the run. For servers that never exit by themselves, and for comparing what a program did in a fixed span of virtual time. Needs the supervisor. |
 | `--wall-limit T` | | `wall-limit:` | The same at a real time. Works for `--native` runs too, which have no virtual clock: every process reports `cpu_user_ns` and `cpu_system_ns`, and `run.cpu_*` sum them, so a program's cost natively and under the supervisor can be compared over the same span. |
+| `--fail-on-death on\|off` | `off` | `fail-on-death:` | Fail the run when any life of any entry, daemons included, dies in a way the run did not cause: a non-zero exit or a signal, or for a daemon any exit. Deaths by an injected `crash:` or `shutdown:`, by `stop-after` or `wall-limit`, and of daemons at the end of the run do not count. The earliest such death fails the run (exit 1 for a daemon that exited 0). The report counts `run.unexpected_deaths` and marks each one `p<i>.unexpected_death=true`. Run-file runs only. |
 | `--scratch DIR` | under the system temp dir | | Where a run file's host directories are made, fresh. An existing directory is only cleared if an earlier run made it. The default one is removed when the run is over, unless `--capture` or `--capture-stderr` put output there: `derp` then says where it is. Give `--scratch` to keep the host directories. Run-file runs (and `bisect`, `suspects`) only. |
 | `--capture` | off | | Run-file runs: each guest's stdout goes to `stdout.<index>` in the scratch directory instead of ours. |
 | `--capture-stderr` | off | | And its stderr to `stderr.<index>`, the supervisor's messages about that guest included; without it they come out on ours. |
@@ -158,7 +159,7 @@ With `-v`, the report goes to stderr: `run.*` totals, then `p<index>.*` per proc
 program without a run file is a run of one process, `p0`.
 
 `derp run` exits with the program's status: for a run file, that of the first entry that
-failed. A guest killed by signal N gives 128+N, as a shell would, and `derp`'s own errors,
+failed, or with `--fail-on-death` of the earliest unexpected death. A guest killed by signal N gives 128+N, as a shell would, and `derp`'s own errors,
 such as a bad option, give 2.
 
 Two environment variables help with debugging:
@@ -190,6 +191,7 @@ scheduler: pct           # or random (the default)
 pct: { depth: 3, horizon: 2s, starve: 50ms }
 stop-after: 30s          # the run is over at this virtual time (default: never)
 wall-limit: 60s          # or at this real time, native runs included
+fail-on-death: on        # any death the run did not cause fails it (default: off)
 outside-network: refuse  # or allow: connections and name lookups beyond the
                          # virtual network reach the real one (input, unrepeatable)
 env: { LOG_LEVEL: debug }   # for every process (guests start from a fixed environment)
@@ -244,7 +246,11 @@ then comes back as a new process on the same host, with a new pid and the
 same host directory; what it needs to remember it has to have written
 there. Its captured stdout continues in the same file. `on-failure` means a
 signal or a non-zero exit. The run's exit status is that of each entry's
-last life. The report counts `run.crashes_injected` and `run.restarts`,
+last life, unless `fail-on-death: on`: then any life that died by itself
+with a signal or a non-zero exit fails the run, and so does a daemon that
+exited at all, since a daemon is not expected to finish. A guest's `kill`
+of another counts as such a death; the run's own crashes, shutdowns and
+stops do not. The report counts `run.crashes_injected` and `run.restarts`,
 and `p<i>.entry` says which run-file entry process `i` was a life of;
 `p<i>.program` and `p<i>.image` say what it ran, children a guest started
 included.
@@ -643,6 +649,11 @@ future. Every random stream starts over at `T`: thread choice and quanta,
 injected faults, where heap blocks land, and the entropy guests read. So a
 failure decided by pointer order or by a random value is found the same
 way; its moment is the allocation or the draw.
+
+A future fails the same way when the entry that failed the reference run
+ends its last life with the same status, or, under `fail-on-death`, dies
+unexpectedly with it in any life. The replays keep the reference's
+`fail-on-death` setting.
 
 ## Which lines does a failing run need?
 

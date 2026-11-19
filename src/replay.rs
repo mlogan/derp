@@ -1,7 +1,7 @@
 //! Running one run file many times over, for the tools that look into a
 //! failing seed (`bisect`, `suspects`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -27,6 +27,8 @@ pub struct Ending {
     pub schedule_hash: String,
     /// The status of each entry's last life
     pub last_status: BTreeMap<usize, String>,
+    /// The entry and status of each unexpected death (`fail-on-death`)
+    pub unexpected: BTreeSet<(usize, String)>,
     /// Which entry each process was a life of, by `p<N>`
     pub entry_of: BTreeMap<String, usize>,
     /// What each process ran, by `p<N>`: the original program, and the
@@ -40,6 +42,7 @@ impl Ending {
     pub fn parse(stderr: &str) -> Ending {
         let mut e = Ending::default();
         let mut status_of: BTreeMap<String, String> = BTreeMap::new();
+        let mut unexpected: Vec<String> = Vec::new();
         for line in stderr.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -54,7 +57,9 @@ impl Ending {
                 "run.failure_at" => e.failure_at = value.parse().unwrap_or(0),
                 "run.schedule_hash" => e.schedule_hash = value.to_string(),
                 _ => {
-                    if let Some(process) = key.strip_suffix(".status") {
+                    if let Some(process) = key.strip_suffix(".unexpected_death") {
+                        unexpected.push(process.to_string());
+                    } else if let Some(process) = key.strip_suffix(".status") {
                         status_of.insert(process.to_string(), value.to_string());
                     } else if let Some(process) = key.strip_suffix(".entry") {
                         if let Ok(entry) = value.parse() {
@@ -78,6 +83,12 @@ impl Ending {
             .filter_map(|(p, &entry)| Some((p.strip_prefix('p')?.parse().ok()?, p, entry)))
             .collect();
         lives.sort_unstable();
+        for process in &unexpected {
+            if let (Some(&entry), Some(status)) = (e.entry_of.get(process), status_of.get(process))
+            {
+                e.unexpected.insert((entry, status.clone()));
+            }
+        }
         for (_, process, entry) in lives {
             if let Some(status) = status_of.get(process) {
                 e.last_status.insert(entry, status.clone());
@@ -87,13 +98,14 @@ impl Ending {
     }
 
     /// Whether this run failed as `reference` did: the same entry ended with
-    /// the same status, whatever else went wrong besides.
+    /// the same status, or died unexpectedly with it, whatever else went
+    /// wrong besides.
     #[must_use]
     pub fn fails_like(&self, reference: &Ending) -> bool {
-        reference
-            .failure
-            .as_ref()
-            .is_some_and(|(entry, status)| self.last_status.get(entry) == Some(status))
+        reference.failure.as_ref().is_some_and(|(entry, status)| {
+            self.last_status.get(entry) == Some(status)
+                || self.unexpected.contains(&(*entry, status.clone()))
+        })
     }
 }
 
@@ -215,7 +227,28 @@ pub fn trace_lines(path: &Path) -> Vec<(u64, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::ms;
+    use super::{ms, Ending};
+
+    #[test]
+    fn an_unexpected_death_fails_like_one_that_ended_a_life_before_the_last() {
+        let reference = Ending::parse(
+            "run.failure=entry 0: signal 6\nrun.unexpected_deaths=1\n\
+             p0.status=signal 6\np0.unexpected_death=true\np0.entry=0\n\
+             p2.status=stopped\np2.entry=0\n",
+        );
+        assert_eq!(reference.last_status[&0], "stopped");
+        let later = Ending::parse(
+            "run.unexpected_deaths=1\np0.status=signal 9\np0.entry=0\n\
+             p2.status=signal 6\np2.unexpected_death=true\np2.entry=0\n\
+             p3.status=stopped\np3.entry=0\n",
+        );
+        assert!(later.fails_like(&reference));
+        let crashed = Ending::parse(
+            "run.unexpected_deaths=0\np0.status=signal 9\np0.entry=0\n\
+             p2.status=stopped\np2.entry=0\n",
+        );
+        assert!(!crashed.fails_like(&reference));
+    }
 
     #[test]
     fn ms_shows_what_tells_two_times_apart() {

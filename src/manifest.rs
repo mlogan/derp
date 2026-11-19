@@ -9,6 +9,7 @@
 //! mem-hook-rate: 1/16
 //! net-latency: 5ms
 //! switch-cost: 10us        # virtual time a baton hand-off costs
+//! fail-on-death: on        # any death the run did not cause fails it
 //! allow:                   # extra paths every host may touch
 //!   - /opt/site-content
 //! env: { LOG_LEVEL: debug } # for every process; guests start from a fixed
@@ -189,6 +190,7 @@ struct RawRun {
     heap_release: Option<Scalar>,
     stop_after: Option<Scalar>,
     wall_limit: Option<Scalar>,
+    fail_on_death: Option<Scalar>,
     pause: Option<RawPause>,
     scheduler: Option<String>,
     pct: Option<RawPct>,
@@ -413,6 +415,8 @@ pub struct Manifest {
     pub stop_after: Option<String>,
     /// Real time after which the run is over, whatever still runs
     pub wall_limit: Option<String>,
+    /// `on` or `off`: whether any death the run did not cause fails it
+    pub fail_on_death: Option<String>,
     /// As on the command line: `off` or `1/200`, and `10us..100ms`
     pub pause_chance: Option<String>,
     pub pause_for: Option<String>,
@@ -487,6 +491,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         heap_release: raw.heap_release.as_ref().map(Scalar::text),
         stop_after: raw.stop_after.as_ref().map(Scalar::text),
         wall_limit: raw.wall_limit.as_ref().map(Scalar::text),
+        fail_on_death: raw.fail_on_death.as_ref().map(Scalar::text),
         pause_chance: match &raw.pause {
             None => None,
             Some(RawPause::Off(s)) => Some(s.clone()),

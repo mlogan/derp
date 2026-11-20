@@ -47,6 +47,8 @@ pub struct Totals {
     pub stopped_at: u64,
     /// Which processes were killed by that stop
     pub stopped: Vec<bool>,
+    /// Which processes an injected crash or shutdown ended
+    pub faulted: Vec<bool>,
 }
 
 static NEXT_FILE: AtomicU32 = AtomicU32::new(0);
@@ -317,6 +319,10 @@ impl Coordinator {
             stopped: s.procs[..s.nprocs as usize]
                 .iter()
                 .map(|p| p.stopped)
+                .collect(),
+            faulted: s.procs[..s.nprocs as usize]
+                .iter()
+                .map(|p| p.crash_injected || p.shut_down)
                 .collect(),
         }
     }

@@ -375,6 +375,8 @@ pub struct ProcRec {
     pub unsettled: bool,
     /// Killed because the run reached `State::stop_at_ns`, not by a fault
     pub stopped: bool,
+    /// Killed by an injected `crash:`, not by a guest
+    pub crash_injected: bool,
     /// Which run-file entry the launcher started this from (`NO_PROC` for a
     /// guest's own child, which only its parent could restart)
     pub spec: u32,
@@ -995,6 +997,7 @@ impl State {
                 f.crashes_left -= 1;
             }
             self.crash(pid);
+            self.procs[pid as usize].crash_injected = true;
             self.crashes_injected += 1;
         }
     }

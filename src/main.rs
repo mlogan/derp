@@ -80,6 +80,9 @@ bare number is milliseconds. An option the command would not use is refused.
   --wall-limit T                       the same at this real time, for native runs too: to
                                        compare the CPU time (cpu_user_ns, cpu_system_ns) a
                                        program uses natively and under the supervisor
+  --fail-on-death on|off               run file: any life of any entry, daemons included, that
+                                       ends by itself with a signal or a non-zero exit fails
+                                       the run, and a daemon that exits at all (default off)
 run file:
   seed: 7                              optional; the command line overrides these
   quantum: 1000..10000
@@ -93,6 +96,7 @@ run file:
   heap-release: on
   stop-after: 30s
   wall-limit: 60s
+  fail-on-death: on
   env: { LOG_LEVEL: debug }            for every process
   pass-env: [SSL_CERT_FILE]            inherited from your environment; nothing else is
   hosts:                               in order: 10.0.0.1, 10.0.0.2, ...
@@ -144,6 +148,8 @@ struct Cli {
     stop_after_ns: u64,
     /// Real time after which it is over (0: never)
     wall_limit_ms: u64,
+    /// Every death the run did not cause fails it, not only last lives'
+    fail_on_death: bool,
     reseed_at: Option<u64>,
     reseed: u64,
     jobs: u32,
@@ -247,6 +253,9 @@ fn with_run_file_settings(cli: &Cli, m: &manifest::Manifest) -> Result<Cli, Stri
     if let (Some(t), true) = (&m.wall_limit, from_file("wall-limit")) {
         cli.wall_limit_ms = parse_positive("wall-limit", t)? / 1_000_000;
     }
+    if let (Some(f), true) = (&m.fail_on_death, from_file("fail-on-death")) {
+        cli.fail_on_death = parse_on_off("fail-on-death", f)?;
+    }
     if m.pause_chance.is_some() {
         // Asked for: a run without the scheduler refuses it
         cli.given.push("pause");
@@ -316,7 +325,7 @@ fn parse_pause_for(v: &str) -> Result<(u64, u64), String> {
 }
 
 /// Every option, by its long name without the dashes
-const OPTIONS: [&str; 28] = [
+const OPTIONS: [&str; 29] = [
     "seed",
     "mem-hook-rate",
     "quantum",
@@ -336,6 +345,7 @@ const OPTIONS: [&str; 28] = [
     "heap-release",
     "wall-limit",
     "stop-after",
+    "fail-on-death",
     "reseed-at",
     "jobs",
     "resolution",
@@ -386,7 +396,9 @@ fn takes_option(cmd: &str, run_file: bool, o: &str) -> bool {
         "quantum" | "pause" | "pause-for" | "scheduler" | "pct-depth" | "pct-horizon"
         | "pct-starve" | "heap-size" | "heap-release" | "stop-after" => runs || replays,
         "wall-limit" | "no-supervisor" | "aslr" | "native" => runs,
-        "scratch" | "net-latency" | "switch-cost" => run_file && (runs || replays),
+        "scratch" | "net-latency" | "switch-cost" | "fail-on-death" => {
+            run_file && (runs || replays)
+        }
         "capture" | "capture-stderr" | "reseed-at" | "reseed" => run_file && runs,
         "jobs" => replays,
         "resolution" => cmd == "bisect",
@@ -455,6 +467,7 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
         heap_release: true,
         stop_after_ns: 0,
         wall_limit_ms: 0,
+        fail_on_death: false,
         reseed_at: None,
         reseed: 0,
         jobs: 4,
@@ -517,6 +530,9 @@ fn parse_cli(mut args: Vec<OsString>) -> Result<Cli, String> {
             }
             "--stop-after" => {
                 cli.stop_after_ns = parse_positive("stop-after", &take_value(&mut args)?)?;
+            }
+            "--fail-on-death" => {
+                cli.fail_on_death = parse_on_off("fail-on-death", &take_value(&mut args)?)?;
             }
             "--reseed-at" => {
                 cli.reseed_at = Some(parse_duration("reseed time", &take_value(&mut args)?)?);
@@ -886,6 +902,7 @@ fn run_manifest(cli: &Cli, path: &Path, scratch: &Path, capture: bool) -> Fallib
         stop_at_ns: cli.stop_after_ns,
         wall_limit_ms: cli.wall_limit_ms,
         outside_network: m.outside_network,
+        fail_on_death: cli.fail_on_death,
     };
     let has_faults = run.guests.iter().any(|g| {
         g.faults.restart != rewrite::shared::RESTART_NEVER
@@ -949,8 +966,15 @@ fn print_run_report(o: &RunOutcome) {
         let at = o.totals.died_at.get(life).copied().unwrap_or(0);
         eprintln!("run.failure_at={at}");
     }
+    let unexpected = unexpected_deaths(o);
+    if o.fail_on_death {
+        eprintln!("run.unexpected_deaths={}", unexpected.len());
+    }
     for (i, g) in o.guests.iter().enumerate() {
         eprintln!("p{i}.status={}", describe_status(g));
+        if unexpected.contains(&i) {
+            eprintln!("p{i}.unexpected_death=true");
+        }
         if let Some(&at) = o.totals.died_at.get(i) {
             eprintln!("p{i}.died_at={at}");
         }
@@ -983,17 +1007,55 @@ fn describe_status(o: &launch::Outcome) -> String {
 /// whose last life did not exit 0. Earlier lives that crashed and were
 /// restarted do not count, what children return is their parents' business,
 /// and daemons and what the run's stop time killed are killed by design.
+/// With `fail-on-death`, the earliest unexpected death counts too; a
+/// daemon that exited 0 by itself makes it 1.
 fn exit_from_run(o: &RunOutcome) -> ExitCode {
-    failed_life(o).map_or(ExitCode::SUCCESS, |(_, life)| exit_from(&o.guests[life]))
+    failed_life(o).map_or(ExitCode::SUCCESS, |(_, life)| {
+        let g = &o.guests[life];
+        if g.exit_code() == Some(0) {
+            ExitCode::FAILURE
+        } else {
+            exit_from(g)
+        }
+    })
 }
 
-/// The run-file entry that failed the run, and the process that was its
-/// last life.
+/// The run-file entry that failed the run, and the process whose death
+/// did: its last life, or with `fail-on-death` the life that died first.
 fn failed_life(o: &RunOutcome) -> Option<(usize, usize)> {
-    (0..o.initial)
+    let last = (0..o.initial)
         .filter(|&entry| !o.daemons[entry])
         .filter_map(|entry| Some((entry, o.specs.iter().rposition(|&s| s == Some(entry))?)))
-        .find(|&(_, life)| !o.guests[life].stopped && o.guests[life].exit_code() != Some(0))
+        .find(|&(_, life)| !o.guests[life].stopped && o.guests[life].exit_code() != Some(0));
+    if !o.fail_on_death {
+        return last;
+    }
+    let died_at = |life: usize| match o.totals.died_at.get(life) {
+        Some(&at) if at != 0 => at,
+        _ => u64::MAX,
+    };
+    unexpected_deaths(o)
+        .into_iter()
+        .chain(last.map(|(_, life)| life))
+        .min_by_key(|&life| (died_at(life), life))
+        .and_then(|life| Some((o.specs[life]?, life)))
+}
+
+/// With `fail-on-death`, the lives of run-file entries that the run did not
+/// end and that did not exit 0, or that were daemons and exited at all: a
+/// daemon is not expected to finish.
+fn unexpected_deaths(o: &RunOutcome) -> Vec<usize> {
+    if !o.fail_on_death {
+        return Vec::new();
+    }
+    (0..o.guests.len())
+        .filter(|&life| {
+            let g = &o.guests[life];
+            o.specs[life].is_some_and(|entry| {
+                !g.ended_by_run && (o.daemons[entry] || g.exit_code() != Some(0))
+            })
+        })
+        .collect()
 }
 
 /// The run a tool replays: the command line laid over the run file's own
@@ -1050,6 +1112,8 @@ fn replay_of(
         pass.push("--stop-after".to_string());
         pass.push(format!("{}ns", cli.stop_after_ns));
     }
+    pass.push("--fail-on-death".to_string());
+    pass.push(if cli.fail_on_death { "on" } else { "off" }.to_string());
     let replay = rewrite::replay::Replay {
         manifest: path,
         dir: scratch_dir(&cli).join(tool),
@@ -1182,9 +1246,9 @@ fn bench(cli: Cli, rest: &[OsString]) -> Fallible<()> {
     Ok(())
 }
 
-/// What must agree between runs: each guest's exit status and stdout, and
-/// the run-wide schedule hash.
-type Observed = (Vec<(String, String)>, String);
+/// What must agree between runs: each guest's exit status and stdout, the
+/// run-wide schedule hash, and what failed the run, if anything did.
+type Observed = (Vec<(String, String)>, String, Option<String>);
 
 fn observe_single(cli: &Cli, exe: &Path, args: &[OsString], out: &Path) -> Fallible<Observed> {
     let o = run_guest(
@@ -1195,7 +1259,7 @@ fn observe_single(cli: &Cli, exe: &Path, args: &[OsString], out: &Path) -> Falli
     )?;
     let text = std::fs::read_to_string(out).unwrap_or_default();
     let hash = o.report.get("schedule_hash").unwrap_or("").to_string();
-    Ok((vec![(describe_status(&o), text)], hash))
+    Ok((vec![(describe_status(&o), text)], hash, None))
 }
 
 fn observe_manifest(cli: &Cli, manifest: &Path, scratch: &Path) -> Fallible<Observed> {
@@ -1209,7 +1273,9 @@ fn observe_manifest(cli: &Cli, manifest: &Path, scratch: &Path) -> Fallible<Obse
             (describe_status(g), text)
         })
         .collect();
-    Ok((guests, format!("{:016x}", o.totals.schedule_hash)))
+    let failure = failed_life(&o)
+        .map(|(entry, life)| format!("entry {entry}: {}", describe_status(&o.guests[life])));
+    Ok((guests, format!("{:016x}", o.totals.schedule_hash), failure))
 }
 
 fn show(o: &Observed) -> String {
@@ -1217,7 +1283,13 @@ fn show(o: &Observed) -> String {
         o.0.iter()
             .map(|(status, text)| format!("[{status}] stdout={:?}", text.trim_end()))
             .collect();
-    format!("hash={} {}", o.1, guests.join(" "))
+    let failure = o.2.as_ref().map(|f| format!(" failure={f}"));
+    format!(
+        "hash={}{} {}",
+        o.1,
+        failure.unwrap_or_default(),
+        guests.join(" ")
+    )
 }
 
 /// Run `cli.runs` times; every run must agree with the first.

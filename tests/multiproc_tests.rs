@@ -2016,3 +2016,128 @@ fn crashes_and_shutdowns_mix() {
     }
     assert!(both, "no seed had both");
 }
+
+/// `derp run` of a run file with `extra` options: its exit code and report.
+fn run_status(manifest: &Path, scratch: &Path, extra: &[&str]) -> (Option<i32>, RunReport) {
+    common::supervisor_dylib();
+    let out = Command::new(common::derp_bin())
+        .args(["run", "-v", "--capture", "--seed", "1"])
+        .args(extra)
+        .arg("--scratch")
+        .arg(scratch)
+        .arg("--manifest")
+        .arg(manifest)
+        .output()
+        .unwrap();
+    let fields = common::report_fields(&String::from_utf8_lossy(&out.stderr));
+    let report = RunReport {
+        fields,
+        stdout: Vec::new(),
+    };
+    (out.status.code(), report)
+}
+
+/// `dies` as a restarted daemon next to a client that sleeps for about
+/// half a second; `setting` comes first in the run file, and `faults` adds
+/// keys to the daemon's entry.
+fn death_run(test: &str, setting: &str, mode: &str, faults: &str) -> std::path::PathBuf {
+    let dir = common::scratch_dir(&format!("fail_on_death_{test}"));
+    common::build_c("dies", &dir, &[]);
+    common::build_c("sleeper", &dir, &[]);
+    let manifest = dir.join("run.yaml");
+    std::fs::write(
+        &manifest,
+        format!(
+            "{setting}hosts:\n  - name: a\n    processes:\n\
+             \x20     - argv: [dies, {mode}]\n        daemon: true\n\
+             \x20       restart: on-failure\n        restart-delay: 10ms\n{faults}\
+             \x20     - sleeper 50 10000\n"
+        ),
+    )
+    .unwrap();
+    manifest
+}
+
+#[test]
+fn a_daemon_that_aborts_fails_the_run_only_with_fail_on_death() {
+    let manifest = death_run("abort", "fail-on-death: on\n", "once", "");
+    let scratch = manifest.with_file_name("scratch");
+    let (code, r) = run_status(&manifest, &scratch, &[]);
+    assert_eq!(code, Some(128 + libc::SIGABRT), "{:?}", r.fields);
+    assert_eq!(r.fields["run.unexpected_deaths"], "1");
+    assert_eq!(r.fields["run.failure"], "entry 0: signal 6");
+    assert_eq!(r.fields["p0.status"], "signal 6");
+    assert_eq!(r.fields["p0.unexpected_death"], "true");
+    assert!(!r.fields.contains_key("p2.unexpected_death"));
+    assert_eq!(r.u64("run.restarts"), 1);
+    // Off, the restart hides the abort: daemons are not looked at
+    let (code, r) = run_status(&manifest, &scratch, &["--fail-on-death", "off"]);
+    assert_eq!(code, Some(0), "{:?}", r.fields);
+    assert!(!r.fields.contains_key("run.unexpected_deaths"));
+    assert!(!r.fields.contains_key("p0.unexpected_death"));
+    assert_eq!(r.fields["p0.status"], "signal 6");
+}
+
+#[test]
+fn a_daemon_that_exits_by_itself_fails_the_run_with_fail_on_death() {
+    let manifest = death_run("exit0", "", "exit0", "");
+    let scratch = manifest.with_file_name("scratch");
+    let (code, r) = run_status(&manifest, &scratch, &[]);
+    assert_eq!(code, Some(0), "{:?}", r.fields);
+    let (code, r) = run_status(&manifest, &scratch, &["--fail-on-death", "on"]);
+    assert_eq!(code, Some(1), "{:?}", r.fields);
+    assert_eq!(r.fields["run.failure"], "entry 0: exit 0");
+    assert_eq!(r.fields["p0.unexpected_death"], "true");
+}
+
+/// Injected crashes and shutdowns, the stop time and the end of the run are
+/// deaths the run caused: none of them fails it.
+#[test]
+fn deaths_the_run_causes_do_not_fail_it() {
+    let crashed = death_run(
+        "crash",
+        "fail-on-death: on\n",
+        "forever",
+        "        crash: { every: 50ms..100ms, times: 2 }\n",
+    );
+    let scratch = crashed.with_file_name("scratch");
+    let (code, r) = run_status(&crashed, &scratch, &[]);
+    assert_eq!(code, Some(0), "{:?}", r.fields);
+    assert_eq!(r.u64("run.crashes_injected"), 2);
+    assert_eq!(r.fields["run.unexpected_deaths"], "0");
+    assert_eq!(r.fields["p0.status"], "signal 9");
+
+    // Dying of the signal, and crashed when the grace period is over
+    for mode in ["default", "ignore"] {
+        let dir = common::scratch_dir(&format!("fail_on_death_shutdown_{mode}"));
+        common::build_c("graceful", &dir, &[]);
+        let manifest = dir.join("run.yaml");
+        std::fs::write(
+            &manifest,
+            format!(
+                "fail-on-death: on\nstop-after: 300ms\nhosts:\n  - name: a\n    processes:\n\
+                 \x20     - argv: [graceful, {mode}]\n        restart: on-failure\n\
+                 \x20       restart-delay: 10ms\n\
+                 \x20       shutdown: {{ every: 50ms..80ms, times: 2, grace: 20ms }}\n"
+            ),
+        )
+        .unwrap();
+        let (code, r) = run_status(&manifest, &dir.join("scratch"), &[]);
+        assert_eq!(code, Some(0), "{mode}: {:?}", r.fields);
+        assert_eq!(r.u64("run.shutdowns_injected"), 2, "{mode}");
+        assert_eq!(r.fields["run.unexpected_deaths"], "0", "{mode}");
+        assert_eq!(r.fields["p2.status"], "stopped", "{mode}");
+    }
+
+    // A non-daemon still running at the stop
+    let stopped = death_run(
+        "stop",
+        "fail-on-death: on\nstop-after: 200ms\n",
+        "forever",
+        "",
+    );
+    let (code, r) = run_status(&stopped, &stopped.with_file_name("scratch"), &[]);
+    assert_eq!(code, Some(0), "{:?}", r.fields);
+    assert_eq!(r.fields["p1.status"], "stopped");
+    assert_eq!(r.fields["run.unexpected_deaths"], "0");
+}
